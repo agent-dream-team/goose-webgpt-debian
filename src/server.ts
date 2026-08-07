@@ -9,7 +9,7 @@ import { providerConfig } from "./config";
 import { AsyncEventQueue } from "./event-queue";
 import { readJsonRequestBody } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { augmentNativeModelCatalog } from "./model-catalog";
 import { readCodexModelContextOverride, type CodexModelContextOverride } from "./codex-integration";
 import {
@@ -221,14 +221,37 @@ function standaloneTextContent(value: unknown): boolean {
   });
 }
 
+/** Same text-only shape as standaloneTextContent, but for an assistant reply's output blocks. */
+function standaloneAssistantTextContent(value: unknown): boolean {
+  if (typeof value === "string") return true;
+  return Array.isArray(value) && value.every(part => {
+    const block = plainObject(part);
+    return (block?.type === "output_text" || block?.type === "text") && typeof block.text === "string";
+  });
+}
+
 /**
  * Give an isolated standalone text request the replay identity required by the browser adapter.
  * Native Codex requests, continuations, and every tool-bearing/non-text shape remain untouched.
+ *
+ * Goose resends the complete conversation on every turn (no previous_response_id, no thread/turn
+ * metadata of its own), so a second or later turn arrives with plain-text `assistant` history
+ * already interleaved with the `system`/`user` items a first turn has. That shape is accepted here
+ * too — text-only, no tool calls, no reasoning items — so ordinary multi-turn conversations keep
+ * getting a replay identity instead of silently falling through to the native-Codex path (which
+ * requires Codex's own turn/thread metadata and fails closed for a plain Goose request).
+ *
+ * Identity defaults to a deterministic digest of the input prefix ending at the latest user
+ * message, not a fresh random value. Because Goose resends full history, a byte-identical retry of
+ * the same logical turn — or a duplicate HTTP POST from a client-side retry — collapses onto the
+ * same execution key instead of opening a second browser tab for work that is already in flight or
+ * already answered. A genuinely new user message changes the prefix and therefore always gets a
+ * fresh identity, i.e. a fresh browser turn.
  */
 export function prepareStandaloneTextRequest(
   raw: unknown,
   config: AppConfig,
-  identity: string = randomUUID(),
+  identity?: string,
 ): unknown {
   if (!config.standalone || config.mode !== "browser-only") return raw;
   const body = plainObject(raw);
@@ -246,19 +269,27 @@ export function prepareStandaloneTextRequest(
   for (let index = 0; index < input.length; index += 1) {
     const item = plainObject(input[index]);
     const type = item?.type ?? "message";
-    if (!item || type !== "message"
-      || (item.role !== "system" && item.role !== "developer" && item.role !== "user")
+    if (!item || type !== "message") return raw;
+    if (item.role === "assistant") {
+      if (!standaloneAssistantTextContent(item.content)) return raw;
+      continue;
+    }
+    if ((item.role !== "system" && item.role !== "developer" && item.role !== "user")
       || !standaloneTextContent(item.content)) return raw;
     if (item.role === "user") latestUserIndex = index;
   }
   if (latestUserIndex < 0) return raw;
 
-  const turnId = `standalone_${identity}`;
+  const resolvedIdentity = identity ?? createHash("sha256")
+    .update(JSON.stringify(input.slice(0, latestUserIndex + 1)))
+    .digest("hex")
+    .slice(0, 32);
+  const turnId = `standalone_${resolvedIdentity}`;
   const latestUser = plainObject(input[latestUserIndex])!;
   const taggedInput = input.map((item, index) => index === latestUserIndex ? {
     ...plainObject(item),
     type: "message",
-    id: `msg_${identity}`,
+    id: `msg_${resolvedIdentity}`,
     internal_chat_message_metadata_passthrough: { turn_id: turnId },
   } : item);
   return {
