@@ -28,7 +28,7 @@ const HELP = `codex-chatgpt-web ${VERSION}
 Focused ChatGPT web-backed models for the native Codex harness.
 
 Usage:
-  codex-chatgpt-web setup --browser-only [options]
+  codex-chatgpt-web setup --browser-only [--standalone] [options]
   codex-chatgpt-web setup --full --tunnel-id ID --runtime-key-file PATH [options]
   codex-chatgpt-web login
   codex-chatgpt-web doctor [--json]
@@ -43,6 +43,7 @@ Usage:
 
 Setup options:
   --browser-only               Account-eligible Web models, full context/images, no local tools or tunnel
+  --standalone                 Set up the browser-only daemon without inspecting or configuring Codex
   --full                       Account-eligible Web models with tools; Pro remains read-only
   --port NUMBER                Loopback Responses port (default: 17841)
   --chrome PATH                Google Chrome executable
@@ -121,6 +122,7 @@ async function setupCommand(args: string[]): Promise<void> {
   let acknowledged = takeFlag(args, "--acknowledge-unofficial");
   const options: SetupOptions = {
     mode: full ? "full" : "browser-only",
+    standalone: takeFlag(args, "--standalone"),
     ...(portRaw ? { port: Number(portRaw) } : {}),
   };
   const appName = takeOption(args, "--app-name");
@@ -174,7 +176,9 @@ async function setupCommand(args: string[]): Promise<void> {
     stdout.write("One account-level step remains: attach the tunnel to the ChatGPT connector named in config.\n");
     stdout.write("Open: https://chatgpt.com/#settings/Connectors\n");
   }
-  stdout.write("Restart the Codex app once so its native model catalog refreshes through the installed route.\n");
+  if (result.codexRestartRequired) {
+    stdout.write("Restart the Codex app once so its native model catalog refreshes through the installed route.\n");
+  }
 }
 
 async function doctorCommand(args: string[]): Promise<void> {

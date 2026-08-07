@@ -18,6 +18,8 @@ import {
   CHATGPT_EFFORT_CONTROL_SELECTOR,
   CHATGPT_EFFORT_ITEM_SELECTOR,
   CHATGPT_EFFORT_MENU_SELECTOR,
+  CHATGPT_EFFORT_POWER_CONTROL_SELECTOR,
+  CHATGPT_EFFORT_POWER_SLIDER_SELECTOR,
   CHATGPT_STOP_BUTTON_SELECTOR,
   CHATGPT_TEMPORARY_CHAT_URL,
   CHATGPT_USER_TURN_SELECTOR,
@@ -797,6 +799,46 @@ export class ChatGptBrowserWorker {
       await currentEffort.click();
     }
     await captureDiagnostic?.("effort-menu-open-requested");
+    await effortMenu.waitFor({ state: "visible", timeout: 70_000 });
+    const effortPowerControl = effortMenu.locator(CHATGPT_EFFORT_POWER_CONTROL_SELECTOR).first();
+    const effortPowerSlider = effortPowerControl.locator(CHATGPT_EFFORT_POWER_SLIDER_SELECTOR).first();
+    if (await effortPowerControl.isVisible().catch(() => false)) {
+      await captureDiagnostic?.("effort-choice-visible");
+      const minimum = Number(await effortPowerSlider.getAttribute("aria-valuemin"));
+      const maximum = Number(await effortPowerSlider.getAttribute("aria-valuemax"));
+      let selected = Number(await effortPowerSlider.getAttribute("aria-valuenow"));
+      if (![minimum, maximum, selected].every(Number.isInteger)
+        || minimum !== 0
+        || maximum < minimum
+        || selected < minimum
+        || selected > maximum) {
+        throw new Error("ChatGPT effort power slider has invalid semantic values");
+      }
+      if (mode.uiEffortIndex > maximum) {
+        throw new Error(
+          `ChatGPT effort power slider does not expose index ${mode.uiEffortIndex}`
+          + `; maximum index: ${maximum}`,
+        );
+      }
+      await effortPowerControl.focus();
+      while (selected !== mode.uiEffortIndex) {
+        await throwIfChatGptRateLimitDialog(page);
+        await page.keyboard.press(selected < mode.uiEffortIndex ? "ArrowRight" : "ArrowLeft");
+        const previous = selected;
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          selected = Number(await effortPowerSlider.getAttribute("aria-valuenow"));
+          if (selected !== previous) break;
+          await new Promise(resolveSleep => setTimeout(resolveSleep, 50));
+        }
+        if (!Number.isInteger(selected) || selected === previous) {
+          throw new Error(`ChatGPT effort power slider did not move from index ${previous}`);
+        }
+      }
+      await captureDiagnostic?.("effort-selected");
+      await page.keyboard.press("Escape");
+      return mode;
+    }
     const effortChoices = effortMenu.locator(CHATGPT_EFFORT_ITEM_SELECTOR);
     const effortChoice = effortChoices.nth(mode.uiEffortIndex);
     const waitAbort = new AbortController();

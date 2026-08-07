@@ -33,6 +33,7 @@ import { VERSION } from "./version";
 
 export interface SetupOptions {
   mode: RuntimeMode;
+  standalone?: boolean;
   port?: number;
   chromeExecutablePath?: string;
   browserHostDescriptorPath?: string;
@@ -53,7 +54,7 @@ export interface SetupResult {
   loginCreated: boolean;
   serviceLoaded: boolean;
   tunnelReady: boolean | null;
-  codexRestartRequired: true;
+  codexRestartRequired: boolean;
   connectorSetupRequired: boolean;
 }
 
@@ -82,6 +83,7 @@ function loadExistingConfig(): AppConfig | undefined {
 function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
   return JSON.stringify({
     mode: before.mode,
+    standalone: before.standalone,
     releaseVersion: before.releaseVersion,
     host: before.host,
     port: before.port,
@@ -100,6 +102,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     tunnel: before.tunnel,
   }) !== JSON.stringify({
     mode: after.mode,
+    standalone: after.standalone,
     releaseVersion: after.releaseVersion,
     host: after.host,
     port: after.port,
@@ -173,9 +176,16 @@ async function waitForProxy(config: AppConfig, timeoutMs = 10_000): Promise<void
   throw new Error(`Responses proxy did not become ready: ${lastError}`);
 }
 
-function baseConfig(existing: AppConfig | undefined, options: SetupOptions): AppConfig {
+export function buildSetupConfig(existing: AppConfig | undefined, options: SetupOptions): AppConfig {
+  if (options.standalone && options.mode !== "browser-only") {
+    throw new Error("Standalone setup requires --browser-only");
+  }
+  if (options.standalone && options.replaceCodexRoute) {
+    throw new Error("Standalone setup cannot replace the Codex route");
+  }
   const config = existing ? structuredClone(existing) : defaultConfig(options.mode);
   config.mode = options.mode;
+  config.standalone = options.standalone === true;
   config.releaseVersion = VERSION;
   config.runtimeCommand = currentRuntimeCommand();
   if (options.port !== undefined) {
@@ -198,6 +208,26 @@ function baseConfig(existing: AppConfig | undefined, options: SetupOptions): App
     throw new Error("Setup requires explicit acknowledgement that this is unofficial browser automation. Pass --acknowledge-unofficial.");
   }
   return config;
+}
+
+export function preflightSetupCodexIntegration(
+  config: AppConfig,
+  options: SetupOptions,
+  preflight: typeof preflightCodexIntegration = preflightCodexIntegration,
+): boolean {
+  if (options.standalone) return false;
+  preflight(config, { replaceExistingRoute: options.replaceCodexRoute });
+  return true;
+}
+
+export function installSetupCodexIntegration(
+  config: AppConfig,
+  options: SetupOptions,
+  install: typeof installCodexIntegration = installCodexIntegration,
+): boolean {
+  if (options.standalone) return false;
+  install(config, { replaceExistingRoute: options.replaceCodexRoute });
+  return true;
 }
 
 async function configureTunnel(config: AppConfig, existing: AppConfig | undefined, options: SetupOptions): Promise<void> {
@@ -252,7 +282,7 @@ async function bootstrapTunnelProfile(config: AppConfig): Promise<void> {
 
 export async function setup(options: SetupOptions): Promise<SetupResult> {
   const existing = loadExistingConfig();
-  const config = baseConfig(existing, options);
+  const config = buildSetupConfig(existing, options);
   const launcherOwned = config.browserHost === "launcher";
   if (!launcherOwned && process.platform !== "darwin") {
     throw new Error(
@@ -260,9 +290,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
       + "Use the Codex Web GPT launcher on Windows or Linux.",
     );
   }
-  preflightCodexIntegration(config, {
-    replaceExistingRoute: options.replaceCodexRoute,
-  });
+  preflightSetupCodexIntegration(config, options);
   const refreshTunnelWorker = tunnelWorkerRuntimeChanged(existing, config);
   if (existing && options.restartService) config.controlToken = randomBytes(32).toString("base64url");
   const beforeService = getServiceStatus();
@@ -379,9 +407,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     launcherOwned && existing && existing.browserHost !== "launcher",
   );
   if (!migratingTerminalRuntime) removeLegacyRuntimeArtifacts(config);
-  installCodexIntegration(config, {
-    replaceExistingRoute: options.replaceCodexRoute,
-  });
+  installSetupCodexIntegration(config, options);
 
   return {
     mode: config.mode,
@@ -389,7 +415,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     loginCreated,
     serviceLoaded: launcherOwned ? false : getServiceStatus().loaded,
     tunnelReady,
-    codexRestartRequired: true,
+    codexRestartRequired: !options.standalone,
     connectorSetupRequired: config.mode === "full",
   };
 }

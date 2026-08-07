@@ -22,6 +22,7 @@ export interface AppConfig {
   version: 3;
   releaseVersion: string;
   mode: RuntimeMode;
+  standalone: boolean;
   host: "127.0.0.1";
   port: number;
   contextWindow: number;
@@ -113,6 +114,7 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     version: 3,
     releaseVersion: VERSION,
     mode,
+    standalone: false,
     host: "127.0.0.1",
     port: 17841,
     contextWindow: 256_000,
@@ -272,6 +274,9 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (parsed.version !== 3) throw new Error(`Unsupported configuration version in ${path}; rerun setup to migrate it`);
   if (typeof parsed.releaseVersion !== "string" || !parsed.releaseVersion.trim()) throw new Error(`Missing releaseVersion in ${path}`);
   if (parsed.mode !== "browser-only" && parsed.mode !== "full") throw new Error(`Invalid runtime mode in ${path}`);
+  if (parsed.standalone !== undefined && typeof parsed.standalone !== "boolean") {
+    throw new Error(`Invalid standalone in ${path}`);
+  }
   if (parsed.host !== "127.0.0.1") throw new Error("The Responses proxy must bind to 127.0.0.1");
   if (parsed.browserHost !== "managed-chrome" && parsed.browserHost !== "launcher") {
     throw new Error(`Invalid browserHost in ${path}`);
@@ -337,7 +342,11 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (parsed.proAvailable !== undefined && typeof parsed.proAvailable !== "boolean") {
     throw new Error(`Invalid proAvailable in ${path}`);
   }
-  return { ...parsed, proAvailable: parsed.proAvailable === true } as AppConfig;
+  return {
+    ...parsed,
+    standalone: parsed.standalone === true,
+    proAvailable: parsed.proAvailable === true,
+  } as AppConfig;
 }
 
 export function saveConfig(config: AppConfig): void {

@@ -9,7 +9,7 @@ import { providerConfig } from "./config";
 import { AsyncEventQueue } from "./event-queue";
 import { readJsonRequestBody } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { augmentNativeModelCatalog } from "./model-catalog";
 import { readCodexModelContextOverride, type CodexModelContextOverride } from "./codex-integration";
 import {
@@ -207,6 +207,72 @@ function toolBridgeMaps(parsed: CodexParsedRequest): {
   return { toolNsMap, freeformToolNames, toolSearchToolNames };
 }
 
+function plainObject(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function standaloneTextContent(value: unknown): boolean {
+  if (typeof value === "string") return true;
+  return Array.isArray(value) && value.every(part => {
+    const block = plainObject(part);
+    return (block?.type === "input_text" || block?.type === "text") && typeof block.text === "string";
+  });
+}
+
+/**
+ * Give an isolated standalone text request the replay identity required by the browser adapter.
+ * Native Codex requests, continuations, and every tool-bearing/non-text shape remain untouched.
+ */
+export function prepareStandaloneTextRequest(
+  raw: unknown,
+  config: AppConfig,
+  identity: string = randomUUID(),
+): unknown {
+  if (!config.standalone || config.mode !== "browser-only") return raw;
+  const body = plainObject(raw);
+  if (!body || body.client_metadata !== undefined || body.previous_response_id !== undefined) return raw;
+  if (Array.isArray(body.tools) ? body.tools.length > 0 : body.tools !== undefined) return raw;
+  if (body.tool_choice !== undefined && body.tool_choice !== "none") return raw;
+  if (body.parallel_tool_calls !== undefined && body.parallel_tool_calls !== false) return raw;
+
+  const input = typeof body.input === "string"
+    ? [{ type: "message", role: "user", content: body.input }]
+    : Array.isArray(body.input) ? body.input : undefined;
+  if (!input) return raw;
+
+  let latestUserIndex = -1;
+  for (let index = 0; index < input.length; index += 1) {
+    const item = plainObject(input[index]);
+    const type = item?.type ?? "message";
+    if (!item || type !== "message"
+      || (item.role !== "system" && item.role !== "developer" && item.role !== "user")
+      || !standaloneTextContent(item.content)) return raw;
+    if (item.role === "user") latestUserIndex = index;
+  }
+  if (latestUserIndex < 0) return raw;
+
+  const turnId = `standalone_${identity}`;
+  const latestUser = plainObject(input[latestUserIndex])!;
+  const taggedInput = input.map((item, index) => index === latestUserIndex ? {
+    ...plainObject(item),
+    type: "message",
+    id: `msg_${identity}`,
+    internal_chat_message_metadata_passthrough: { turn_id: turnId },
+  } : item);
+  return {
+    ...body,
+    input: taggedInput,
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({
+        thread_id: turnId,
+        turn_id: turnId,
+      }),
+    },
+  };
+}
+
 export async function responseRequest(
   req: Request,
   config: AppConfig,
@@ -236,7 +302,7 @@ export async function responseRequest(
   const requestedPreviousResponseId = raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { previous_response_id?: unknown }).previous_response_id
     : undefined;
-  const expanded = expandPreviousResponseInput(raw);
+  const expanded = expandPreviousResponseInput(prepareStandaloneTextRequest(raw, config));
   let parsed: CodexParsedRequest;
   let route: ChatGptWebModelRoute;
   try {
