@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { extractChatGptTurnEnvironment } from "../src/adapters/chatgpt-web/environment";
+import { extractChatGptTurnEnvironment, extractStandaloneGooseToolEnvironment } from "../src/adapters/chatgpt-web/environment";
 import { ChatGptThreadEnvironmentStore } from "../src/adapters/chatgpt-web/thread-environment";
 import type { CodexParsedRequest, CodexTool } from "../src/types";
 
@@ -262,5 +262,33 @@ describe("trusted Codex task environment continuity", () => {
     const invalidUpdate = currentWire({ sandbox: "read-only" });
     invalidUpdate.context.systemPrompt = [`<environment_context><cwd>${root}</cwd></environment_context>`];
     expect(() => store.resolve(invalidUpdate)).toThrow("requires one explicit trusted Codex sandbox mode");
+  });
+});
+
+describe("standalone Goose tool environment", () => {
+  test("carries only Goose's own advertised tools and fabricates no cwd, roots, or sandbox authority", () => {
+    const tools: CodexTool[] = [{ name: "get_proof_nonce", description: "proof", parameters: { type: "object" } }];
+    const request: CodexParsedRequest = {
+      modelId: "gpt-5.6-sol",
+      stream: true,
+      context: { tools, messages: [{ role: "user", content: "go", timestamp: 1 }] },
+      options: { reasoning: "high" },
+    };
+    const environment = extractStandaloneGooseToolEnvironment(request);
+    expect(environment).toEqual({ roots: [], writableRoots: [], tools });
+    expect(environment.cwd).toBeUndefined();
+    expect(environment.sandboxPolicy).toBeUndefined();
+    expect("cwd" in environment).toBe(false);
+    expect("sandboxPolicy" in environment).toBe(false);
+  });
+
+  test("reflects an empty tool registry rather than inventing one", () => {
+    const request: CodexParsedRequest = {
+      modelId: "gpt-5.6-sol",
+      stream: true,
+      context: { messages: [{ role: "user", content: "go", timestamp: 1 }] },
+      options: { reasoning: "high" },
+    };
+    expect(extractStandaloneGooseToolEnvironment(request).tools).toEqual([]);
   });
 });

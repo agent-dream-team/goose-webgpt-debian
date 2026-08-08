@@ -99,9 +99,23 @@ test("standalone setup produces usable browser-only daemon configuration", () =>
   });
   expect(config.tunnel).toBeUndefined();
   expect(provider.chatgptWeb!.localToolsEnabled).toBe(false);
-  expect(() => buildSetupConfig(undefined, {
+});
+
+test("standalone setup also allows full mode, enabling local tools without touching Codex", () => {
+  const config = buildSetupConfig(undefined, {
     mode: "full",
     standalone: true,
     acknowledgedUnofficial: true,
-  })).toThrow("Standalone setup requires --browser-only");
+  });
+  const provider = providerConfig(config);
+
+  expect(config).toMatchObject({ mode: "full", standalone: true });
+  expect(provider.chatgptWeb!.localToolsEnabled).toBe(true);
+  expect(provider.chatgptWeb!.standalone).toBe(true);
+  expect(preflightSetupCodexIntegration(config, { mode: "full", standalone: true }, () => {
+    throw new Error("must not preflight Codex integration for standalone full setup");
+  })).toBe(false);
+  expect(installSetupCodexIntegration(config, { mode: "full", standalone: true }, () => {
+    throw new Error("must not install Codex integration for standalone full setup");
+  })).toBe(false);
 });

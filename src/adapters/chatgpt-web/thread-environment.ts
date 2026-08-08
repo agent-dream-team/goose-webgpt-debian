@@ -98,6 +98,11 @@ function validateStoredEnvironment(value: unknown): StoredThreadEnvironment {
 }
 
 function authority(environment: ChatGptTurnEnvironment, updatedAt: number): StoredThreadEnvironment {
+  if (environment.cwd === undefined || environment.sandboxPolicy === undefined) {
+    // This store only ever carries trusted native Codex authority (see class doc comment); a
+    // standalone Goose environment, which supplies neither field, must never reach here.
+    throw new Error("ChatGPT thread environment store requires a trusted cwd and sandboxPolicy");
+  }
   return {
     cwd: environment.cwd,
     roots: environment.roots,

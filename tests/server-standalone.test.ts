@@ -3,7 +3,7 @@ import type { ProviderAdapter } from "../src/adapters/base";
 import { extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
 import { chatGptTurnExecutionKey } from "../src/adapters/chatgpt-web/turn-execution";
 import { defaultConfig } from "../src/config";
-import { prepareStandaloneTextRequest, responseRequest } from "../src/server";
+import { prepareStandaloneTextRequest, prepareStandaloneToolRequest, responseRequest } from "../src/server";
 import type { CodexParsedRequest } from "../src/types";
 
 const model = "chatgpt-web/high";
@@ -140,4 +140,76 @@ test("assistant history carrying a tool call still falls through to the native-C
     ],
   };
   expect(prepareStandaloneTextRequest(raw, config)).toBe(raw);
+});
+
+const toolConfig = { ...defaultConfig("full"), standalone: true };
+const proofTool = { type: "function", name: "get_proof_nonce", description: "Return the proof nonce.", parameters: { type: "object", properties: {} } };
+
+test("prepareStandaloneToolRequest only applies to standalone full-mode requests", () => {
+  const raw = {
+    model,
+    input: [{ role: "user", content: [{ type: "input_text", text: "Use the proof tool." }] }],
+    tools: [proofTool],
+  };
+  expect(prepareStandaloneToolRequest(raw, defaultConfig("full"))).toBe(raw);
+  expect(prepareStandaloneToolRequest(raw, { ...defaultConfig("browser-only"), standalone: true })).toBe(raw);
+  expect(prepareStandaloneToolRequest(raw, toolConfig)).not.toBe(raw);
+});
+
+test("a tool-request round and its function_call_output round resolve to the identical turn_id", () => {
+  const initialRound = {
+    model,
+    tools: [proofTool],
+    input: [
+      { role: "system", content: [{ type: "input_text", text: "You are a general-purpose AI agent called goose." }] },
+      { role: "user", content: [{ type: "input_text", text: "Call get_proof_nonce and reply with exactly its result." }] },
+    ],
+  };
+  // Goose resends the full conversation and only appends function_call/function_call_output after
+  // the same latest user message; it never edits that message between the two provider rounds.
+  const followUpRound = {
+    ...initialRound,
+    input: [
+      ...initialRound.input,
+      { type: "function_call", call_id: "call_abc123", name: "get_proof_nonce", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_abc123", output: "GOOSE_TOOL_PROOF_example" },
+    ],
+  };
+  const initialTurnId = turnIdOf(prepareStandaloneToolRequest(initialRound, toolConfig));
+  const followUpTurnId = turnIdOf(prepareStandaloneToolRequest(followUpRound, toolConfig));
+  expect(followUpTurnId).toBe(initialTurnId);
+});
+
+test("a genuinely new human user message after a completed tool round gets a fresh turn_id", () => {
+  const completedTurn = {
+    model,
+    tools: [proofTool],
+    input: [
+      { role: "user", content: [{ type: "input_text", text: "Call get_proof_nonce and reply with exactly its result." }] },
+      { type: "function_call", call_id: "call_abc123", name: "get_proof_nonce", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_abc123", output: "GOOSE_TOOL_PROOF_example" },
+      { role: "assistant", content: [{ type: "output_text", text: "GOOSE_TOOL_PROOF_example" }] },
+    ],
+  };
+  const nextHumanTurn = {
+    ...completedTurn,
+    input: [
+      ...completedTurn.input,
+      { role: "user", content: [{ type: "input_text", text: "Call it again." }] },
+    ],
+  };
+  const firstTurnId = turnIdOf(prepareStandaloneToolRequest(completedTurn, toolConfig));
+  const secondTurnId = turnIdOf(prepareStandaloneToolRequest(nextHumanTurn, toolConfig));
+  expect(secondTurnId).not.toBe(firstTurnId);
+});
+
+test("a byte-identical retry of a tool-request round is idempotent", () => {
+  const round = {
+    model,
+    tools: [proofTool],
+    input: [{ role: "user", content: [{ type: "input_text", text: "Call get_proof_nonce and reply with exactly its result." }] }],
+  };
+  const first = turnIdOf(prepareStandaloneToolRequest(round, toolConfig));
+  const second = turnIdOf(prepareStandaloneToolRequest(structuredClone(round), toolConfig));
+  expect(second).toBe(first);
 });

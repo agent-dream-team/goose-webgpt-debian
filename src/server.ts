@@ -248,6 +248,43 @@ function standaloneAssistantTextContent(value: unknown): boolean {
  * already answered. A genuinely new user message changes the prefix and therefore always gets a
  * fresh identity, i.e. a fresh browser turn.
  */
+/**
+ * Tag the input item at `latestUserIndex` with deterministic synthetic thread/turn identity so the
+ * adapter's execution-key derivation (which requires native-Codex-shaped turn_id metadata) accepts
+ * a standalone request. Identity defaults to a digest of the input prefix ending at that item, not a
+ * fresh random value: a byte-identical retry — or, for a tool-bearing round, the follow-up request
+ * carrying the tool result — collapses onto the same execution key instead of opening a second
+ * browser tab for work that is already in flight or already answered.
+ */
+function tagStandaloneIdentity(
+  body: Record<string, unknown>,
+  input: unknown[],
+  latestUserIndex: number,
+  identity: string | undefined,
+): unknown {
+  const resolvedIdentity = identity ?? createHash("sha256")
+    .update(JSON.stringify(input.slice(0, latestUserIndex + 1)))
+    .digest("hex")
+    .slice(0, 32);
+  const turnId = `standalone_${resolvedIdentity}`;
+  const taggedInput = input.map((item, index) => index === latestUserIndex ? {
+    ...plainObject(item),
+    type: "message",
+    id: `msg_${resolvedIdentity}`,
+    internal_chat_message_metadata_passthrough: { turn_id: turnId },
+  } : item);
+  return {
+    ...body,
+    input: taggedInput,
+    client_metadata: {
+      "x-codex-turn-metadata": JSON.stringify({
+        thread_id: turnId,
+        turn_id: turnId,
+      }),
+    },
+  };
+}
+
 export function prepareStandaloneTextRequest(
   raw: unknown,
   config: AppConfig,
@@ -279,29 +316,58 @@ export function prepareStandaloneTextRequest(
     if (item.role === "user") latestUserIndex = index;
   }
   if (latestUserIndex < 0) return raw;
+  return tagStandaloneIdentity(body, input, latestUserIndex, identity);
+}
 
-  const resolvedIdentity = identity ?? createHash("sha256")
-    .update(JSON.stringify(input.slice(0, latestUserIndex + 1)))
-    .digest("hex")
-    .slice(0, 32);
-  const turnId = `standalone_${resolvedIdentity}`;
-  const latestUser = plainObject(input[latestUserIndex])!;
-  const taggedInput = input.map((item, index) => index === latestUserIndex ? {
-    ...plainObject(item),
-    type: "message",
-    id: `msg_${resolvedIdentity}`,
-    internal_chat_message_metadata_passthrough: { turn_id: turnId },
-  } : item);
-  return {
-    ...body,
-    input: taggedInput,
-    client_metadata: {
-      "x-codex-turn-metadata": JSON.stringify({
-        thread_id: turnId,
-        turn_id: turnId,
-      }),
-    },
-  };
+function standaloneAllowedToolItem(item: Record<string, unknown>): boolean {
+  if (item.type === "function_call") return typeof item.call_id === "string" && typeof item.name === "string";
+  if (item.type === "function_call_output") return typeof item.call_id === "string";
+  return false;
+}
+
+/**
+ * Same deterministic replay identity as {@link prepareStandaloneTextRequest}, but for a standalone
+ * Goose round that advertises tools and may carry a `function_call`/`function_call_output` pair.
+ * Goose resends its full canonical conversation on every provider round and only ever appends
+ * function_call/function_call_output items after the latest real user message — it never edits or
+ * removes that message — so hashing the input prefix ending at that message gives the tool-request
+ * round and its later tool-result round the identical identity, letting them resolve to the same
+ * `ChatGptTurnSession` through the existing, unmodified session registry. A genuinely new user
+ * message always shifts that prefix and therefore always gets a fresh identity.
+ */
+export function prepareStandaloneToolRequest(
+  raw: unknown,
+  config: AppConfig,
+  identity?: string,
+): unknown {
+  if (!config.standalone || config.mode !== "full") return raw;
+  const body = plainObject(raw);
+  if (!body || body.client_metadata !== undefined || body.previous_response_id !== undefined) return raw;
+
+  const input = typeof body.input === "string"
+    ? [{ type: "message", role: "user", content: body.input }]
+    : Array.isArray(body.input) ? body.input : undefined;
+  if (!input) return raw;
+
+  let latestUserIndex = -1;
+  for (let index = 0; index < input.length; index += 1) {
+    const item = plainObject(input[index]);
+    if (!item) return raw;
+    const type = item.type ?? "message";
+    if (type !== "message") {
+      if (!standaloneAllowedToolItem(item)) return raw;
+      continue;
+    }
+    if (item.role === "assistant") {
+      if (!standaloneAssistantTextContent(item.content)) return raw;
+      continue;
+    }
+    if ((item.role !== "system" && item.role !== "developer" && item.role !== "user")
+      || !standaloneTextContent(item.content)) return raw;
+    if (item.role === "user") latestUserIndex = index;
+  }
+  if (latestUserIndex < 0) return raw;
+  return tagStandaloneIdentity(body, input, latestUserIndex, identity);
 }
 
 export async function responseRequest(
@@ -333,7 +399,8 @@ export async function responseRequest(
   const requestedPreviousResponseId = raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { previous_response_id?: unknown }).previous_response_id
     : undefined;
-  const expanded = expandPreviousResponseInput(prepareStandaloneTextRequest(raw, config));
+  const standalonePrepared = prepareStandaloneToolRequest(prepareStandaloneTextRequest(raw, config), config);
+  const expanded = expandPreviousResponseInput(standalonePrepared);
   let parsed: CodexParsedRequest;
   let route: ChatGptWebModelRoute;
   try {

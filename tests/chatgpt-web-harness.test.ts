@@ -14,7 +14,8 @@ import { CHATGPT_WEB_MODEL_ID, resolveChatGptWebModelMode } from "../src/adapter
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt, withoutSupersededModelSwitchContracts } from "../src/adapters/chatgpt-web/prompt";
 import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions, chatGptCompactionSourceExecutionKey, chatGptTurnExecutionKey } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
-import { defaultBrokerEndpoint } from "../src/config";
+import { defaultBrokerEndpoint, defaultConfig } from "../src/config";
+import { prepareStandaloneToolRequest, routeChatGptWebRequest } from "../src/server";
 import { estimateChatGptWebUsage } from "../src/adapters/chatgpt-web/usage";
 import { decodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { parseRequest } from "../src/responses/parser";
@@ -239,6 +240,84 @@ describe("ChatGPT outer-native harness v3", () => {
       await createChatGptWebAdapter(provider).runTurn!(request, { headers: new Headers() }, event => events.push(event));
       expect(browserStarts).toBe(1);
       expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
+  test("starts a standalone Goose tool turn with only Goose's advertised tools, no invented cwd/roots/sandbox", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h3-standalone-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: "browser://chatgpt-standalone-test",
+      chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: true, proAvailable: false, standalone: true },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      expect(prepared.text).toContain("Act as the model backend for the Goose task encoded below.");
+      expect(prepared.text).not.toContain("outer Codex turn");
+      const answer = "Standalone Goose turn accepted";
+      turn.onTextDelta(answer);
+      return answer;
+    };
+    try {
+      const toolConfig = { ...defaultConfig("full"), standalone: true };
+      const raw = prepareStandaloneToolRequest({
+        model: "chatgpt-web/high",
+        tools: [{ type: "function", name: "get_proof_nonce", description: "Return the proof nonce.", parameters: { type: "object", properties: {} } }],
+        input: [{ role: "user", content: [{ type: "input_text", text: "Call get_proof_nonce and reply with exactly its result." }] }],
+      }, toolConfig);
+      const request = parseRequest(raw as Record<string, unknown>);
+      routeChatGptWebRequest(request, toolConfig);
+
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(request, { headers: new Headers() }, event => events.push(event));
+      expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+    } finally {
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      await TurnBroker.forSocket(socketPath).close();
+    }
+  });
+
+  test("a standalone Goose turn fails closed when ChatGPT requests a tool Goose did not advertise", async () => {
+    const socketPath = brokerTestEndpoint(`cgw-h3-standalone-unadvertised-${process.pid}-${Date.now()}`);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: "browser://chatgpt-standalone-unadvertised-test",
+      chatgptWeb: { brokerSocketPath: socketPath, localToolsEnabled: true, proAvailable: false, standalone: true },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(provider);
+    const originalRun = worker.run.bind(worker);
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      const prepared = await turn.prepare();
+      const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
+      expect(token).toBeDefined();
+      const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token: token! });
+      // Simulate ChatGPT asking for a tool that was never in Goose's advertised registry.
+      await callTurnBroker(socketPath, {
+        method: "invoke",
+        bindingId: claimed.bindingId,
+        wireName: "not_advertised_tool",
+        freeform: false,
+        arguments: {},
+      }, 10_000).catch(() => {});
+      return "unreachable";
+    };
+    try {
+      const toolConfig = { ...defaultConfig("full"), standalone: true };
+      const raw = prepareStandaloneToolRequest({
+        model: "chatgpt-web/high",
+        tools: [{ type: "function", name: "get_proof_nonce", description: "Return the proof nonce.", parameters: { type: "object", properties: {} } }],
+        input: [{ role: "user", content: [{ type: "input_text", text: "Call get_proof_nonce and reply with exactly its result." }] }],
+      }, toolConfig);
+      const request = parseRequest(raw as Record<string, unknown>);
+      routeChatGptWebRequest(request, toolConfig);
+
+      await expect(createChatGptWebAdapter(provider).runTurn!(request, { headers: new Headers() }, () => {}))
+        .rejects.toThrow("did not advertise");
     } finally {
       (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
       await TurnBroker.forSocket(socketPath).close();
@@ -572,6 +651,29 @@ describe("ChatGPT outer-native harness v3", () => {
       proAvailable: false,
     })).toThrow("Extra High effort is not available");
     expect(() => resolveChatGptWebModelMode("unknown", "high", toolCapabilities)).toThrow("model is not supported");
+  });
+
+  test("names Codex as the outer harness by default and leaves the connector's own tool names untouched", () => {
+    const request = parsed();
+    const compiled = compileChatGptWebPrompt(request, toolCapabilities, "turn_123456789012345678901234");
+    expect(compiled.text).toContain("Act as the model backend for the Codex task encoded below.");
+    expect(compiled.text).toContain("outer Codex turn");
+    expect(compiled.text).toContain("call codex_bind_turn with turn_token turn_123456789012345678901234");
+    expect(compiled.text).toContain("Use codex_tool_inventory and codex_tool_call for any other tool advertised by the current Codex harness");
+    expect(compiled.text).not.toContain("Goose");
+  });
+
+  test("names Goose as the outer harness for a standalone turn without renaming any connector tool", () => {
+    const request = parsed();
+    const compiled = compileChatGptWebPrompt(request, toolCapabilities, "turn_123456789012345678901234", "Goose");
+    expect(compiled.text).toContain("Act as the model backend for the Goose task encoded below.");
+    expect(compiled.text).toContain("outer Goose turn");
+    expect(compiled.text).toContain("Use codex_tool_inventory and codex_tool_call for any other tool advertised by the current Goose harness");
+    // The connector's own registered identity and its literal MCP tool names are reused as-is.
+    expect(compiled.text).toContain("Codex Native plugin");
+    expect(compiled.text).toContain("call codex_bind_turn with turn_token turn_123456789012345678901234");
+    expect(compiled.text).not.toContain("outer Codex turn");
+    expect(compiled.text).not.toContain("Act as the model backend for the Codex task");
   });
 
   test("builds a context-complete Pro prompt without exposing any local-tool capability", () => {

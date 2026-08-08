@@ -8,10 +8,12 @@ export type ChatGptSandboxPolicy =
   | { type: "workspaceWrite"; writableRoots: string[]; networkAccess: boolean };
 
 export interface ChatGptTurnEnvironment {
-  cwd: string;
+  /** Absent means no trusted local-authority provenance was supplied for this turn (unknown, never a fabricated default). */
+  cwd?: string;
   roots: string[];
   writableRoots: string[];
-  sandboxPolicy: ChatGptSandboxPolicy;
+  /** Absent means no sandbox authority was supplied for this turn (unknown/not granted, never a fabricated default). */
+  sandboxPolicy?: ChatGptSandboxPolicy;
   tools: CodexTool[];
 }
 
@@ -370,6 +372,16 @@ export function extractChatGptTurnEnvironment(parsed: CodexParsedRequest): ChatG
     };
   }
   return { cwd, roots, writableRoots: [], sandboxPolicy: { type: "readOnly", networkAccess }, tools: parsed.context.tools ?? [] };
+}
+
+/**
+ * Standalone Goose turns carry none of native Codex's trusted `<environment_context>` envelope, and
+ * this bridge must not invent one. The only authority actually supplied by Goose for a given
+ * provider round is its own advertised tool registry, so that is the only field populated here;
+ * cwd/roots/writableRoots/sandboxPolicy stay absent (unknown/not granted) rather than guessed.
+ */
+export function extractStandaloneGooseToolEnvironment(parsed: CodexParsedRequest): ChatGptTurnEnvironment {
+  return { roots: [], writableRoots: [], tools: parsed.context.tools ?? [] };
 }
 
 export function extractChatGptTurnIdentity(parsed: CodexParsedRequest): ChatGptTurnIdentity {

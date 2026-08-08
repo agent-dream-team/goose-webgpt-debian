@@ -325,5 +325,7 @@ export interface CodexProviderConfig {
     proAvailable?: boolean;
     /** Authorize per-call "Allow once" confirmation clicks for this connector. */
     autoApproveToolCalls?: boolean;
+    /** True when this daemon runs without any native Codex integration; the outer harness is not Codex. */
+    standalone?: boolean;
   };
 }

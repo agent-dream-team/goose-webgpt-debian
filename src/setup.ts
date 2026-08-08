@@ -177,9 +177,6 @@ async function waitForProxy(config: AppConfig, timeoutMs = 10_000): Promise<void
 }
 
 export function buildSetupConfig(existing: AppConfig | undefined, options: SetupOptions): AppConfig {
-  if (options.standalone && options.mode !== "browser-only") {
-    throw new Error("Standalone setup requires --browser-only");
-  }
   if (options.standalone && options.replaceCodexRoute) {
     throw new Error("Standalone setup cannot replace the Codex route");
   }

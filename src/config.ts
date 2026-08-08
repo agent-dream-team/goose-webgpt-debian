@@ -379,6 +379,7 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       localToolsEnabled: config.mode === "full",
       proAvailable: config.proAvailable,
       autoApproveToolCalls: config.autoApproveToolCalls,
+      standalone: config.standalone === true,
     },
   };
 }

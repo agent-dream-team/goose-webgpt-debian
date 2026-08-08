@@ -6,7 +6,7 @@ import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import { ChatGptBrowserWorker } from "./browser-worker";
-import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "./environment";
+import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractStandaloneGooseToolEnvironment } from "./environment";
 import { resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult } from "./turn-broker";
@@ -157,6 +157,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
   const worker = ChatGptBrowserWorker.forProvider(provider);
   const broker = TurnBroker.forSocket(brokerSocketPath(provider));
   const timeoutMs = provider.chatgptWeb?.turnTimeoutMs;
+  const standaloneGoose = provider.chatgptWeb?.standalone === true;
   const configuredCapabilities: ChatGptWebCapabilities = {
     localToolsEnabled: provider.chatgptWeb?.localToolsEnabled === true,
     proAvailable: provider.chatgptWeb?.proAvailable === true,
@@ -187,7 +188,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
         modelId: parsed.modelId,
         reasoning: parsed.options.reasoning,
         capabilities: turnCapabilities,
-        prepare: async () => ({ ...compileChatGptWebPrompt(parsed, turnCapabilities), release: () => {} }),
+        prepare: async () => ({ ...compileChatGptWebPrompt(parsed, turnCapabilities, undefined, standaloneGoose ? "Goose" : "Codex"), release: () => {} }),
         abortSignal: browserAbort.signal,
         onReasoningSummary: (text, continuation) => trace.push({ kind: "reasoning", text, ...(continuation ? { continuation: true } : {}) }),
         onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
@@ -201,7 +202,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
         cancel: () => browserAbort.abort(),
       };
     }
-    if (!environment) throw new Error("Tool-capable ChatGPT web mode requires a trusted Codex environment");
+    if (!environment) throw new Error("Tool-capable ChatGPT web mode requires a resolved outer-harness environment");
     const token = deferred<string>();
     let tokenSettled = false;
     let activeToken: string | undefined;
@@ -220,7 +221,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
         tokenSettled = true;
         token.resolve(turnToken);
         try {
-          const compiled = compileChatGptWebPrompt(parsed, turnCapabilities, turnToken);
+          const compiled = compileChatGptWebPrompt(parsed, turnCapabilities, turnToken, standaloneGoose ? "Goose" : "Codex");
           return { ...compiled, release: () => {} };
         } catch (error) {
           broker.revoke(turnToken);
@@ -267,14 +268,20 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
       const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities);
       let environment: ReturnType<typeof extractChatGptTurnEnvironment> | undefined;
       if (mode.localTools) {
-        try {
-          environment = environmentStore.resolve(parsed);
-        } catch (error) {
-          const identity = extractChatGptTurnIdentity(parsed);
-          console.warn(
-            `[chatgpt-web] trusted environment unavailable (thread_id=${identity.threadId ? "present" : "missing"}, turn_id=${identity.turnId ? "present" : "missing"}, previous_response_id=${parsed.previousResponseId ?? "none"}, replay_prefix_items=${parsed._replayPrefixLen ?? 0}, context_messages=${parsed.context.messages.length})`,
-          );
-          throw error;
+        if (standaloneGoose) {
+          // Standalone Goose supplies no trusted Codex environment envelope and this bridge must not
+          // invent one; only Goose's own advertised tool registry is authoritative here.
+          environment = extractStandaloneGooseToolEnvironment(parsed);
+        } else {
+          try {
+            environment = environmentStore.resolve(parsed);
+          } catch (error) {
+            const identity = extractChatGptTurnIdentity(parsed);
+            console.warn(
+              `[chatgpt-web] trusted environment unavailable (thread_id=${identity.threadId ? "present" : "missing"}, turn_id=${identity.turnId ? "present" : "missing"}, previous_response_id=${parsed.previousResponseId ?? "none"}, replay_prefix_items=${parsed._replayPrefixLen ?? 0}, context_messages=${parsed.context.messages.length})`,
+            );
+            throw error;
+          }
         }
       }
       if (parsed._compactionRequest) {

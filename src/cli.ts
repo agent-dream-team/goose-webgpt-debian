@@ -43,7 +43,7 @@ Usage:
 
 Setup options:
   --browser-only               Account-eligible Web models, full context/images, no local tools or tunnel
-  --standalone                 Set up the browser-only daemon without inspecting or configuring Codex
+  --standalone                 Set up the daemon (browser-only or full) without inspecting or configuring Codex
   --full                       Account-eligible Web models with tools; Pro remains read-only
   --port NUMBER                Loopback Responses port (default: 17841)
   --chrome PATH                Google Chrome executable
