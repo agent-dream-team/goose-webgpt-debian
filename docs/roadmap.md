@@ -28,10 +28,18 @@ Status as of 2026-08-08: **PASS (fallback #2).** Three mechanisms were tried in 
 Follow-ups:
 
 - The ~2–3s activation window at turn start is a known, bounded limitation of this fallback, not eliminated by it; do not attempt further focus-suppression tricks without new evidence.
-- Investigate why headed managed Chrome showed two ChatGPT tabs during earlier proof runs; session naming explained the second independent turn in those runs, so verify normal operation stays at the minimum required browser surfaces once auxiliary calls are disabled.
-- Add recovery for a crashed or externally killed managed browser so a stale Playwright browser/context handle is discarded and a fresh browser is acquired instead of returning `Target page, context or browser has been closed`.
-- Improve send-stage diagnostics so a rate-limit dialog that appears after submission is classified explicitly instead of degrading into a generic send acknowledgement timeout.
-- Keep rate-limit handling conservative: a confirmed 429 should trigger backoff/stop behaviour with a very low retry cap, never a rapid retry loop.
+
+## Completed milestone — bounded browser-reliability follow-ups
+
+Status as of 2026-08-08: **PASS.**
+
+- Stale managed-browser recovery: `ensureManagedBrowser()` in `src/adapters/chatgpt-web/browser-worker.ts` now checks `browser.isConnected()` and `!context.isClosed()` before reusing the cached handle; a dead one is discarded (no process killing — just dropping the reference) and a fresh browser is acquired instead of surfacing `Target page, context or browser has been closed`. Bounded: one check, one relaunch attempt, no retry loop. Live-validated: the cached managed Chrome process was killed with a single targeted `kill -TERM` (not a broad kill), and the next turn transparently acquired a fresh browser and reached `composer_ready` successfully — no stale-handle error surfaced.
+- Send-stage 429 detection: `waitForSubmissionAccepted()` now also calls the existing `throwIfChatGptRateLimitDialog()` on every poll, so a rate-limit dialog appearing after submission surfaces as an explicit `429`/`rate_limit_error` instead of degrading into a generic send-stage timeout. Covered by a focused test (dialog visible ⇒ explicit 429, not a hang); a real live 429 was not forced, since reliably reproducing ChatGPT's actual rate limit requires abusive rapid-fire requests, which is out of scope.
+- Minimum browser-surface count re-confirmed with `GOOSE_DISABLE_SESSION_NAMING=true`: one ordinary Goose request produced exactly one managed Chrome process and exactly one ChatGPT browser turn, end to end to a correct reply.
+- No retry/backoff logic was added — 429 handling stays conservative by construction (surface once, explicitly, and stop; a confirmed 429 should still only ever get a very low retry cap with no rapid retry loop if retry logic is added later).
+- Local validation: `bun test tests/*.test.ts` — 273 passed, 0 failed; `bunx tsc --noEmit` — clean.
+
+Newly discovered, explicitly **not fixed** in this milestone (stop-boundary: this is a deeper issue than "died or was externally closed"): after using `codex-chatgpt-web service cancel-turns` to abort a turn that was already stuck in an unrelated pre-existing stage-timeout (`session_verification`, intermittent ChatGPT-side screenshot/DOM flakiness seen throughout this session, unrelated to the browser-worker code), the worker's cached browser handle was observed to still report `isConnected() === true` / `!isClosed()` on the next call, yet a subsequent `context.newPage()` hung for the full stage timeout instead of erroring or succeeding — i.e., a "wedged but technically connected" handle that the new liveness check cannot detect, distinct from an outright-dead handle. A clean daemon/service restart resolved it immediately. Follow-up options for later, not started: a real (bounded, timeout-guarded) CDP round-trip liveness probe instead of the cheap local checks, and/or having `cancel-turns` itself discard the worker's cached browser handle rather than leaving it for the next turn to discover.
 
 ## Then — reconcile with upstream before more custom development
 

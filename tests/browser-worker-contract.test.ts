@@ -176,6 +176,78 @@ test("minimizeManagedWindow clears its internal timer once the attempt settles",
   }
 });
 
+test("ensureManagedBrowser reuses a cached browser/context that is still connected", async () => {
+  const ensureManagedBrowser = (ChatGptBrowserWorker.prototype as unknown as {
+    ensureManagedBrowser(): Promise<{ browser: unknown; context: unknown }>;
+  }).ensureManagedBrowser;
+
+  const cached = { browser: { isConnected: () => true }, context: { isClosed: () => false } };
+  const worker = {
+    managedBrowserReady: Promise.resolve(cached),
+    browser: cached.browser,
+    context: cached.context,
+    config: { storageStatePath: "/nonexistent/should-not-be-read", chromeExecutablePath: "/nonexistent/should-not-be-read" },
+  };
+
+  const result = await ensureManagedBrowser.call(worker);
+
+  expect(result).toBe(cached);
+  expect(worker.managedBrowserReady).resolves.toBe(cached);
+  expect(worker.browser).toBe(cached.browser);
+  expect(worker.context).toBe(cached.context);
+});
+
+test("ensureManagedBrowser discards a stale (disconnected) cached browser instead of reusing it", async () => {
+  const ensureManagedBrowser = (ChatGptBrowserWorker.prototype as unknown as {
+    ensureManagedBrowser(): Promise<{ browser: unknown; context: unknown }>;
+  }).ensureManagedBrowser;
+
+  const stale = { browser: { isConnected: () => false }, context: { isClosed: () => false } };
+  const worker = {
+    managedBrowserReady: Promise.resolve(stale),
+    browser: stale.browser,
+    context: stale.context,
+    // A missing storage state deterministically fails the fresh-acquisition attempt, which is
+    // exactly how this test proves the stale connection was discarded rather than reused: a
+    // working implementation must reach (and fail in) the relaunch path, not return `stale`.
+    config: { storageStatePath: "/nonexistent/storage-state.json", chromeExecutablePath: "/nonexistent/chrome" },
+  };
+
+  await expect(ensureManagedBrowser.call(worker)).rejects.toThrow("ChatGPT web login state is missing");
+  expect(worker.managedBrowserReady).toBeUndefined();
+  expect(worker.browser).toBeUndefined();
+  expect(worker.context).toBeUndefined();
+});
+
+test("ensureManagedBrowser discards a stale cached context even when the browser itself is still connected", async () => {
+  const ensureManagedBrowser = (ChatGptBrowserWorker.prototype as unknown as {
+    ensureManagedBrowser(): Promise<{ browser: unknown; context: unknown }>;
+  }).ensureManagedBrowser;
+
+  const stale = { browser: { isConnected: () => true }, context: { isClosed: () => true } };
+  const worker = {
+    managedBrowserReady: Promise.resolve(stale),
+    browser: stale.browser,
+    context: stale.context,
+    config: { storageStatePath: "/nonexistent/storage-state.json", chromeExecutablePath: "/nonexistent/chrome" },
+  };
+
+  await expect(ensureManagedBrowser.call(worker)).rejects.toThrow("ChatGPT web login state is missing");
+});
+
+test("ensureManagedBrowser treats a rejected in-flight launch as no cache, not as a stale browser", async () => {
+  const ensureManagedBrowser = (ChatGptBrowserWorker.prototype as unknown as {
+    ensureManagedBrowser(): Promise<{ browser: unknown; context: unknown }>;
+  }).ensureManagedBrowser;
+
+  const worker = {
+    managedBrowserReady: Promise.reject(new Error("previous launch failed")),
+    config: { storageStatePath: "/nonexistent/storage-state.json", chromeExecutablePath: "/nonexistent/chrome" },
+  };
+
+  await expect(ensureManagedBrowser.call(worker)).rejects.toThrow("ChatGPT web login state is missing");
+});
+
 test("browser turns have no absolute deadline unless one is explicitly configured", () => {
   const provider = { adapter: "chatgpt-web" as const, baseUrl: "browser://chatgpt" };
   expect(resolveBrowserConfig(provider).turnTimeoutMs).toBeUndefined();
@@ -751,6 +823,54 @@ test("submission acceptance stops when its stage is aborted", async () => {
     0,
     controller.signal,
   )).rejects.toMatchObject({ name: "AbortError" });
+});
+
+test("a rate-limit dialog during the send/acknowledgement wait surfaces as an explicit 429, not a generic send timeout", async () => {
+  const waitForSubmissionAccepted = (ChatGptBrowserWorker.prototype as unknown as {
+    waitForSubmissionAccepted(
+      page: Page,
+      userTurns: unknown,
+      responseTurns: unknown,
+      responseTurn: unknown,
+      initialUserTurnCount: number,
+      initialResponseTurnCount: number,
+      signal?: AbortSignal,
+    ): Promise<unknown>;
+  }).waitForSubmissionAccepted;
+
+  const neverVisible = {
+    filter: () => neverVisible,
+    last: () => neverVisible,
+    isVisible: async () => false,
+    count: async () => 0,
+    getByText: () => neverVisible,
+  };
+  const rateLimitDialog = {
+    filter: () => rateLimitDialog,
+    last: () => rateLimitDialog,
+    isVisible: async () => true,
+    getByRole: () => ({ last: () => ({ isVisible: async () => false }) }),
+  };
+  const page = {
+    locator: (selector: string) => (selector === '[role="dialog"]' ? rateLimitDialog : neverVisible),
+  } as unknown as Page;
+  const responseTurn = { getByText: () => neverVisible };
+
+  await expect(waitForSubmissionAccepted.call(
+    {},
+    page,
+    neverVisible,
+    neverVisible,
+    responseTurn,
+    0,
+    0,
+  )).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError",
+    status: 429,
+    errorType: "rate_limit_error",
+    code: "rate_limit_exceeded",
+    retryable: true,
+  });
 });
 
 test("unrelated ChatGPT alerts are not terminal", async () => {

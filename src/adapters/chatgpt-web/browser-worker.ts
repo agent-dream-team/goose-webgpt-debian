@@ -733,6 +733,20 @@ export class ChatGptBrowserWorker {
   }
 
   private async ensureManagedBrowser(): Promise<{ browser: Browser; context: BrowserContext }> {
+    const cached = this.managedBrowserReady;
+    if (cached) {
+      const connection = await cached.catch(() => undefined);
+      if (connection && connection.browser.isConnected() && !connection.context.isClosed()) return connection;
+      // The cached browser/context crashed or was closed externally; discard the stale handle
+      // (rather than surfacing "Target page, context or browser has been closed" from the next
+      // Playwright call) so a fresh managed browser is acquired below. No process killing here:
+      // the dead handle is simply dropped, not the underlying OS process.
+      if (this.managedBrowserReady === cached) {
+        this.managedBrowserReady = undefined;
+        this.browser = undefined;
+        this.context = undefined;
+      }
+    }
     if (this.managedBrowserReady) return this.managedBrowserReady;
     const opening = (async () => {
       if (!existsSync(this.config.storageStatePath) || !existsSync(loginVerificationMarkerPath(this.config.storageStatePath))) {
@@ -965,6 +979,9 @@ export class ChatGptBrowserWorker {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       await throwIfChatGptSessionFailureAlert(page);
       await throwIfChatGptTerminalErrorAlert(responseTurn);
+      // A confirmed 429 during the send/acknowledgement wait must surface as an explicit
+      // rate-limit error, not degrade into a generic "send" stage timeout.
+      await throwIfChatGptRateLimitDialog(page);
       const [userTurnCount, assistantTurnCount, visibleStopButtonCount] = await Promise.all([
         userTurns.count(),
         responseTurns.count(),
