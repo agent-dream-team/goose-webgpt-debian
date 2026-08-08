@@ -19,13 +19,15 @@ Closure: implementation, live proof, local validation, scope review, and indepen
 
 ## Next milestone — browser UX and reliability
 
-After the tool-bridge milestone is closed:
+Status as of 2026-08-08: **PASS (fallback #2).** Three mechanisms were tried in order:
 
-- Prefer headless browser operation for normal automated ChatGPT turns so Chrome does not steal focus or move user input into a newly opened browser window.
-- Keep interactive login, account setup and connector configuration headed/visible.
-- If headless proves incompatible with ChatGPT Web, fall back in this order:
-  1. headed without activation/focus theft;
-  2. headed and immediately hidden/minimized.
+1. Headless by default (`agent/managed-chrome-headless-default`, draft PR #4, not merged) — **blocked**: `chatgpt.com` serves a Cloudflare `Just a moment...` bot-check to Playwright's headless Chromium and never exposes the composer, even with the identical stored session that succeeds headed. Do not revisit without a validated anti-detection change; this repo does not do Cloudflare-bypass work.
+2. Headed without activation/focus theft — **blocked**: a deterministic `NSWorkspace.frontmostApplication` A/B test showed Chrome always activates and steals macOS keyboard focus the instant it shows any real window/tab (confirmed via `chromium.launch()`, via macOS `open -g` non-activating launch, and via a raw CDP `Target.createTarget` call with no Playwright involved at all — all three activate). No Chromium command-line switch suppresses it.
+3. Headed, immediately minimized — **implemented**. `pageForNewTurn()` in `src/adapters/chatgpt-web/browser-worker.ts` now minimizes each new managed-Chrome window immediately after creation via CDP `Browser.getWindowForTarget` + `Browser.setWindowBounds({windowState: "minimized"})`, gated on `config.headed` (headless and `launcher` browser-host turns are unaffected; interactive `loginToChatGpt` is untouched and stays visible). Live A/B testing (`NSWorkspace.frontmostApplication` timeline, 4 runs including one real authenticated ChatGPT turn) showed Chrome activates for roughly 2–3 seconds after each new window, then focus reliably returns to the previously-frontmost app on its own; the real ChatGPT composer became reachable and Goose automation continued to work normally while the window stayed minimized for the rest of the turn.
+
+Follow-ups:
+
+- The ~2–3s activation window at turn start is a known, bounded limitation of this fallback, not eliminated by it; do not attempt further focus-suppression tricks without new evidence.
 - Investigate why headed managed Chrome showed two ChatGPT tabs during earlier proof runs; session naming explained the second independent turn in those runs, so verify normal operation stays at the minimum required browser surfaces once auxiliary calls are disabled.
 - Add recovery for a crashed or externally killed managed browser so a stale Playwright browser/context handle is discarded and a fresh browser is acquired instead of returning `Target page, context or browser has been closed`.
 - Improve send-stage diagnostics so a rate-limit dialog that appears after submission is classified explicitly instead of degrading into a generic send acknowledgement timeout.

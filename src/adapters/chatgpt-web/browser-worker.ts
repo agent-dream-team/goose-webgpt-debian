@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { chromium, type Browser, type BrowserContext, type Locator, type Page } from "playwright-core";
+import { chromium, type Browser, type BrowserContext, type CDPSession, type Locator, type Page } from "playwright-core";
 import { atomicWriteFile, defaultChromeExecutable, expandUserPath, getConfigDir } from "../../config";
 import type { CodexProviderConfig } from "../../types";
 import { parseDataUrl } from "../image";
@@ -769,7 +769,41 @@ export class ChatGptBrowserWorker {
       throw new Error("Launcher turns require an explicitly leased browser surface");
     }
     const { context } = await this.ensureManagedBrowser();
-    return await context.newPage();
+    const page = await context.newPage();
+    if (this.config.headed) await this.minimizeManagedWindow(page);
+    return page;
+  }
+
+  /**
+   * Headed managed Chrome briefly activates and steals macOS keyboard focus the instant a new
+   * window/tab is shown; there is no Chromium launch flag that suppresses it. Minimizing the
+   * window immediately after creation lets focus return to whatever the user was doing within a
+   * couple of seconds instead of leaving Chrome in the foreground for the whole turn. This is
+   * strictly cosmetic: it must never block or fail a turn, so it is bounded by its own short
+   * timeout independent of the browser_page stage deadline.
+   */
+  private async minimizeManagedWindow(page: Page, timeoutMs = 3_000): Promise<void> {
+    let session: CDPSession | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        (async () => {
+          session = await page.context().newCDPSession(page);
+          const { windowId } = await session.send("Browser.getWindowForTarget");
+          await session.send("Browser.setWindowBounds", { windowId, bounds: { windowState: "minimized" } });
+        })(),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("minimize timed out")), timeoutMs);
+        }),
+      ]);
+    } catch (error) {
+      console.warn(
+        `[chatgpt-web] failed to minimize the managed Chrome window: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (session) await (session as CDPSession).detach().catch(() => {});
+    }
   }
 
   private async selectModelAndEffort(
