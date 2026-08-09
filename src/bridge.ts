@@ -188,9 +188,14 @@ export function bridgeToResponsesSSE(
       let outputIndex = 0;
       const finishedItems: OutputItem[] = [];
 
+      // The OpenAI Responses API always includes `error` on the response object (null when there
+      // is none). Some client-side Responses parsers deserialize it as a required (non-optional)
+      // field, so omitting the key entirely on non-failure statuses breaks their stream decode
+      // even before a real failure ever occurs. Failure call sites below override this with the
+      // real error by spreading this snapshot first.
       const responseSnapshot = (status: string, output: OutputItem[], endTurn?: boolean) => ({
         id: responseId, object: "response", created_at: createdAt,
-        status, model: modelId, output, usage: null,
+        status, model: modelId, output, usage: null, error: null,
         ...(endTurn !== undefined ? { end_turn: endTurn } : {}),
       });
 
@@ -1133,6 +1138,7 @@ export function buildResponseJSON(
     created_at: Math.floor(Date.now() / 1000),
     status,
     model: modelId, output,
+    error: null,
     ...(endTurn !== undefined ? { end_turn: endTurn } : {}),
     ...(failure ? { error: failure.error, last_error: failure.error } : {}),
     ...(errorEvent?.retryable !== undefined ? { retryable: errorEvent.retryable } : {}),

@@ -418,7 +418,8 @@ test("closing the launcher page is an immediate terminal turn error", async () =
 test("connector verification and real tool turns share one Playwright selector", () => {
   const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
   expect(workerSource.match(/this\.selectConnector\(page(?:, captureDiagnostic)?\)/g)?.length).toBe(2);
-  expect(workerSource).toContain('composer.pressSequentially("@c", { delay: 25 })');
+  expect(workerSource).toContain("composer.pressSequentially(this.connectorMentionTrigger(), { delay: 25 })");
+  expect(workerSource).not.toMatch(/pressSequentially\("@c"/);
   expect(workerSource).toContain('page.locator(\'.__menu-item[tabindex="0"]\')');
   expect(workerSource).toContain('appResult.dispatchEvent("click")');
   expect(workerSource).not.toContain('composer.press("Enter")');
@@ -546,6 +547,9 @@ test("connector selection re-resolves the active composer after ChatGPT replaces
   let activeComposerCalls = 0;
   const resolved = await selectConnector.call({
     config: { appName: "Codex Native" },
+    connectorMentionTrigger: (ChatGptBrowserWorker.prototype as unknown as {
+      connectorMentionTrigger(): string;
+    }).connectorMentionTrigger,
     connectorIsSelected: async () => connectorSelected,
     selectedConnectorControl: () => selectedConnector,
     activeComposer: async () => {
@@ -565,6 +569,110 @@ test("connector selection re-resolves the active composer after ChatGPT replaces
     ["dispatchResult", "click"],
     ["waitForSelectedConnector"],
   ]);
+});
+
+test("the connector mention trigger derives from the configured connector name, not a hard-coded Codex assumption", () => {
+  const connectorMentionTrigger = (ChatGptBrowserWorker.prototype as unknown as {
+    connectorMentionTrigger(): string;
+  }).connectorMentionTrigger;
+
+  expect(connectorMentionTrigger.call({ config: { appName: "Goose Native" } })).toBe("@g");
+  expect(connectorMentionTrigger.call({ config: { appName: "Codex Native" } })).toBe("@c");
+  expect(connectorMentionTrigger.call({ config: { appName: "Team Codex Harness" } })).toBe("@t");
+  expect(connectorMentionTrigger.call({ config: { appName: "  Goose Native" } })).toBe("@g");
+});
+
+test("connector selection triggers the configured Goose Native mention instead of the retired Codex-only @c trigger", async () => {
+  const calls: Array<[string, string?]> = [];
+  let connectorSelected = false;
+  const appResult = {
+    waitFor: async () => { calls.push(["waitForResult"]); },
+    count: async () => 1,
+    dispatchEvent: async (event: string) => {
+      connectorSelected = true;
+      calls.push(["dispatchResult", event]);
+    },
+  };
+  const selectedConnector = {
+    waitFor: async () => { calls.push(["waitForSelectedConnector"]); },
+    count: async () => 1,
+  };
+  const selectedComposer = {
+    locator: () => ({ filter: () => selectedConnector }),
+  };
+  const initialComposer = {
+    fill: async (value: string) => { calls.push(["fill", value]); },
+    focus: async () => { calls.push(["focus"]); },
+    pressSequentially: async (value: string, options: { delay: number }) => {
+      expect(options).toEqual({ delay: 25 });
+      calls.push(["pressSequentially", value]);
+    },
+  };
+  const page = {
+    getByText: (text: string, options: { exact: boolean }) => {
+      expect(text).toBe("Goose Native");
+      expect(options).toEqual({ exact: true });
+      return { exactConnectorLabel: true };
+    },
+    locator: (selector: string) => selector.includes("__menu-item")
+      ? { filter: () => appResult }
+      : (() => { throw new Error(`Unexpected locator: ${selector}`); })(),
+  };
+  const selectConnector = (ChatGptBrowserWorker.prototype as unknown as {
+    selectConnector(page: unknown): Promise<unknown>;
+  }).selectConnector;
+  const connectorMentionTrigger = (ChatGptBrowserWorker.prototype as unknown as {
+    connectorMentionTrigger(): string;
+  }).connectorMentionTrigger;
+
+  await selectConnector.call({
+    config: { appName: "Goose Native" },
+    connectorMentionTrigger,
+    connectorIsSelected: async () => connectorSelected,
+    selectedConnectorControl: () => selectedConnector,
+    activeComposer: async () => connectorSelected ? selectedComposer : initialComposer,
+  }, page);
+
+  const triggerCall = calls.find(call => call[0] === "pressSequentially");
+  expect(triggerCall?.[1]).toBe("@g");
+  expect(triggerCall?.[1]).not.toBe("@c");
+});
+
+test("connector selection fails closed when the mention menu never exposes exactly one exact-name row", async () => {
+  const appResult = {
+    waitFor: async () => {},
+    count: async () => 0,
+  };
+  const menuRows = {
+    filter: (options: { has?: unknown; visible?: boolean }) => options.has !== undefined ? appResult : menuRows,
+    allInnerTexts: async () => ["Some Other Connector\nextra"],
+  };
+  const initialComposer = {
+    fill: async () => {},
+    focus: async () => {},
+    pressSequentially: async () => {},
+  };
+  const page = {
+    getByText: () => ({ exactConnectorLabel: true }),
+    locator: () => menuRows,
+  };
+  const selectConnector = (ChatGptBrowserWorker.prototype as unknown as {
+    selectConnector(page: unknown): Promise<unknown>;
+  }).selectConnector;
+  const connectorMentionTrigger = (ChatGptBrowserWorker.prototype as unknown as {
+    connectorMentionTrigger(): string;
+  }).connectorMentionTrigger;
+  const connectorMentionRowTitles = (ChatGptBrowserWorker.prototype as unknown as {
+    connectorMentionRowTitles(menuRows: unknown): Promise<string[]>;
+  }).connectorMentionRowTitles;
+
+  await expect(selectConnector.call({
+    config: { appName: "Goose Native" },
+    connectorMentionTrigger,
+    connectorMentionRowTitles,
+    connectorIsSelected: async () => false,
+    activeComposer: async () => initialComposer,
+  }, page)).rejects.toThrow(/did not expose one exact "Goose Native" row/);
 });
 
 test("connector selection retriggers the complete mention after a fresh-page hydration miss", async () => {
@@ -616,6 +724,9 @@ test("connector selection retriggers the complete mention after a fresh-page hyd
   let activeComposerCalls = 0;
   await selectConnector.call({
     config: { appName: "Codex Native" },
+    connectorMentionTrigger: (ChatGptBrowserWorker.prototype as unknown as {
+      connectorMentionTrigger(): string;
+    }).connectorMentionTrigger,
     connectorIsSelected: async () => selected,
     selectedConnectorControl: () => selectedConnector,
     activeComposer: async () => {
@@ -683,6 +794,9 @@ test("tool-capable prompts use the shared Playwright connector selection before 
   await attachPrompt.call({
     config: { appName: "Codex Native" },
     selectConnector,
+    connectorMentionTrigger: (ChatGptBrowserWorker.prototype as unknown as {
+      connectorMentionTrigger(): string;
+    }).connectorMentionTrigger,
     insertPromptText,
     connectorIsSelected: async () => selected,
     selectedConnectorControl: () => selectedConnector,

@@ -1101,6 +1101,15 @@ export class ChatGptBrowserWorker {
       .filter(title => title.length > 0);
   }
 
+  /**
+   * ChatGPT's `@` mention menu filters candidate connectors by the characters typed after `@`.
+   * The trigger must therefore track the actually configured connector name (upstream hard-coded
+   * "@c" for its own "Codex Native2" identity) rather than assume any particular fork's name.
+   */
+  private connectorMentionTrigger(): string {
+    return `@${this.config.appName.trim().charAt(0).toLowerCase()}`;
+  }
+
   private async connectorMentionFailure(menuRows: Locator, triggerAttempts: number): Promise<string> {
     const titles = await this.connectorMentionRowTitles(menuRows);
     if (titles.length === 0) {
@@ -1135,7 +1144,7 @@ export class ChatGptBrowserWorker {
       await composer.fill("");
       await composer.focus();
       await settleChatGptUi();
-      await composer.pressSequentially("@c", { delay: 25 });
+      await composer.pressSequentially(this.connectorMentionTrigger(), { delay: 25 });
       if (!firstMenuCaptured) {
         firstMenuCaptured = true;
         await captureDiagnostic?.("connector-mention-triggered");
