@@ -3,6 +3,7 @@ import { closeChatGptBrowserWorkers } from "./adapters/chatgpt-web/browser-worke
 import { closeTurnBrokers, TurnBroker } from "./adapters/chatgpt-web/turn-broker";
 import { timingSafeEqual } from "node:crypto";
 import { chatGptTurnSessions } from "./adapters/chatgpt-web/turn-execution";
+import { stripVolatileTurnContextParts } from "./adapters/chatgpt-web/environment";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
 import type { AppConfig } from "./config";
 import { providerConfig } from "./config";
@@ -256,6 +257,21 @@ function standaloneAssistantTextContent(value: unknown): boolean {
  * carrying the tool result — collapses onto the same execution key instead of opening a second
  * browser tab for work that is already in flight or already answered.
  */
+/**
+ * The prefix used for standalone-identity hashing, with the latest user message's content
+ * normalized to strip a volatile re-stamped `<turn-context>` block. Without this, a same-turn tool
+ * round trip that crosses a wall-clock tick (Goose re-stamps live current-time into the resent user
+ * message on every provider round) would hash differently and spuriously open a second browser tab.
+ */
+function standaloneIdentityPrefix(input: unknown[], latestUserIndex: number): unknown[] {
+  return input.slice(0, latestUserIndex + 1).map((item, index) => {
+    if (index !== latestUserIndex) return item;
+    const obj = plainObject(item);
+    if (!obj) return item;
+    return { ...obj, content: stripVolatileTurnContextParts(obj.content) };
+  });
+}
+
 function tagStandaloneIdentity(
   body: Record<string, unknown>,
   input: unknown[],
@@ -263,7 +279,7 @@ function tagStandaloneIdentity(
   identity: string | undefined,
 ): unknown {
   const resolvedIdentity = identity ?? createHash("sha256")
-    .update(JSON.stringify(input.slice(0, latestUserIndex + 1)))
+    .update(JSON.stringify(standaloneIdentityPrefix(input, latestUserIndex)))
     .digest("hex")
     .slice(0, 32);
   const turnId = `standalone_${resolvedIdentity}`;

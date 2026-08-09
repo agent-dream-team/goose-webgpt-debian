@@ -83,6 +83,25 @@ function contextualUserMessage(value: Record<string, unknown>): boolean {
     || text === OPAQUE_COMPACTION_NOTE;
 }
 
+const VOLATILE_TURN_CONTEXT_RE = /^<turn-context>[\s\S]*<\/turn-context>$/;
+
+/**
+ * Standalone Goose clients re-stamp a live `<turn-context>` block (current time, cwd, todo notes)
+ * into the resent user message on every provider round, including the tool-result continuation of
+ * the same logical turn. Strip it before it feeds a standalone-identity hash so a same-turn tool
+ * round trip that crosses a wall-clock tick still resolves to the same browser session instead of
+ * spuriously opening a second ChatGPT browser turn.
+ */
+export function stripVolatileTurnContextParts(content: unknown): unknown {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return content;
+  return content.filter(part => {
+    const block = record(part);
+    const text = typeof block?.text === "string" ? block.text.trim() : undefined;
+    return !(text !== undefined && VOLATILE_TURN_CONTEXT_RE.test(text));
+  });
+}
+
 /**
  * Return the latest real user instruction owned by the current native Codex turn.
  *
@@ -99,7 +118,7 @@ export function extractChatGptTurnUserRevision(parsed: CodexParsedRequest): unkn
   if (revision.turnId !== undefined && revision.turnId !== turnId) {
     throw new Error("ChatGPT web current user message conflicts with native Codex turn_id metadata");
   }
-  return revision.content;
+  return stripVolatileTurnContextParts(revision.content);
 }
 
 function latestChatGptTurnUserRevision(parsed: CodexParsedRequest): ChatGptTurnUserRevision | undefined {

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { ProviderAdapter } from "../src/adapters/base";
-import { extractChatGptTurnIdentity } from "../src/adapters/chatgpt-web/environment";
+import { extractChatGptTurnIdentity, stripVolatileTurnContextParts } from "../src/adapters/chatgpt-web/environment";
 import { chatGptTurnExecutionKey } from "../src/adapters/chatgpt-web/turn-execution";
 import { defaultConfig } from "../src/config";
 import { prepareStandaloneTextRequest, prepareStandaloneToolRequest, responseRequest } from "../src/server";
@@ -212,4 +212,101 @@ test("a byte-identical retry of a tool-request round is idempotent", () => {
   const first = turnIdOf(prepareStandaloneToolRequest(round, toolConfig));
   const second = turnIdOf(prepareStandaloneToolRequest(structuredClone(round), toolConfig));
   expect(second).toBe(first);
+});
+
+// Standalone Goose clients (real Goose CLI/Desktop) re-stamp a live `<turn-context>` block ahead
+// of the actual instruction on every provider round, including the function_call_output
+// continuation of the same logical turn. Only `<current-time>` inside it actually changes between
+// rounds of the same turn; the rest of the block (cwd, todo notes) is stable. These tests pin that
+// contract directly against the real request shape a live Goose run sends.
+function turnContextPart(currentTime: string) {
+  return {
+    type: "input_text",
+    text: `<turn-context>\n<current-time>${currentTime}</current-time>\n<working-directory>/Users/luke/Documents/goose-chatgpt-web</working-directory>\n\nCurrent tasks and notes:\nOnce given a task, immediately update your todo with all explicit and implicit requirements\n\n</turn-context>`,
+  };
+}
+
+test("standalone identity is unaffected by the injected <turn-context> current-time", () => {
+  const config = { ...defaultConfig("browser-only"), standalone: true };
+  const requestAt = (currentTime: string) => ({
+    model,
+    input: [
+      { role: "system", content: [{ type: "input_text", text: "Be precise." }] },
+      { role: "user", content: [turnContextPart(currentTime), { type: "input_text", text: "Reply exactly." }] },
+    ],
+  });
+  const early = turnIdOf(prepareStandaloneTextRequest(requestAt("2026-08-09 03:19:00 +02:00"), config));
+  const late = turnIdOf(prepareStandaloneTextRequest(requestAt("2026-08-09 03:21:47 +02:00"), config));
+  expect(late).toBe(early);
+});
+
+test("a tool round and its function_call_output continuation resolve to the same turn_id across a <turn-context> clock tick", () => {
+  // This is the exact regression shape: the initial tool-request round and the follow-up round
+  // carrying the tool result are otherwise byte-identical except the live <current-time> Goose
+  // re-stamps into the resent user message — the real symptom being fixed here was a wall-clock
+  // gap (ChatGPT stages routinely take 20s+) opening a second, independent browser turn instead of
+  // resuming the first.
+  const initialRound = {
+    model,
+    tools: [proofTool],
+    input: [
+      { role: "system", content: [{ type: "input_text", text: "You are a general-purpose AI agent called goose." }] },
+      {
+        role: "user",
+        content: [turnContextPart("2026-08-09 03:19:00 +02:00"), { type: "input_text", text: "Call get_proof_nonce and reply with exactly its result." }],
+      },
+    ],
+  };
+  const followUpRound = {
+    ...initialRound,
+    input: [
+      initialRound.input[0],
+      {
+        ...initialRound.input[1],
+        content: [turnContextPart("2026-08-09 03:20:46 +02:00"), { type: "input_text", text: "Call get_proof_nonce and reply with exactly its result." }],
+      },
+      { type: "function_call", call_id: "call_abc123", name: "get_proof_nonce", arguments: "{}" },
+      { type: "function_call_output", call_id: "call_abc123", output: "GOOSE_TOOL_PROOF_example" },
+    ],
+  };
+  const initialTurnId = turnIdOf(prepareStandaloneToolRequest(initialRound, toolConfig));
+  const followUpTurnId = turnIdOf(prepareStandaloneToolRequest(followUpRound, toolConfig));
+  expect(followUpTurnId).toBe(initialTurnId);
+});
+
+test("standalone identity still changes when the real instruction text changes, even with an identical <turn-context>", () => {
+  // Normalizing away the volatile clock must not swallow genuine content changes: two different
+  // human instructions issued at the same wall-clock stamp are two different logical turns.
+  const config = { ...defaultConfig("browser-only"), standalone: true };
+  const sameTime = "2026-08-09 03:19:00 +02:00";
+  const requestWith = (instruction: string) => ({
+    model,
+    input: [
+      { role: "system", content: [{ type: "input_text", text: "Be precise." }] },
+      { role: "user", content: [turnContextPart(sameTime), { type: "input_text", text: instruction }] },
+    ],
+  });
+  const first = turnIdOf(prepareStandaloneTextRequest(requestWith("Remember the token ORANGE-731."), config));
+  const second = turnIdOf(prepareStandaloneTextRequest(requestWith("Remember the token BANANA-042."), config));
+  expect(second).not.toBe(first);
+});
+
+test("stripVolatileTurnContextParts removes only a part that is entirely a <turn-context> block", () => {
+  const content = [turnContextPart("2026-08-09 03:19:00 +02:00"), { type: "input_text", text: "Reply exactly." }];
+  expect(stripVolatileTurnContextParts(content)).toEqual([{ type: "input_text", text: "Reply exactly." }]);
+});
+
+test("stripVolatileTurnContextParts leaves non-matching content untouched", () => {
+  const plainString = "Reply exactly.";
+  expect(stripVolatileTurnContextParts(plainString)).toBe(plainString);
+
+  const noWrapper = [{ type: "input_text", text: "Reply exactly." }];
+  expect(stripVolatileTurnContextParts(noWrapper)).toEqual(noWrapper);
+
+  // A part that merely mentions the tag inline (not the complete wrapping block) is real content,
+  // not the volatile envelope, and must survive.
+  const mentionsTagButIsNotTheWrapper = [{ type: "input_text", text: "Explain what a <turn-context> block is for." }];
+  expect(stripVolatileTurnContextParts(mentionsTagButIsNotTheWrapper)).toEqual(mentionsTagButIsNotTheWrapper);
+
+  expect(stripVolatileTurnContextParts(undefined)).toBeUndefined();
 });
