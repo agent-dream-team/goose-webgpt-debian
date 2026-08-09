@@ -60,7 +60,7 @@ test("response.incomplete carries a present null error field alongside incomplet
   expect(response.incomplete_details).toBeTruthy();
 });
 
-test("response.failed carries the real error, overriding the default null", async () => {
+test("response.failed serializes the top-level error required by Goose while preserving the response snapshot", async () => {
   async function* events(): AsyncGenerator<AdapterEvent> {
     yield { type: "text_delta", text: "before the failure" };
     yield { type: "error", message: "upstream exploded", status: 502, errorType: "server_error" };
@@ -70,9 +70,26 @@ test("response.failed carries the real error, overriding the default null", asyn
 
   const failed = byType.get("response.failed");
   expect(failed).toHaveLength(1);
-  const response = failed![0]!.response as Record<string, unknown>;
-  expect(response.error).not.toBeNull();
-  expect((response.error as Record<string, unknown>).message).toBe("upstream exploded");
+  const event = failed![0]!;
+  const response = event.response as Record<string, unknown>;
+  expect(typeof event.sequence_number).toBe("number");
+  expect(event.error).toEqual(response.error);
+  expect((event.error as Record<string, unknown>).message).toBe("upstream exploded");
+  expect(response.last_error).toEqual(response.error);
+});
+
+test("bridge exceptions also emit a Goose-compatible top-level response.failed error", async () => {
+  async function* events(): AsyncGenerator<AdapterEvent> {
+    throw new Error("bridge exploded");
+  }
+  const body = await streamBody(events());
+  const failed = sseEventsByType(body).get("response.failed");
+
+  expect(failed).toHaveLength(1);
+  const event = failed![0]!;
+  const response = event.response as Record<string, unknown>;
+  expect(event.error).toEqual(response.error);
+  expect((event.error as Record<string, unknown>).message).toBe("bridge exploded");
   expect(response.last_error).toEqual(response.error);
 });
 

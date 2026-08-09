@@ -189,12 +189,30 @@ const browserStageTimeouts = {
 
 /**
  * CDP accepts large Input.insertText payloads, but a single oversized edit can outrun ChatGPT's
- * Lexical update path. The composer itself accepts substantially larger messages: a live probe on
- * 2026-08-06 preserved 819,343 characters and kept Send enabled when the same text arrived in
- * bounded edits. Chunk only the browser input event; the resulting user message remains one exact
- * prompt and is verified byte-for-byte after insertion.
+ * Lexical update path. Current upstream keeps each browser edit at 100k after measuring a
+ * 139,331-character Send ceiling on its most constrained composer. Chunk only the browser input
+ * event; the resulting user message remains one exact prompt and is verified byte-for-byte.
  */
-export const CHATGPT_PROMPT_INSERT_CHUNK_CHARS = 200_000;
+export const CHATGPT_PROMPT_INSERT_CHUNK_CHARS = 100_000;
+export const CHATGPT_COMPOSER_DOCUMENT_END_KEY = process.platform === "darwin"
+  ? "Meta+ArrowDown"
+  : "Control+End";
+
+/**
+ * A fixed-offset UTF-16 slice can land between a surrogate pair (e.g. an emoji), corrupting the
+ * character on either side of the cut. Back the boundary off by one code unit whenever that would
+ * happen so every chunk stays a valid UTF-16 string; the chunk this shortens is picked up whole at
+ * the start of the next insertText call.
+ */
+export function chatGptPromptChunkEnd(text: string, offset: number, maxChars: number): number {
+  const end = Math.min(offset + maxChars, text.length);
+  if (end <= offset || end >= text.length) return end;
+  const beforeCut = text.charCodeAt(end - 1);
+  const afterCut = text.charCodeAt(end);
+  const splitsSurrogatePair = beforeCut >= 0xd800 && beforeCut <= 0xdbff
+    && afterCut >= 0xdc00 && afterCut <= 0xdfff;
+  return splitsSurrogatePair ? end - 1 : end;
+}
 
 export interface BrowserTurn {
   traceId: string;
@@ -1208,15 +1226,39 @@ export class ChatGptBrowserWorker {
     }
     const selectedComposer = await this.selectConnector(page, captureDiagnostic);
     await selectedComposer.focus();
-    await page.keyboard.press("End");
+    await page.keyboard.press(CHATGPT_COMPOSER_DOCUMENT_END_KEY);
     await this.insertPromptText(page, ` ${prompt}`);
     await this.assertPromptAttached(page, prompt);
   }
 
   private async insertPromptText(page: Page, text: string): Promise<void> {
-    for (let offset = 0; offset < text.length; offset += CHATGPT_PROMPT_INSERT_CHUNK_CHARS) {
-      await page.keyboard.insertText(text.slice(offset, offset + CHATGPT_PROMPT_INSERT_CHUNK_CHARS));
+    for (let offset = 0; offset < text.length; ) {
+      const end = chatGptPromptChunkEnd(text, offset, CHATGPT_PROMPT_INSERT_CHUNK_CHARS);
+      await page.keyboard.insertText(text.slice(offset, end));
+      if (end < text.length) {
+        await this.waitForPromptChunkAttached(page, text.slice(0, end).trimStart());
+        // A plain End key stops at the end of the current visual line in a multiline Lexical
+        // editor. Move to the end of the complete composer before appending the next verified edit.
+        await page.keyboard.press(CHATGPT_COMPOSER_DOCUMENT_END_KEY);
+      }
+      offset = end;
     }
+  }
+
+  private async waitForPromptChunkAttached(page: Page, expected: string): Promise<void> {
+    const deadline = Date.now() + 20_000;
+    let observed = "";
+    do {
+      observed = await this.attachedPromptText(page);
+      if (observed === expected) return;
+      await new Promise(resolveSleep => setTimeout(resolveSleep, 100));
+    } while (Date.now() < deadline);
+    let commonPrefix = 0;
+    while (commonPrefix < expected.length && expected[commonPrefix] === observed[commonPrefix]) commonPrefix += 1;
+    throw new Error(
+      `ChatGPT composer did not commit a complete prompt insertion chunk`
+      + ` (expectedChars=${expected.length}, actualChars=${observed.length}, commonPrefixChars=${commonPrefix})`,
+    );
   }
 
   private async verifyConnectorExclusive(): Promise<string> {

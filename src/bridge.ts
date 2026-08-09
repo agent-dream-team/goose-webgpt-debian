@@ -724,6 +724,9 @@ export function bridgeToResponsesSSE(
               if (currentWebSearch) closeCurrentWebSearch("failed", []);
               const failure = adapterFailureFromEvent(event);
               emit("response.failed", {
+                // Goose deserializes response.failed.error at the event top level. Preserve the
+                // response snapshot as well for Responses clients that consume that shape.
+                error: failure.error,
                 response: {
                   ...responseSnapshot("failed", finishedItems),
                   // Partial consumption from a mid-stream upstream failure: surfaced so the request
@@ -750,11 +753,13 @@ export function bridgeToResponsesSSE(
         if (!terminated) {
           flushHiddenRawReasoning();
           if (currentWebSearch) closeCurrentWebSearch("failed", []);
+          const error = responseError(500, "proxy_error", err instanceof Error ? err.message : String(err));
           emit("response.failed", {
+            error,
             response: {
               ...responseSnapshot("failed", finishedItems),
-              error: responseError(500, "proxy_error", err instanceof Error ? err.message : String(err)),
-              last_error: responseError(500, "proxy_error", err instanceof Error ? err.message : String(err)),
+              error,
+              last_error: error,
             },
           });
           reportTerminal("failed");
