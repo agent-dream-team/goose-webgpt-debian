@@ -52,6 +52,11 @@ export const CHATGPT_EMPTY_RESPONSE_GRACE_MS = 10_000;
 export const CHATGPT_COMPLETION_ACTION_GRACE_MS = 60_000;
 export const CHATGPT_COMPLETION_SETTLE_MS = 2_000;
 export const CHATGPT_TOOL_CONFIRMATION_TIMEOUT_MS = 60_000;
+// isConnected()/isClosed() are local flags that can both report healthy while the browser's CDP
+// message loop is wedged (e.g. after `service cancel-turns` aborts a turn that was mid a stage
+// timeout, leaving an unanswered CDP command in flight); a subsequent context.newPage() can then
+// hang indefinitely. This bounds the real round-trip probe used to catch that case before reuse.
+export const MANAGED_BROWSER_LIVENESS_PROBE_TIMEOUT_MS = 3_000;
 /**
  * ChatGPT applies composer state asynchronously, and a fast host can reach the next step before the
  * editor has taken the previous one. This is headroom for that, not a readiness check.
@@ -736,11 +741,19 @@ export class ChatGptBrowserWorker {
     const cached = this.managedBrowserReady;
     if (cached) {
       const connection = await cached.catch(() => undefined);
-      if (connection && connection.browser.isConnected() && !connection.context.isClosed()) return connection;
-      // The cached browser/context crashed or was closed externally; discard the stale handle
-      // (rather than surfacing "Target page, context or browser has been closed" from the next
-      // Playwright call) so a fresh managed browser is acquired below. No process killing here:
-      // the dead handle is simply dropped, not the underlying OS process.
+      if (
+        connection
+        && connection.browser.isConnected()
+        && !connection.context.isClosed()
+        && await this.isManagedBrowserConnectionLive(connection.context)
+      ) {
+        return connection;
+      }
+      // The cached browser/context crashed, was closed externally, or is connected-but-wedged
+      // (failed the liveness probe above); discard the stale handle (rather than surfacing
+      // "Target page, context or browser has been closed" or hanging from the next Playwright
+      // call) so a fresh managed browser is acquired below. No process killing here: the dead
+      // handle is simply dropped, not the underlying OS process.
       if (this.managedBrowserReady === cached) {
         this.managedBrowserReady = undefined;
         this.browser = undefined;
@@ -770,6 +783,30 @@ export class ChatGptBrowserWorker {
     } catch (error) {
       if (this.managedBrowserReady === opening) this.managedBrowserReady = undefined;
       throw error;
+    }
+  }
+
+  // Storage.getCookies is the cheapest real CDP round trip BrowserContext exposes with no visible
+  // side effect (no page required, nothing created or navigated), so it doubles as a bounded
+  // liveness probe: a wedged browser leaves it hanging exactly like the context.newPage() call
+  // that this check protects, instead of resolving.
+  private async isManagedBrowserConnectionLive(
+    context: BrowserContext,
+    timeoutMs = MANAGED_BROWSER_LIVENESS_PROBE_TIMEOUT_MS,
+  ): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        context.cookies(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("managed browser liveness probe timed out")), timeoutMs);
+        }),
+      ]);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 

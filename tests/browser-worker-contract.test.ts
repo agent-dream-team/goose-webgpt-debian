@@ -181,11 +181,14 @@ test("ensureManagedBrowser reuses a cached browser/context that is still connect
     ensureManagedBrowser(): Promise<{ browser: unknown; context: unknown }>;
   }).ensureManagedBrowser;
 
-  const cached = { browser: { isConnected: () => true }, context: { isClosed: () => false } };
+  const cached = { browser: { isConnected: () => true }, context: { isClosed: () => false, cookies: async () => [] } };
   const worker = {
     managedBrowserReady: Promise.resolve(cached),
     browser: cached.browser,
     context: cached.context,
+    isManagedBrowserConnectionLive: (ChatGptBrowserWorker.prototype as unknown as {
+      isManagedBrowserConnectionLive(context: unknown, timeoutMs?: number): Promise<boolean>;
+    }).isManagedBrowserConnectionLive,
     config: { storageStatePath: "/nonexistent/should-not-be-read", chromeExecutablePath: "/nonexistent/should-not-be-read" },
   };
 
@@ -235,6 +238,33 @@ test("ensureManagedBrowser discards a stale cached context even when the browser
   await expect(ensureManagedBrowser.call(worker)).rejects.toThrow("ChatGPT web login state is missing");
 });
 
+test("ensureManagedBrowser discards a connected-but-wedged cached browser that fails the liveness probe", async () => {
+  const ensureManagedBrowser = (ChatGptBrowserWorker.prototype as unknown as {
+    ensureManagedBrowser(): Promise<{ browser: unknown; context: unknown }>;
+  }).ensureManagedBrowser;
+
+  // isConnected() and isClosed() both report healthy, exactly like the observed "connected but
+  // wedged" state after `service cancel-turns`, but the real CDP round trip never comes back.
+  const wedged = {
+    browser: { isConnected: () => true },
+    context: { isClosed: () => false, cookies: async () => { throw new Error("no response from browser"); } },
+  };
+  const worker = {
+    managedBrowserReady: Promise.resolve(wedged),
+    browser: wedged.browser,
+    context: wedged.context,
+    isManagedBrowserConnectionLive: (ChatGptBrowserWorker.prototype as unknown as {
+      isManagedBrowserConnectionLive(context: unknown, timeoutMs?: number): Promise<boolean>;
+    }).isManagedBrowserConnectionLive,
+    config: { storageStatePath: "/nonexistent/storage-state.json", chromeExecutablePath: "/nonexistent/chrome" },
+  };
+
+  await expect(ensureManagedBrowser.call(worker)).rejects.toThrow("ChatGPT web login state is missing");
+  expect(worker.managedBrowserReady).toBeUndefined();
+  expect(worker.browser).toBeUndefined();
+  expect(worker.context).toBeUndefined();
+});
+
 test("ensureManagedBrowser treats a rejected in-flight launch as no cache, not as a stale browser", async () => {
   const ensureManagedBrowser = (ChatGptBrowserWorker.prototype as unknown as {
     ensureManagedBrowser(): Promise<{ browser: unknown; context: unknown }>;
@@ -246,6 +276,65 @@ test("ensureManagedBrowser treats a rejected in-flight launch as no cache, not a
   };
 
   await expect(ensureManagedBrowser.call(worker)).rejects.toThrow("ChatGPT web login state is missing");
+});
+
+test("isManagedBrowserConnectionLive resolves true when the CDP round trip answers", async () => {
+  const isManagedBrowserConnectionLive = (ChatGptBrowserWorker.prototype as unknown as {
+    isManagedBrowserConnectionLive(context: unknown, timeoutMs?: number): Promise<boolean>;
+  }).isManagedBrowserConnectionLive;
+
+  const context = { cookies: async () => [] };
+  await expect(isManagedBrowserConnectionLive.call({}, context, 20)).resolves.toBeTrue();
+});
+
+test("isManagedBrowserConnectionLive resolves false when the CDP round trip rejects", async () => {
+  const isManagedBrowserConnectionLive = (ChatGptBrowserWorker.prototype as unknown as {
+    isManagedBrowserConnectionLive(context: unknown, timeoutMs?: number): Promise<boolean>;
+  }).isManagedBrowserConnectionLive;
+
+  const context = { cookies: async () => { throw new Error("no response from browser"); } };
+  await expect(isManagedBrowserConnectionLive.call({}, context, 20)).resolves.toBeFalse();
+});
+
+test("isManagedBrowserConnectionLive resolves false when the wedged browser never answers within the bound", async () => {
+  const isManagedBrowserConnectionLive = (ChatGptBrowserWorker.prototype as unknown as {
+    isManagedBrowserConnectionLive(context: unknown, timeoutMs?: number): Promise<boolean>;
+  }).isManagedBrowserConnectionLive;
+
+  // Simulates the observed wedge: the CDP command is sent but the browser process never answers.
+  const context = { cookies: () => new Promise(() => {}) };
+  await expect(isManagedBrowserConnectionLive.call({}, context, 20)).resolves.toBeFalse();
+});
+
+test("isManagedBrowserConnectionLive clears its internal timer once the probe settles", async () => {
+  const isManagedBrowserConnectionLive = (ChatGptBrowserWorker.prototype as unknown as {
+    isManagedBrowserConnectionLive(context: unknown, timeoutMs?: number): Promise<boolean>;
+  }).isManagedBrowserConnectionLive;
+
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const pending = new Set<ReturnType<typeof setTimeout>>();
+  let clearedId: ReturnType<typeof setTimeout> | undefined;
+  globalThis.setTimeout = ((handler: () => void, ms?: number) => {
+    const id = originalSetTimeout(handler, ms);
+    pending.add(id);
+    return id;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((id: ReturnType<typeof setTimeout>) => {
+    clearedId = id;
+    return originalClearTimeout(id);
+  }) as typeof clearTimeout;
+
+  try {
+    const context = { cookies: async () => [] };
+    await isManagedBrowserConnectionLive.call({}, context, 1_000);
+
+    expect(pending.size).toBe(1);
+    expect(clearedId).toBe([...pending][0]);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  }
 });
 
 test("browser turns have no absolute deadline unless one is explicitly configured", () => {
