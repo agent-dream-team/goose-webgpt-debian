@@ -61,28 +61,60 @@ Status as of 2026-08-09: **PASS.** Ordinary Goose (the real Goose Desktop/CLI at
 - ChatGPT's own MCP connector intermittently declines a tool call with "This tool call was blocked by OpenAI because we couldn't determine the safety status of the request" or silently skips the call ("No value was returned."), on requests that are otherwise identical to ones that succeed. Observed on 2 of 4 fresh-identity attempts in one session; not something this bridge controls (it is ChatGPT's own connector-side gate on the `autoApproveToolCalls` auto-click), so treat tool-calling turns as retriable rather than guaranteed-first-try.
 - Not re-validated: `doctor`'s tunnel-readiness check is unreliable — it reported "Tunnel runtime is not ready" / a stale `OnStop` log line even immediately after a successful `tunnel restart`, while the tunnel's own health endpoint and real browser/tool traffic were actually healthy. Don't trust `doctor`'s tunnel section as a go/no-go signal without also checking `curl $(cat "~/Library/Application Support/tunnel-client/health/codex-chatgpt-web.url")`.
 
-## Then — reconcile with upstream before more custom development
+## Immediate milestone — restore unrestricted Goose tool handoff and native delegation
 
-Before adding more architecture, inspect the current `miuuyy/codex-chatgpt-web` delta from this fork's base and reuse upstream fixes where possible.
+Status as of 2026-08-09: **BLOCKED on the legacy ChatGPT connector contract, upstream solution identified.**
 
-Pay particular attention to newer upstream work around:
+- In a real Goose Desktop session with ChatGPT-Web as main, ChatGPT could inspect enough of Goose's exposed tool schemas to identify native `delegate` and its explicit `provider` / `model` controls, but actual calls to `shell`, `tree`, `analyze`, `load`, and `delegate` were rejected by ChatGPT/OpenAI safety checks before Goose executed them.
+- This is therefore currently a ChatGPT connector/action-control problem, not evidence that Goose-native delegation or the free OpenRouter worker route is broken.
+- Operational priority: fix this path early so ChatGPT-Web can perform the bulk of subsequent repository work itself, including delegation to free workers; keep Claude/Codex as independent review, specialist, and break-glass recovery providers rather than mandatory implementers.
+- Current implementation task: selectively adapt upstream's v2.1/v4 connector/action-permission architecture to standalone Goose without weakening Goose-owned approvals, sandboxing, or tool execution authority.
 
-- rate-limit handling;
-- connector migration/versioning (`Codex Native` / newer connector contracts);
-- model/runtime changes;
-- browser/runtime reliability;
-- any changes that would supersede custom work in this fork.
+After the fix, validate in this order and stop on the first failure: (1) read a harmless repository file through Goose; (2) execute one harmless Goose shell/tool action; (3) invoke Goose-native `delegate` with an explicit strictly-free OpenRouter provider/model and receive its result in the parent ChatGPT-Web conversation.
 
-Do not independently rebuild functionality that upstream already provides cleanly.
+## Upstream reconnaissance snapshot — `miuuyy/codex-chatgpt-web` v2.1.4
+
+Audit date: **2026-08-09.** Upstream's latest release is v2.1.4. At the audit point this fork and upstream were materially diverged (upstream had 12 commits after the common base and this fork had 8 fork-specific commits). Do **selective reconciliation**, not a blind merge.
+
+### Reuse/adapt before independently designing
+
+1. **Fresh connector ABI identity + permissions.** Upstream's v2.1 line replaces the legacy `Codex Native` public MCP contract with a fresh `Codex Native2` identity because ChatGPT caches the MCP contract by connector identity. Upstream explicitly requires `Authentication: None` and **Allow all actions**; `Allow low-risk actions` blocks commands/patches before they reach the outer harness. For Goose, create/adapt a fresh Goose-specific connector identity rather than renaming/refreshing the old connector. Goose remains the final executor and approval/sandbox authority.
+2. **v4 direct turn-token bridge.** Upstream removed the model-visible bind handshake. Six stable public MCP gateway actions accept the trusted turn capability directly while binding leases remain private in the runtime: `codex_exec`, `codex_write_stdin`, `codex_apply_patch`, `codex_view_image`, `codex_tool_inventory`, `codex_tool_call`. Adapt the transport concept/naming to Goose rather than extending the old v3 handshake.
+3. **Descriptor-driven command dispatch.** Upstream no longer assumes one command ABI: gateway-only turns inspect the authoritative `ALL_TOOLS` registry and select exactly one of `exec_command` or `shell_command`, then map arguments to that ABI. Zero or multiple command candidates fail closed. Reuse this principle anywhere Goose tool descriptors differ from Codex.
+4. **Context/usage accounting.** Upstream measured browser transport ceilings separately from underlying model context and recalculates usage after every tool-result round so compaction can trigger during long tool loops. Do not invent independent limits without first adapting/checking upstream's current measurements.
+5. **Account-capability/model gating.** Upstream now dynamically exposes routes based on the authenticated account: Free/Go → Luna; Plus → Instant/Medium/High; Pro additionally gates Extra High/Pro. Audit this fork's static Goose picker against upstream rather than assuming every visible route is account-valid.
+6. **Luna continuity lesson.** v2.1.4 changed rolling checkpoints from model-authored JSON to model-authored semantic text with bridge-owned serialization after malformed quoted content broke completed turns. If Goose ever needs checkpointing, keep semantic state model-owned and serialization deterministic/runtime-owned.
+7. **Reliable configuration/lifecycle ideas.** Upstream has reversible route journaling, authenticated drain/shutdown, explicit active-request/browser-session counters, bounded crash recovery, and explicit HTTP/SSE negotiation. These are useful references, but much of the concrete code is Codex/launcher-specific; adopt only where Goose has the same problem.
+
+### Upstream work that does not replace Goose-specific work
+
+- **Native Web subagents:** upstream can expose `chatgpt-web/*` routes to Codex `spawn_agent`. This proves useful subagent plumbing is possible but does not replace the intended Goose path: ChatGPT-Web main → Goose-native `delegate`/summon → explicit free OpenRouter worker.
+- **Electron browser host:** upstream owns a persistent Electron partition with up to five task-bound `WebContentsView` surfaces and a system-Chrome login handoff. Benefits include stronger task/surface isolation, bounded parallelism, integrated diagnostics, and potentially no ordinary Chrome focus theft. Do **not** migrate now: this fork's headed managed-Chrome path is already proven on the target Mac, simpler, and has bounded minimize/stale/wedged recovery. Revisit Electron only if concurrency/focus/browser-ownership become dominant problems.
+- **Codex route/config integration:** upstream's model catalog injection, `openai_base_url` journaling and Codex feature toggles are primarily Codex-specific. Goose uses its custom OpenAI-compatible provider and should not inherit unnecessary Codex configuration machinery.
+- **Windows launcher fixes:** track but do not port unless needed on this target. Open upstream PR #92 currently addresses Windows Chrome 151 login, Node/Bun differences, locale-independent composer selection, and partitioned-cookie handling; the selector/cookie lessons may be reusable later.
+
+### Known upstream dead ends / still-open problems — do not rediscover them
+
+- **Browser context ceiling (#76):** attaching canonical context as a file was rejected as a correctness path because ChatGPT may ignore/partially read it and consumption cannot be proven. Merely advertising a larger context window cannot bypass the composer/send limit. The deterministic larger-context transport problem remains open upstream.
+- **Headless / centralized deployment (#58):** still open upstream. This fork already proved headless branded Chrome hits a Cloudflare challenge; do not pursue stealth/Cloudflare bypass.
+- **Persistent normal ChatGPT chats (#94):** still only a feature request upstream. Persistent browser-conversation reuse across Goose user turns remains genuinely future work; Goose must remain canonical durable history unless/until a stronger design is proven.
+- **Pro mode local tools:** upstream currently treats ChatGPT Pro mode as unable to initiate the custom MCP connector; do not assume the highest visible ChatGPT mode is tool-capable.
+
+### Standing upstream-reconciliation rule
+
+Before substantial new bridge/browser/tool work, check current upstream first. Classify each relevant upstream change as **adopt directly / adapt for Goose / already superseded here / irrelevant to Goose / deliberately defer**. Prefer a small compatibility note/update over rediscovering behavior experimentally.
 
 ## Then — continue the core Goose architecture
 
-Only after upstream reconciliation:
+After the connector/tool/delegation fix and the selective v2.1.4 reconciliation:
 
-- choose and verify the strongest tool-capable ChatGPT-Web tier suitable as the normal Goose model;
-- investigate persistent ChatGPT browser conversation reuse across separate user turns, while Goose remains the canonical durable conversation history;
-- broaden Goose-owned tool coverage only after the single-tool lifecycle is solid;
-- then revisit Day Shift orchestration, free-worker delegation, provider routing and related refinements.
+1. Prove ChatGPT-Web main can use Goose-native delegation to one explicit strictly-free OpenRouter worker, with no Day Shift MCP fallback and no paid provider/model fallback.
+2. Use ChatGPT-Web + Goose tools + free delegated workers for the bulk of subsequent `goose-chatgpt-web` development. ChatGPT-Web may inspect/edit/test/commit its own source tree, but should stop before replacing/restarting the live bridge carrying its current conversation; do runtime replacement and validation at a clean turn boundary. Claude/Codex remain fallback/recovery providers if the ChatGPT-Web runtime itself is broken.
+3. Choose and verify the strongest **tool-capable** ChatGPT-Web tier suitable as the normal Goose model. Do not select purely by nominal reasoning strength; account capability, MCP availability, browser limits and reliability matter. Medium/High are the current Plus upstream tool-capable routes; verify High after the bridge reconciliation.
+4. Broaden Goose-owned tool coverage and realistic delegated repository work only after the single free-worker lifecycle is solid.
+5. Investigate persistent ChatGPT browser conversation reuse across separate user turns only later, while Goose remains the canonical durable conversation history.
+6. Revisit browser architecture only if needed: first see whether managed Chrome can support explicit task/surface ownership and bounded parallelism; consider upstream's Electron host only if it materially solves a demonstrated focus/concurrency/lifecycle limitation.
+7. Revisit Day Shift orchestration/provider-routing refinements only after native Goose delegation is proven insufficient for a concrete requirement.
 
 ## Boundaries
 
