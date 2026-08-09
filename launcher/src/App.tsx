@@ -1114,8 +1114,9 @@ function McpSurface({
               <div className="connector-actions">
                 <div className="connector-name">
                   <span>{copy.connectorName}</span>
-                  <code>Codex Native</code>
+                  <code>Goose Native</code>
                 </div>
+                <p className="connector-migration-notice">{copy.connectorMigrationNotice}</p>
                 <div className="inline-actions">
                   <SecondaryButton
                     icon="external"

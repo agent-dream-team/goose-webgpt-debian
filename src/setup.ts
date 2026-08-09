@@ -9,6 +9,7 @@ import {
   defaultConfig,
   getConfigPath,
   loadConfigForSetup,
+  resolveSetupConnectorName,
   saveConfig,
 } from "./config";
 import {
@@ -198,7 +199,7 @@ export function buildSetupConfig(existing: AppConfig | undefined, options: Setup
     config.browserHost = "managed-chrome";
     delete config.browserHostDescriptorPath;
   }
-  if (options.appName) config.appName = options.appName;
+  config.appName = resolveSetupConnectorName(existing?.appName, options.appName);
   if (options.autoApproveToolCalls !== undefined) config.autoApproveToolCalls = options.autoApproveToolCalls;
   if (options.acknowledgedUnofficial) config.acknowledgedUnofficialAt = new Date().toISOString();
   if (!config.acknowledgedUnofficialAt) {

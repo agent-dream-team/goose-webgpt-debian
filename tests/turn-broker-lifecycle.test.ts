@@ -219,7 +219,7 @@ test("turn broker names the finished turn that owns a replayed handle", async ()
       wireName: "exec_command",
     });
     expect(replayedBinding).toContain("turn-alpha");
-    expect(replayedBinding).toContain("codex_bind_turn");
+    expect(replayedBinding).toContain("Retry the tool call with the turn_token");
 
     const replayedToken = await rejection({ method: "claim", token });
     expect(replayedToken).toContain("turn-alpha");

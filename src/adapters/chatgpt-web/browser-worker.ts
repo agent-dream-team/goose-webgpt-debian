@@ -2,7 +2,15 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { chromium, type Browser, type BrowserContext, type CDPSession, type Locator, type Page } from "playwright-core";
-import { atomicWriteFile, defaultChromeExecutable, expandUserPath, getConfigDir } from "../../config";
+import {
+  atomicWriteFile,
+  CHATGPT_CONNECTOR_NAME,
+  defaultChromeExecutable,
+  expandUserPath,
+  getConfigDir,
+  isLegacyChatGptConnectorName,
+  legacyChatGptConnectorMigrationMessage,
+} from "../../config";
 import type { CodexProviderConfig } from "../../types";
 import { parseDataUrl } from "../image";
 import { ChatGptMarkdownBuffer, type ChatGptMarkdownSegment } from "./markdown";
@@ -565,8 +573,10 @@ export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBro
     && (!Number.isFinite(turnTimeoutMs) || turnTimeoutMs <= 0)) {
     throw new Error("ChatGPT Web turnTimeoutMs must be a positive finite number");
   }
+  const appName = configured.appName?.trim() || CHATGPT_CONNECTOR_NAME;
+  if (isLegacyChatGptConnectorName(appName)) throw new Error(legacyChatGptConnectorMigrationMessage(appName));
   return {
-    appName: configured.appName?.trim() || "Codex Native",
+    appName,
     browserHost,
     ...(browserHostDescriptorPath ? { browserHostDescriptorPath: resolve(expandUserPath(browserHostDescriptorPath)) } : {}),
     storageStatePath: resolve(expandUserPath(configured.storageStatePath?.trim() || join(getConfigDir(), "browser", "storage-state.json"))),
@@ -1697,7 +1707,7 @@ export class ChatGptBrowserWorker {
             completionActionVisible: snapshot.completionActionVisible,
           })) {
             if (snapshot.visibleText === "api_tool unavailable") {
-              throw new Error("ChatGPT selected mode rejected the Codex Native MCP tool (api_tool unavailable)");
+              throw new Error(`ChatGPT selected mode rejected the ${JSON.stringify(this.config.appName)} MCP tool (api_tool unavailable)`);
             }
             const final = markdownBuffer.finish();
             if (!final.markdown && snapshot.visibleText) {

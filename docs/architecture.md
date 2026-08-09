@@ -32,8 +32,18 @@ launcher-owned codex-chatgpt-web daemon
 - Exposes the same fixed models; Instant through Extra High are tool-capable, while Pro remains
   read-only.
 - ChatGPT uses a custom MCP connector backed by `openai/tunnel-client`.
-- Every connector call is bound to one outer Codex turn capability.
-- Tool calls and results remain in the same ChatGPT response while Codex executes them locally.
+- Every connector call presents the current turn_token directly; the MCP server idempotently claims
+  an internal binding and dispatches the call in the same request. The binding is never exposed to
+  the model.
+- Tool calls and results remain in the same ChatGPT response while the outer harness (Codex or
+  standalone Goose) executes them locally.
+
+The ChatGPT connector name is also the public MCP ABI identity. ChatGPT caches a connector's tool
+schema and granted action permission by that identity, so the direct turn-token contract uses a
+fresh name (`Goose Native`); the retired `Codex Native` identity is never selected or refreshed in
+place. Setup and the browser worker fail closed with an explicit migration error rather than
+silently reusing a legacy connector's stale contract or permission grant. See
+[security model](security-model.md) for the full capability flow.
 
 ## Browser lifecycle
 

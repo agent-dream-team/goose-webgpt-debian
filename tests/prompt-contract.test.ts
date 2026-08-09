@@ -32,10 +32,10 @@ test("tool-capable prompts resume the mandatory bind contract after the complete
   expect(envelopeEnd).toBeGreaterThan(0);
   expect(resume).toBeGreaterThan(envelopeEnd);
   expect(finalToken).toBeGreaterThan(resume);
-  expect(compiled.text.slice(resume)).toContain("first action now must be the actual Codex Native codex_bind_turn call");
-  expect(compiled.text).toContain("turn_token and binding_id are different values");
-  expect(compiled.text).toContain("valid_until outer_turn_end has no time limit");
-  expect(compiled.text).toContain("not the turn_ token");
+  expect(compiled.text.slice(resume)).toContain("first action now must be an actual Goose Native tool call");
+  expect(compiled.text).toContain("takes turn_token turn_12345678901234567890123456789012 directly");
+  expect(compiled.text).toContain("no separate bind step and no binding_id");
+  expect(compiled.text).not.toContain("codex_bind_turn");
   expect(compiled.text).not.toContain("CODEX_INTERNAL_CONTEXT_COMPACT");
   expect(compiled.text).not.toContain("internally compacts this response");
 });
@@ -257,7 +257,7 @@ test("uses the public Instant name without leaking the browser menu alias into t
     { localToolsEnabled: false, proAvailable: true },
   );
 
-  expect(compiled.text).toContain("This is ChatGPT Web Instant with no Codex Native bridge to the user's local computer");
+  expect(compiled.text).toContain("This is ChatGPT Web Instant with no Goose Native bridge to the user's local computer");
   expect(compiled.text).not.toContain("Instant 5.5");
 });
 

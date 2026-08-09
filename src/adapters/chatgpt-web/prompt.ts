@@ -1,3 +1,4 @@
+import { CHATGPT_CONNECTOR_NAME } from "../../config";
 import type { CodexAssistantContentPart, CodexContentPart, CodexMessage, CodexParsedRequest } from "../../types";
 import { isOnePixelPngDataUrl, isReadableCompactionSummaryText } from "../../responses/compaction";
 import { resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
@@ -166,6 +167,8 @@ export function compileChatGptWebPrompt(
   turnToken?: string,
   /** Names the outer harness in the transport contract text. Never affects connector tool names. */
   harnessLabel = "Codex",
+  /** The exact ChatGPT connector name the model must select; must match the account's actual connector. */
+  connectorName = CHATGPT_CONNECTOR_NAME,
 ): CompiledChatGptWebPrompt {
   const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, capabilities);
   if (mode.localTools && !turnToken) {
@@ -209,18 +212,16 @@ export function compileChatGptWebPrompt(
     ]
     : mode.localTools
     ? [
-      "For local files, commands, processes, images, user interaction, and configured MCP/apps, use the attached Codex Native plugin inside this same response.",
-      `Before commentary, an answer, or any other tool call, call codex_bind_turn with turn_token ${turnToken}. This bind is mandatory on every response, even when the request appears not to need a local operation.`,
-      "turn_token and binding_id are different values: copy the exact binding_ value returned by codex_bind_turn into every later Codex Native call, and never put the turn_ value in a binding_id field. Do not reveal either capability value in the answer.",
-      "A bind result with binding_status active and valid_until outer_turn_end has no time limit. Never report that it expired unless a real Codex Native call returns that exact error.",
+      `For local files, commands, processes, images, user interaction, and configured MCP/apps, use the attached ${connectorName} plugin inside this same response.`,
+      `Every ${connectorName} tool call takes turn_token ${turnToken} directly as an argument; pass it on the first and every later call in this response. There is no separate bind step and no binding_id. Do not reveal the turn_token in the answer.`,
       "Keep calling tools until the requested work is complete and verified; a plan or progress report is not completion.",
       "Use codex_apply_patch for targeted edits, codex_exec for commands, and codex_write_stdin for sessions returned by codex_exec.",
       `Use codex_tool_inventory and codex_tool_call for any other tool advertised by the current ${harnessLabel} harness, including configured MCP/apps.`,
-      `Codex Native synchronously bridges each plugin action into the same outer ${harnessLabel} turn; wait for its real result before continuing.`,
+      `${connectorName} synchronously bridges each plugin action into the same outer ${harnessLabel} turn; wait for its real result before continuing.`,
       "Never serialize a proposed tool call as assistant text. Make the actual MCP call and use its real result.",
     ]
     : [
-      `This is ChatGPT Web ${mode.displayLabel} with no Codex Native bridge to the user's local computer attached to this response. This restriction applies only to local ${harnessLabel} files, commands, processes, and computer mutations.`,
+      `This is ChatGPT Web ${mode.displayLabel} with no ${connectorName} bridge to the user's local computer attached to this response. This restriction applies only to local ${harnessLabel} files, commands, processes, and computer mutations.`,
       "Use any ChatGPT-native capabilities available in this chat—including web search, browsing, research, and other first-party tools—whenever they help complete the request. The missing local-computer bridge says nothing about whether those ChatGPT capabilities are available.",
       `The task history below already contains everything ${harnessLabel} collected from the user's local workspace. Treat prior local tool results as authoritative snapshots of that earlier work.`,
       "Do not claim a new local inspection, command, edit, or verification unless it actually appears in the task history. If the latest request requires fresh local-computer access or a local mutation, state only that exact limitation instead of inventing success.",
@@ -235,8 +236,8 @@ export function compileChatGptWebPrompt(
     : mode.localTools
     ? [
       "<codex_transport_resume>",
-      `The task context is complete. Your first action now must be the actual Codex Native codex_bind_turn call with turn_token ${turnToken}; emit no commentary or answer before its real result.`,
-      "After binding, copy its exact binding_ result (not the turn_ token) into the binding_id field, execute the latest active user request, and keep using that binding_id for Codex Native calls.",
+      `The task context is complete. Your first action now must be an actual ${connectorName} tool call with turn_token ${turnToken}; emit no commentary or answer before its real result.`,
+      "Execute the latest active user request, passing that same turn_token on every later call in this response.",
       "</codex_transport_resume>",
     ]
     : [

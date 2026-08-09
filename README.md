@@ -121,19 +121,33 @@ context already collected by Codex, but ChatGPT Pro cannot initiate local MCP/to
 
 ## Full harness
 
-Full mode connects ChatGPT's tool calls back to the current Codex task through the official
-[OpenAI tunnel-client](https://github.com/openai/tunnel-client). The tunnel is outbound: it does
-not expose a public IP, open an inbound port, or require router forwarding.
+Full mode connects ChatGPT's tool calls back to the current Codex or Goose task through the
+official [OpenAI tunnel-client](https://github.com/openai/tunnel-client). The tunnel is outbound:
+it does not expose a public IP, open an inbound port, or require router forwarding.
+
+> [!WARNING]
+> Create a **new** connector named **Goose Native** and set its permissions to **Allow all
+> actions**. Do not rename, refresh, or reuse an older **Codex Native** connector: ChatGPT caches a
+> connector's public MCP contract (tool schema and granted action permission) by connector
+> identity, so reusing an old identity keeps enforcing its old, narrower permission grant instead
+> of the current tool set — this is what silently blocks calls like `codex_exec`,
+> `codex_tool_call`, or a Goose-owned tool such as `delegate` before they ever run. **Allow low-risk
+> actions** blocks command and tool calls before they reach this runtime; the outer harness (Codex
+> or Goose) still enforces its own sandbox and approvals independently.
 
 1. Finish the required launcher setup.
 2. Open **MCP** in the launcher. Create the Tunnel and a regular API key on the same OpenAI account
    that will use the ChatGPT connector; creating the key is free and does not consume model API
    credits.
 3. Paste the Tunnel ID and API key, then press **Connect harness**.
-4. Enable **Developer Mode** in ChatGPT settings. Create a connector using **Tunnel**, select that
-   exact Tunnel, set **Authentication** to **None**, and name it exactly `Codex Native`.
-5. Scan its tools, choose the intended action permissions, and run **Verify runtime**. Verification
-   types and accepts the full `@Codex Native` mention, then confirms the connector pill.
+4. Enable **Developer Mode** in ChatGPT settings. Create a **new** connector using **Tunnel**,
+   select that exact Tunnel, set **Authentication** to **None**, and name it exactly
+   `Goose Native`.
+5. Open **Permissions** and choose **Allow all actions**, then run **Verify runtime**. Verification
+   types and accepts the full `@Goose Native` mention, then confirms the connector pill.
+6. If an older `Codex Native` connector exists, leave it untouched. Do not rename or refresh it:
+   this release's local runtime rejects a legacy-only connector explicitly instead of silently
+   reusing its stale contract and permission grant.
 
 Write/modify actions require a ChatGPT workspace and admin policy that permit them. OpenAI
 currently documents those actions for Business and Enterprise/Edu workspaces; personal Pro is

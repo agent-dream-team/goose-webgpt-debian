@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import type { Page } from "playwright-core";
 import { CHATGPT_PROMPT_INSERT_CHUNK_CHARS, ChatGptBrowserWorker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_TABS, assertChatGptWebInputWithinContextWindow, browserDiagnosticCheckpoint, chatGptSubmissionEvidence, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert } from "../src/adapters/chatgpt-web/browser-worker";
-import { defaultChromeExecutable } from "../src/config";
+import { CHATGPT_CONNECTOR_NAME, defaultChromeExecutable } from "../src/config";
 
 test("Codex context uses the owned CDP composer transport, never the operating-system clipboard", () => {
   const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
@@ -348,6 +348,19 @@ test("browser turns have no absolute deadline unless one is explicitly configure
     ...provider,
     chatgptWeb: { turnTimeoutMs: 0 },
   })).toThrow("turnTimeoutMs must be a positive finite number");
+});
+
+test("resolveBrowserConfig defaults to the current connector identity and rejects the retired one", () => {
+  const provider = { adapter: "chatgpt-web" as const, baseUrl: "browser://chatgpt" };
+  expect(resolveBrowserConfig(provider).appName).toBe(CHATGPT_CONNECTOR_NAME);
+  expect(resolveBrowserConfig({
+    ...provider,
+    chatgptWeb: { appName: "Team Codex Harness" },
+  }).appName).toBe("Team Codex Harness");
+  expect(() => resolveBrowserConfig({
+    ...provider,
+    chatgptWeb: { appName: "Codex Native" },
+  })).toThrow(/newly created connector named/);
 });
 
 test("managed Chrome defaults follow the host platform", () => {

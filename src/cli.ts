@@ -49,7 +49,7 @@ Setup options:
   --chrome PATH                Google Chrome executable
   --browser-host-descriptor PATH
                                Use the embedded launcher browser described by this owner-only file
-  --app-name NAME              ChatGPT connector name (default: Codex Native)
+  --app-name NAME              ChatGPT connector name (default: Goose Native; legacy "Codex Native" is rejected)
   --tunnel-id ID               Existing OpenAI tunnel id (full mode)
   --runtime-key-file PATH      File containing a Tunnels Read+Use runtime key
   --replace-codex-route        Reversibly replace an existing openai_base_url

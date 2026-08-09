@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
-import { defaultBrokerEndpoint, expandUserPath, resolveBrokerEndpoint } from "../../config";
+import { CHATGPT_CONNECTOR_NAME, defaultBrokerEndpoint, expandUserPath, resolveBrokerEndpoint } from "../../config";
 import { namespacedToolName, type AdapterEvent, type CodexContentPart, type CodexParsedRequest, type CodexProviderConfig, type CodexToolResultMessage, type CodexUsage } from "../../types";
 import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
@@ -162,6 +162,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
     localToolsEnabled: provider.chatgptWeb?.localToolsEnabled === true,
     proAvailable: provider.chatgptWeb?.proAvailable === true,
   };
+  const connectorName = provider.chatgptWeb?.appName?.trim() || CHATGPT_CONNECTOR_NAME;
   const executionNamespace = createHash("sha256").update(JSON.stringify({
     baseUrl: provider.baseUrl,
     chatgptWeb: provider.chatgptWeb ?? {},
@@ -188,7 +189,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
         modelId: parsed.modelId,
         reasoning: parsed.options.reasoning,
         capabilities: turnCapabilities,
-        prepare: async () => ({ ...compileChatGptWebPrompt(parsed, turnCapabilities, undefined, standaloneGoose ? "Goose" : "Codex"), release: () => {} }),
+        prepare: async () => ({ ...compileChatGptWebPrompt(parsed, turnCapabilities, undefined, standaloneGoose ? "Goose" : "Codex", connectorName), release: () => {} }),
         abortSignal: browserAbort.signal,
         onReasoningSummary: (text, continuation) => trace.push({ kind: "reasoning", text, ...(continuation ? { continuation: true } : {}) }),
         onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
@@ -221,7 +222,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
         tokenSettled = true;
         token.resolve(turnToken);
         try {
-          const compiled = compileChatGptWebPrompt(parsed, turnCapabilities, turnToken, standaloneGoose ? "Goose" : "Codex");
+          const compiled = compileChatGptWebPrompt(parsed, turnCapabilities, turnToken, standaloneGoose ? "Goose" : "Codex", connectorName);
           return { ...compiled, release: () => {} };
         } catch (error) {
           broker.revoke(turnToken);

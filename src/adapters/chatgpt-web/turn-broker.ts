@@ -414,8 +414,8 @@ export class TurnBroker {
         + ` retiredTurn=${retiredTurn ?? "unknown"})`,
       );
       throw new Error(retiredTurn !== undefined
-        ? `This binding_id belongs to ${retiredTurnLabel(retiredTurn)}, which has already finished.`
-        + " Call codex_bind_turn with the current turn_token and use the binding_id it returns."
+        ? `This binding belongs to ${retiredTurnLabel(retiredTurn)}, which has already finished.`
+        + " Retry the tool call with the turn_token supplied in the current task context."
         : "binding id is invalid or expired");
     }
     if (request.method === "release") {

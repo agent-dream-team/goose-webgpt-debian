@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { providerConfig } from "../src/config";
+import { CHATGPT_CONNECTOR_NAME, providerConfig } from "../src/config";
 import {
   buildSetupConfig,
   installSetupCodexIntegration,
@@ -118,4 +118,33 @@ test("standalone setup also allows full mode, enabling local tools without touch
   expect(installSetupCodexIntegration(config, { mode: "full", standalone: true }, () => {
     throw new Error("must not install Codex integration for standalone full setup");
   })).toBe(false);
+});
+
+test("a fresh setup defaults the connector name to the current identity", () => {
+  const config = buildSetupConfig(undefined, {
+    mode: "browser-only",
+    acknowledgedUnofficial: true,
+  });
+  expect(config.appName).toBe(CHATGPT_CONNECTOR_NAME);
+});
+
+test("re-running setup over an existing legacy connector name migrates it forward", () => {
+  const existing = buildSetupConfig(undefined, {
+    mode: "browser-only",
+    acknowledgedUnofficial: true,
+  });
+  existing.appName = "Codex Native";
+  const migrated = buildSetupConfig(existing, {
+    mode: "browser-only",
+    acknowledgedUnofficial: true,
+  });
+  expect(migrated.appName).toBe(CHATGPT_CONNECTOR_NAME);
+});
+
+test("setup refuses an explicit --app-name that reuses the retired connector identity", () => {
+  expect(() => buildSetupConfig(undefined, {
+    mode: "browser-only",
+    acknowledgedUnofficial: true,
+    appName: "Codex Native",
+  })).toThrow(/newly created connector named/);
 });

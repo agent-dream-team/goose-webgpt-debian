@@ -9,6 +9,42 @@ import { VERSION } from "./version";
 export type RuntimeMode = "browser-only" | "full";
 export type BrowserHostMode = "managed-chrome" | "launcher";
 
+/**
+ * ChatGPT caches a connector's public MCP contract (tool schema and the account's granted action
+ * permission) by connector identity. Reusing "Codex Native" in place would keep the stale, narrower
+ * permission grant this fork accumulated before the direct turn-token contract and Goose's own tool
+ * set (shell/tree/analyze/load/delegate, routed through codex_tool_call) started using it — so
+ * ChatGPT keeps enforcing that old grant instead of the current contract. A fresh identity forces a
+ * deliberate new permission grant instead.
+ */
+export const CHATGPT_CONNECTOR_NAME = "Goose Native";
+export const LEGACY_CHATGPT_CONNECTOR_NAMES = ["Codex Native"] as const;
+
+export function isLegacyChatGptConnectorName(value: string): boolean {
+  return (LEGACY_CHATGPT_CONNECTOR_NAMES as readonly string[]).includes(value);
+}
+
+export function legacyChatGptConnectorMigrationMessage(legacyName: string): string {
+  return `Legacy ChatGPT connector ${JSON.stringify(legacyName)} was found, but this release requires`
+    + ` a newly created connector named ${JSON.stringify(CHATGPT_CONNECTOR_NAME)} with permissions set to`
+    + ` Allow all actions. Create ${JSON.stringify(CHATGPT_CONNECTOR_NAME)} against the same tunnel with`
+    + ` Authentication set to None; do not rename or refresh ${JSON.stringify(legacyName)}.`;
+}
+
+export function resolveSetupConnectorName(existingName?: string, requestedName?: string): string {
+  if (requestedName !== undefined) {
+    const requested = requestedName.trim();
+    if (!requested || requested.length > 80) throw new Error("Connector name is invalid");
+    if (isLegacyChatGptConnectorName(requested)) {
+      throw new Error(legacyChatGptConnectorMigrationMessage(requested));
+    }
+    return requested;
+  }
+  const existing = existingName?.trim();
+  if (!existing || isLegacyChatGptConnectorName(existing)) return CHATGPT_CONNECTOR_NAME;
+  return existing;
+}
+
 export interface TunnelConfig {
   binaryPath: string;
   tunnelId: string;
@@ -118,7 +154,7 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     host: "127.0.0.1",
     port: 17841,
     contextWindow: 256_000,
-    appName: "Codex Native",
+    appName: CHATGPT_CONNECTOR_NAME,
     browserHost: "managed-chrome",
     chromeExecutablePath: defaultChromeExecutable(),
     storageStatePath: join(home, "browser", "storage-state.json"),

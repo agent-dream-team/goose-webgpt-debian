@@ -115,17 +115,27 @@ bun run app
 
 完整模式通过官方
 [OpenAI tunnel-client](https://github.com/openai/tunnel-client)
-将 ChatGPT 的工具调用连接回当前 Codex 任务。该隧道为出站连接：不会暴露公网 IP、开放入站端口，
-也不需要配置路由器端口转发。
+将 ChatGPT 的工具调用连接回当前 Codex 或 Goose 任务。该隧道为出站连接：不会暴露公网 IP、
+开放入站端口，也不需要配置路由器端口转发。
+
+> [!WARNING]
+> 请创建名为 **Goose Native** 的**新**连接器，并将权限设置为 **允许所有操作**。不要重命名、
+> 刷新或复用旧的 **Codex Native** 连接器：ChatGPT 会按连接器身份缓存其公开 MCP 合约（工具
+> schema 与已授予的操作权限），复用旧身份会继续套用旧的、更窄的权限，而不是当前的工具集——
+> 这正是 `codex_exec`、`codex_tool_call`，或 Goose 自有工具（例如 `delegate`）在真正执行前
+> 被静默拦截的原因。**允许低风险操作** 会在命令和工具调用到达本地运行时之前将其拦截；外层
+> harness（Codex 或 Goose）仍会独立执行自己的沙箱与审批规则。
 
 1. 完成启动器中的必需设置。
 2. 在启动器中打开 **MCP**。请在将使用 ChatGPT 连接器的同一个 OpenAI 账户中创建 Tunnel
    和普通 API 密钥；创建密钥本身免费，也不会消耗模型 API 额度。
 3. 粘贴 Tunnel ID 和 API 密钥，然后点击 **连接 Harness**。
-4. 在 ChatGPT 设置中启用 **开发者模式**。创建连接器时选择 **Tunnel**，选择刚创建的
-   Tunnel，将 **身份验证** 设为 **无**，并将连接器准确命名为 `Codex Native`。
-5. 扫描工具，选择需要的操作权限，然后运行 **验证运行时**。验证过程会逐字输入并确认完整的
-   `@Codex Native` mention，然后检查连接器 pill。
+4. 在 ChatGPT 设置中启用 **开发者模式**。新建连接器时选择 **Tunnel**，选择刚创建的
+   Tunnel，将 **身份验证** 设为 **无**，并将连接器准确命名为 `Goose Native`。
+5. 打开 **权限** 并选择 **允许所有操作**，然后运行 **验证运行时**。验证过程会逐字输入并
+   确认完整的 `@Goose Native` mention，然后检查连接器 pill。
+6. 如果已存在旧的 `Codex Native` 连接器，请保持其不变，不要重命名或刷新它：此版本的本地
+   运行时会在只检测到旧连接器时明确拒绝，而不是静默复用其陈旧的合约与权限。
 
 写入/修改操作需要 ChatGPT 工作区及管理员政策允许。OpenAI 目前仅为 Business 和
 Enterprise/Edu 工作区说明了这些操作；个人 Pro 账户仅限 read/fetch MCP 权限。请参阅

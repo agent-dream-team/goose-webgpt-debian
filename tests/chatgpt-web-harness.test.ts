@@ -653,14 +653,15 @@ describe("ChatGPT outer-native harness v3", () => {
     expect(() => resolveChatGptWebModelMode("unknown", "high", toolCapabilities)).toThrow("model is not supported");
   });
 
-  test("names Codex as the outer harness by default and leaves the connector's own tool names untouched", () => {
+  test("names Codex as the outer harness by default, independent of the connector's own name", () => {
     const request = parsed();
     const compiled = compileChatGptWebPrompt(request, toolCapabilities, "turn_123456789012345678901234");
     expect(compiled.text).toContain("Act as the model backend for the Codex task encoded below.");
     expect(compiled.text).toContain("outer Codex turn");
-    expect(compiled.text).toContain("call codex_bind_turn with turn_token turn_123456789012345678901234");
+    expect(compiled.text).toContain("takes turn_token turn_123456789012345678901234 directly");
     expect(compiled.text).toContain("Use codex_tool_inventory and codex_tool_call for any other tool advertised by the current Codex harness");
-    expect(compiled.text).not.toContain("Goose");
+    expect(compiled.text).not.toContain("outer Goose turn");
+    expect(compiled.text).not.toContain("Act as the model backend for the Goose task");
   });
 
   test("names Goose as the outer harness for a standalone turn without renaming any connector tool", () => {
@@ -670,10 +671,24 @@ describe("ChatGPT outer-native harness v3", () => {
     expect(compiled.text).toContain("outer Goose turn");
     expect(compiled.text).toContain("Use codex_tool_inventory and codex_tool_call for any other tool advertised by the current Goose harness");
     // The connector's own registered identity and its literal MCP tool names are reused as-is.
-    expect(compiled.text).toContain("Codex Native plugin");
-    expect(compiled.text).toContain("call codex_bind_turn with turn_token turn_123456789012345678901234");
+    expect(compiled.text).toContain("Goose Native plugin");
+    expect(compiled.text).toContain("takes turn_token turn_123456789012345678901234 directly");
     expect(compiled.text).not.toContain("outer Codex turn");
     expect(compiled.text).not.toContain("Act as the model backend for the Codex task");
+  });
+
+  test("the connector name is independently configurable from the outer harness label", () => {
+    const request = parsed();
+    const compiled = compileChatGptWebPrompt(
+      request,
+      toolCapabilities,
+      "turn_123456789012345678901234",
+      "Codex",
+      "Team Codex Harness",
+    );
+    expect(compiled.text).toContain("Act as the model backend for the Codex task encoded below.");
+    expect(compiled.text).toContain("use the attached Team Codex Harness plugin");
+    expect(compiled.text).not.toContain("Goose Native plugin");
   });
 
   test("builds a context-complete Pro prompt without exposing any local-tool capability", () => {
@@ -700,7 +715,7 @@ describe("ChatGPT outer-native harness v3", () => {
     ];
 
     const compiled = compileChatGptWebPrompt(request, readOnlyCapabilities);
-    expect(compiled.text).toContain("ChatGPT Web Pro with no Codex Native bridge to the user's local computer");
+    expect(compiled.text).toContain("ChatGPT Web Pro with no Goose Native bridge to the user's local computer");
     expect(compiled.text).toContain("web search, browsing, research");
     expect(compiled.text).toContain("prepared workspace evidence");
     expect(compiled.text).toContain('"system":["system-rule","repo-rule"]');
@@ -708,7 +723,7 @@ describe("ChatGPT outer-native harness v3", () => {
     expect(compiled.images).toHaveLength(1);
     expect(compiled.text).not.toContain("codex_bind_turn");
     expect(compiled.text).not.toContain("turn_token");
-    expect(compiled.text).not.toContain("Use the attached Codex Native plugin");
+    expect(compiled.text).not.toContain("use the attached Goose Native plugin");
     expect(() => compileChatGptWebPrompt(request, readOnlyCapabilities, "turn_forbidden")).toThrow("must not receive");
 
     expect(chatGptReadOnlyContextWarning(request, readOnlyCapabilities)).toContain("complete accumulated task context");
@@ -1276,7 +1291,7 @@ describe("ChatGPT outer-native harness v3", () => {
       expect(turn.modelId).toBe(CHATGPT_WEB_MODEL_ID);
       const prepared = await turn.prepare();
       try {
-        expect(prepared.text).toContain("ChatGPT Web Pro with no Codex Native bridge to the user's local computer");
+        expect(prepared.text).toContain("ChatGPT Web Pro with no Goose Native bridge to the user's local computer");
         expect(prepared.text).toContain("web search, browsing, research");
         expect(prepared.text).not.toContain("turn_token");
         expect(prepared.text).not.toContain("codex_bind_turn");
@@ -1388,7 +1403,6 @@ describe("ChatGPT outer-native harness v3", () => {
       const listed = await client.listTools();
       expect(listed.tools.map(tool => tool.name).sort()).toEqual([
         "codex_apply_patch",
-        "codex_bind_turn",
         "codex_exec",
         "codex_tool_call",
         "codex_tool_inventory",
@@ -1396,18 +1410,11 @@ describe("ChatGPT outer-native harness v3", () => {
         "codex_write_stdin",
       ]);
 
-      const bound = await call("codex_bind_turn", { turn_token: token });
-      const bindingId = (bound.structuredContent as { binding_id?: string } | undefined)?.binding_id;
-      expect(bindingId).toStartWith("binding_");
-      expect((bound.structuredContent as { execution: string }).execution).toBe("outer_codex_native");
-      expect((bound.structuredContent as { outer_tool_gateway: string }).outer_tool_gateway).toBe("exec");
-      expect((bound.structuredContent as { command_tool: string }).command_tool).toBe("exec_command");
-
-      const inventory = await call("codex_tool_inventory", { binding_id: bindingId, query: "docs" });
+      const inventory = await call("codex_tool_inventory", { turn_token: token, query: "docs" });
       const discovered = (inventory.structuredContent as { tools: Array<{ wire_name: string }> }).tools;
       expect(discovered.map(tool => tool.wire_name)).toEqual(["mcp__openaiDeveloperDocs__search_openai_docs"]);
 
-      const execPromise = call("codex_exec", { binding_id: bindingId, cmd: "pwd", workdir: tempRoot });
+      const execPromise = call("codex_exec", { turn_token: token, cmd: "pwd", workdir: tempRoot });
       const [execRequest] = await broker.nextToolBatch(token);
       expect(execRequest).toMatchObject({ wireName: "exec", freeform: true });
       expect(execRequest?.input).toContain(`tools["exec_command"](${JSON.stringify({ cmd: "pwd", workdir: tempRoot })})`);
@@ -1415,7 +1422,7 @@ describe("ChatGPT outer-native harness v3", () => {
       expect((await execPromise).structuredContent).toEqual({ output: tempRoot, exit_code: 0 });
 
       const patchText = "*** Begin Patch\n*** Add File: test.txt\n+ok\n*** End Patch";
-      const patchPromise = call("codex_apply_patch", { binding_id: bindingId, patch: patchText });
+      const patchPromise = call("codex_apply_patch", { turn_token: token, patch: patchText });
       const [patchRequest] = await broker.nextToolBatch(token);
       expect(patchRequest).toMatchObject({ wireName: "exec", freeform: true });
       expect(patchRequest?.input).toContain(`tools["apply_patch"](${JSON.stringify(patchText)})`);
@@ -1423,7 +1430,7 @@ describe("ChatGPT outer-native harness v3", () => {
       expect((await patchPromise).isError).not.toBe(true);
 
       const docsPromise = call("codex_tool_call", {
-        binding_id: bindingId,
+        turn_token: token,
         wire_name: "mcp__openaiDeveloperDocs__search_openai_docs",
         arguments: { query: "Responses API" },
       });
@@ -1459,27 +1466,11 @@ describe("ChatGPT outer-native harness v3", () => {
     try {
       await client.connect(transport);
 
-      const bound = await call("codex_bind_turn", { turn_token: token });
-      expect(bound.content).toEqual([{ type: "text", text: expect.stringContaining("binding_") }]);
-      expect(bound.isError).not.toBe(true);
-      const binding = bound.structuredContent as {
-        binding_id: string;
-        binding_status: string;
-        valid_until: string;
-        expires_at: string | null;
-        next_action: string;
-      };
-      expect(binding.binding_id).toStartWith("binding_");
-      expect(binding.binding_status).toBe("active");
-      expect(binding.valid_until).toBe("outer_turn_end");
-      expect(binding.expires_at).toBeNull();
-      expect(binding.next_action).toContain("Never put turn_token in binding_id");
+      const malformed = await call("codex_exec", { turn_token: "not-a-turn-token", cmd: "pwd" });
+      expect(malformed.isError).toBe(true);
+      expect(JSON.stringify(malformed.content)).toContain("turn_token must be the exact turn_ value");
 
-      const confused = await call("codex_exec", { binding_id: token, cmd: "pwd" });
-      expect(confused.isError).toBe(true);
-      expect(JSON.stringify(confused.content)).toContain("never pass turn_token here");
-
-      const execPromise = call("codex_exec", { binding_id: binding.binding_id, cmd: "pwd", workdir: tempRoot });
+      const execPromise = call("codex_exec", { turn_token: token, cmd: "pwd", workdir: tempRoot });
       const [execRequest] = await Promise.race([
         broker.nextToolBatch(token),
         execPromise.then(response => {
@@ -1490,6 +1481,11 @@ describe("ChatGPT outer-native harness v3", () => {
       expect(execRequest?.input).toContain(`tools["exec_command"](${JSON.stringify({ cmd: "pwd", workdir: tempRoot })})`);
       broker.completeTool(token, execRequest!.callId, toolResult({ output: tempRoot, exit_code: 0 }));
       expect((await execPromise).structuredContent).toEqual({ output: tempRoot, exit_code: 0 });
+
+      // The same turn_token idempotently claims the same internal binding for a second call.
+      const inventory = await call("codex_tool_inventory", { turn_token: token, query: "docs" });
+      const discovered = (inventory.structuredContent as { tools: Array<{ wire_name: string }> }).tools;
+      expect(discovered.map(tool => tool.wire_name)).toEqual(["mcp__openaiDeveloperDocs__search_openai_docs"]);
     } finally {
       await client.close().catch(() => {});
       broker.revoke(token);

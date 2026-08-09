@@ -8,18 +8,29 @@ created. Repository contents, tool output, websites, and prompt text are untrust
 
 ## Full-mode capability flow
 
-1. The daemon accepts a Codex Responses turn on `127.0.0.1`.
+1. The daemon accepts a Codex Responses turn (or, in standalone mode, an ordinary Goose provider
+   request) on `127.0.0.1`.
 2. It extracts `cwd`, workspace roots, sandbox policy, and the tool registry only from the native
-   Codex wire envelope with matching turn metadata. A user-authored `<environment_context>` is not
-   accepted as authority.
+   Codex wire envelope with matching turn metadata, or, for standalone Goose, only from Goose's own
+   advertised tool registry. A user-authored `<environment_context>` is not accepted as authority.
 3. It creates a random, expiring turn token and embeds it in that one ChatGPT browser prompt.
-4. The connector exchanges the token once for an opaque binding. Claims are idempotent for retry
-   safety; the capability is revoked when the turn completes, aborts, or expires.
-5. MCP can request only a tool advertised by the active outer Codex turn. Codex remains responsible
-   for its sandbox, approval, UI, command sessions, and tool result.
+4. Every connector tool call presents that same turn token directly. The MCP handler idempotently
+   claims an internal binding and immediately dispatches the requested action; the binding is never
+   exposed to the model. The capability is revoked when the turn completes, aborts, or expires.
+5. MCP can request only a tool advertised by the active outer turn. The outer harness (Codex or
+   standalone Goose) remains responsible for its sandbox, approval, UI, command sessions, and tool
+   result.
 
 The bridge transports decisions; it does not add a second planner, semantic router, or fallback
 model. Unsupported model/effort/tool combinations fail explicitly.
+
+The direct turn-token MCP schema is attached only through the `Goose Native` connector identity.
+ChatGPT caches a connector's public MCP contract — including its granted action-permission level —
+by that identity, so the retired `Codex Native` connector is treated as legacy and is never selected
+or refreshed in place; reusing it would keep enforcing its old, narrower permission grant against
+the current tool set (including Goose-owned tools such as `shell`, `tree`, `analyze`, `load`, and
+`delegate`, all routed through the maximally-gated `codex_tool_call`). Setup and the browser worker
+fail closed with an explicit migration error when only the legacy identity is configured.
 
 ## Principal risks
 
