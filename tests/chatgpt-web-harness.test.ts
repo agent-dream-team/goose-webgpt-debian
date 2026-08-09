@@ -47,6 +47,34 @@ function brokerTestEndpoint(name: string): string {
     : join(tmpdir(), `${name}.sock`);
 }
 
+interface GatewayProgramCall {
+  name: string;
+  input: unknown;
+}
+
+async function executeGatewayProgram(program: string, availableToolNames: string[], calls: GatewayProgramCall[]): Promise<void> {
+  const nestedTools = Object.fromEntries(availableToolNames.map(name => [
+    name,
+    async (input: unknown) => {
+      calls.push({ name, input });
+      return { output: name, exit_code: 0 };
+    },
+  ]));
+  const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor as new (
+    ...args: string[]
+  ) => (...values: unknown[]) => Promise<void>;
+  const execute = new AsyncFunction("tools", "ALL_TOOLS", "text", "image", "audio", "generatedImage", program);
+  const ignoreOutput = (_value: unknown): void => {};
+  await execute(
+    nestedTools,
+    availableToolNames.map(name => ({ name, description: `${name} test tool` })),
+    ignoreOutput,
+    ignoreOutput,
+    ignoreOutput,
+    ignoreOutput,
+  );
+}
+
 function parsed(developerText?: string): CodexParsedRequest {
   return {
     modelId: CHATGPT_WEB_MODEL_ID,
@@ -1415,10 +1443,43 @@ describe("ChatGPT outer-native harness v3", () => {
       const discovered = (inventory.structuredContent as { tools: Array<{ wire_name: string }> }).tools;
       expect(discovered.map(tool => tool.wire_name)).toEqual(["mcp__openaiDeveloperDocs__search_openai_docs"]);
 
-      const execPromise = call("codex_exec", { turn_token: token, cmd: "pwd", workdir: tempRoot });
+      const execPromise = call("codex_exec", {
+        turn_token: token,
+        cmd: "pwd",
+        workdir: tempRoot,
+        yield_time_ms: 2_000,
+        max_output_tokens: 1_234,
+        tty: true,
+      });
       const [execRequest] = await broker.nextToolBatch(token);
       expect(execRequest).toMatchObject({ wireName: "exec", freeform: true });
-      expect(execRequest?.input).toContain(`tools["exec_command"](${JSON.stringify({ cmd: "pwd", workdir: tempRoot })})`);
+      expect(execRequest?.input).toContain("ALL_TOOLS");
+      expect(execRequest?.input).toContain('"exec_command"');
+      expect(execRequest?.input).toContain('"shell_command"');
+      const execGatewayCalls: GatewayProgramCall[] = [];
+      await executeGatewayProgram(execRequest!.input!, ["exec_command"], execGatewayCalls);
+      expect(execGatewayCalls).toEqual([{
+        name: "exec_command",
+        input: {
+          cmd: "pwd",
+          workdir: tempRoot,
+          yield_time_ms: 2_000,
+          max_output_tokens: 1_234,
+          tty: true,
+        },
+      }]);
+      const shellGatewayCalls: GatewayProgramCall[] = [];
+      await executeGatewayProgram(execRequest!.input!, ["shell_command"], shellGatewayCalls);
+      expect(shellGatewayCalls).toEqual([{
+        name: "shell_command",
+        input: { command: "pwd", workdir: tempRoot, timeout_ms: 2_000 },
+      }]);
+      for (const unavailableOrAmbiguous of [[], ["exec_command", "shell_command"]]) {
+        const rejectedCalls: GatewayProgramCall[] = [];
+        await expect(executeGatewayProgram(execRequest!.input!, unavailableOrAmbiguous, rejectedCalls))
+          .rejects.toThrow("Expected exactly one native command tool");
+        expect(rejectedCalls).toEqual([]);
+      }
       broker.completeTool(token, execRequest!.callId, toolResult({ output: tempRoot, exit_code: 0 }));
       expect((await execPromise).structuredContent).toEqual({ output: tempRoot, exit_code: 0 });
 
@@ -1444,6 +1505,150 @@ describe("ChatGPT outer-native harness v3", () => {
       await client.close().catch(() => {});
       broker.revoke(token);
       await broker.close();
+    }
+  }, 30_000);
+
+  test("routes codex_exec through supported direct command descriptors and fails closed", async () => {
+    const commandSchema = (field: "cmd" | "command") => ({
+      type: "object",
+      properties: { [field]: { type: "string" } },
+      required: [field],
+    });
+    const shellTool: CodexTool = {
+      name: "shell",
+      description: "Execute a shell command",
+      parameters: {
+        type: "object",
+        properties: {
+          command: { type: "string" },
+          timeout_secs: { type: ["integer", "null"], minimum: 0 },
+        },
+        required: ["command"],
+      },
+    };
+
+    const directCases = [
+      {
+        label: "goose-shell",
+        tool: shellTool,
+        expectedArguments: { command: "pwd" },
+      },
+      {
+        label: "exec-command",
+        tool: { name: "exec_command", description: "Run command", parameters: commandSchema("cmd") } satisfies CodexTool,
+        expectedArguments: {
+          cmd: "pwd",
+          workdir: tempRoot,
+          yield_time_ms: 2_000,
+          max_output_tokens: 1_234,
+          tty: true,
+        },
+      },
+      {
+        label: "shell-command",
+        tool: { name: "shell_command", description: "Run command", parameters: commandSchema("command") } satisfies CodexTool,
+        expectedArguments: { command: "pwd", workdir: tempRoot, timeout_ms: 2_000 },
+      },
+    ];
+
+    for (const { label, tool, expectedArguments } of directCases) {
+      const socketPath = brokerTestEndpoint(`cgw-h3-command-${label}-${process.pid}-${Date.now()}`);
+      const broker = TurnBroker.forSocket(socketPath);
+      const environment = extractChatGptTurnEnvironment(parsed(environmentXml));
+      environment.tools = [tool];
+      const token = await broker.register(environment, 60_000);
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: ["src/cli.ts", "mcp", "--broker-socket", socketPath],
+        cwd: process.cwd(),
+        stderr: "pipe",
+      });
+      const client = new Client({ name: `command-${label}-test`, version: "1.0.0" });
+      try {
+        await client.connect(transport);
+        const execPromise = client.callTool({
+          name: "codex_exec",
+          arguments: {
+            turn_token: token,
+            cmd: "pwd",
+            workdir: tempRoot,
+            yield_time_ms: 2_000,
+            max_output_tokens: 1_234,
+            tty: true,
+          },
+        });
+        const requests = await broker.nextToolBatch(token);
+        expect(requests).toHaveLength(1);
+        expect(requests[0]).toMatchObject({ wireName: tool.name, freeform: false, arguments: expectedArguments });
+        if (tool.name === "shell") {
+          expect(requests[0]?.arguments).toEqual({ command: "pwd" });
+          expect(requests[0]?.arguments).not.toHaveProperty("timeout_secs");
+        }
+        broker.completeTool(token, requests[0]!.callId, toolResult({ output: "ok", exit_code: 0 }));
+        expect((await execPromise).structuredContent).toEqual({ output: "ok", exit_code: 0 });
+
+        if (tool.name === "shell") {
+          const failedExec = client.callTool({
+            name: "codex_exec",
+            arguments: { turn_token: token, cmd: "false" },
+          });
+          const failedRequests = await broker.nextToolBatch(token);
+          expect(failedRequests).toHaveLength(1);
+          expect(failedRequests[0]).toMatchObject({ wireName: "shell", arguments: { command: "false" } });
+          broker.completeTool(token, failedRequests[0]!.callId, {
+            ...toolResult({ error: "command failed", exit_code: 1 }),
+            isError: true,
+          });
+          expect((await failedExec).isError).toBe(true);
+          const controller = new AbortController();
+          controller.abort();
+          await expect(broker.nextToolBatch(token, controller.signal)).rejects.toThrow("tool wait aborted");
+        }
+      } finally {
+        await client.close().catch(() => {});
+        broker.revoke(token);
+        await broker.close();
+      }
+    }
+
+    for (const [label, toolsForTurn, expectedError] of [
+      ["missing", [], "did not advertise a supported command capability or the native exec gateway"],
+      [
+        "ambiguous",
+        [shellTool, { name: "exec_command", description: "Run command", parameters: commandSchema("cmd") }],
+        "ambiguous supported command capabilities",
+      ],
+      [
+        "incompatible-shell",
+        [{ name: "shell", description: "Wrong shell ABI", parameters: { type: "object", properties: { script: { type: "string" } }, required: ["script"] } }],
+        "did not advertise a supported command capability or the native exec gateway",
+      ],
+    ] as const) {
+      const socketPath = brokerTestEndpoint(`cgw-h3-command-fail-${label}-${process.pid}-${Date.now()}`);
+      const broker = TurnBroker.forSocket(socketPath);
+      const environment = extractChatGptTurnEnvironment(parsed(environmentXml));
+      environment.tools = [...toolsForTurn] as CodexTool[];
+      const token = await broker.register(environment, 60_000);
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: ["src/cli.ts", "mcp", "--broker-socket", socketPath],
+        cwd: process.cwd(),
+        stderr: "pipe",
+      });
+      const client = new Client({ name: `command-fail-${label}-test`, version: "1.0.0" });
+      try {
+        await client.connect(transport);
+        const response = await client.callTool({ name: "codex_exec", arguments: { turn_token: token, cmd: "pwd" } });
+        expect(response.isError).toBe(true);
+        expect(JSON.stringify(response.content)).toContain(expectedError);
+        const controller = new AbortController();
+        controller.abort();
+        await expect(broker.nextToolBatch(token, controller.signal)).rejects.toThrow("tool wait aborted");
+      } finally {
+        await client.close().catch(() => {});
+        broker.revoke(token);
+        await broker.close();
+      }
     }
   }, 30_000);
 
@@ -1630,7 +1835,10 @@ describe("ChatGPT outer-native harness v3", () => {
         }),
       ]);
       expect(execRequest).toMatchObject({ wireName: "exec", freeform: true });
-      expect(execRequest?.input).toContain(`tools["exec_command"](${JSON.stringify({ cmd: "pwd", workdir: tempRoot })})`);
+      expect(execRequest?.input).toContain("ALL_TOOLS");
+      expect(execRequest?.input).toContain('"exec_command"');
+      expect(execRequest?.input).toContain('"shell_command"');
+      expect(execRequest?.input).toContain(JSON.stringify({ cmd: "pwd", workdir: tempRoot }));
       broker.completeTool(token, execRequest!.callId, toolResult({ output: tempRoot, exit_code: 0 }));
       expect((await execPromise).structuredContent).toEqual({ output: tempRoot, exit_code: 0 });
 

@@ -71,6 +71,23 @@ Status as of 2026-08-09: **PASS.** ChatGPT-Web (`chatgpt-web/medium`) as ordinar
 - Deployment lesson: the Secure MCP Tunnel owns a persistent stdio MCP child independently of the HTTP daemon. Restarting only the HTTP daemon does **not** refresh that child. After MCP action/schema changes, restart the established tunnel service while preserving tunnel identity, then refresh the ChatGPT-side Goose Native app so the updated contract is visible.
 - Remaining compatibility follow-up: `codex_exec` still assumes Codex-style `exec_command` / `shell_command` or a native exec gateway and does not directly handle Goose's `shell` tool. This is a convenience-action compatibility issue only; the generic Goose tool gateway and native delegation milestone are both already proven.
 
+## PARALLEL FREE-WORKER DELEGATION — pending
+
+Near-term sequence: first close the `codex_exec` → Goose `shell` compatibility gap, then validate `chatgpt-web/high` as the normal main model, then prove parallel strictly-free workers. This is near-term because parallel free workers should accelerate subsequent provider integration, research, implementation, and independent review.
+
+Current delegation policy: prefer explicitly selected external strictly-free workers; avoid child-agent delegation here for routine development. If no suitable external free worker is available, the main agent completes the work itself and reports delegation unavailable. Future parallelism should use the external free-worker pool.
+
+Acceptance criteria:
+
+- ChatGPT-Web parent launches exactly two independent workers through Goose-native delegation.
+- Delegation is genuinely asynchronous/parallel rather than two sequential synchronous calls; both task IDs return before waiting for either, and execution overlap is demonstrated.
+- Both workers use explicitly selected strictly-free provider/model routes. Initial proof may use two `openrouter` / `poolside/laguna-s-2.1:free` workers; after a second free provider is qualified, repeat across different providers.
+- Both real results return to the same ChatGPT-Web parent and are synthesized there.
+- Failure of one worker must not silently replace it with another provider/model; no paid fallback and no Day Shift fallback.
+- Prefer Goose's existing native async delegate/task lifecycle. Extend the narrow Goose Native bridge only as necessary, likely with async delegation plus a narrow task-result/wait action; do not build a custom scheduler if Goose already provides the lifecycle.
+
+Do not implement parallel delegation as part of the `codex_exec` compatibility task.
+
 ## Upstream reconnaissance snapshot — `miuuyy/codex-chatgpt-web` v2.1.4
 
 Audit date: **2026-08-09.** Upstream's latest release is v2.1.4. At the audit point this fork and upstream were materially diverged (upstream had 12 commits after the common base and this fork had 8 fork-specific commits). Do **selective reconciliation**, not a blind merge.
