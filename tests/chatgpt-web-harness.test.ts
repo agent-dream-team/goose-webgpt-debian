@@ -1408,6 +1408,7 @@ describe("ChatGPT outer-native harness v3", () => {
         "codex_tool_inventory",
         "codex_view_image",
         "codex_write_stdin",
+        "goose_delegate",
       ]);
 
       const inventory = await call("codex_tool_inventory", { turn_token: token, query: "docs" });
@@ -1443,6 +1444,157 @@ describe("ChatGPT outer-native harness v3", () => {
       await client.close().catch(() => {});
       broker.revoke(token);
       await broker.close();
+    }
+  }, 30_000);
+
+  test("serves a fail-closed first-class Goose delegation action over MCP stdio", async () => {
+    const delegateSchema = {
+      type: "object",
+      properties: {
+        instructions: { type: "string" },
+        source: { type: "string" },
+        parameters: { type: "object", additionalProperties: true },
+        extensions: { type: "array", items: { type: "string" } },
+        provider: { type: "string" },
+        model: { type: "string" },
+        temperature: { type: "number" },
+        max_turns: { type: "integer", minimum: 1 },
+        context: { type: "string" },
+        working_dir: { type: "string" },
+        async: { type: "boolean", default: false },
+      },
+    };
+    const delegateTool: CodexTool = {
+      name: "delegate",
+      description: "Delegate a task to a subagent that runs independently with its own context.",
+      parameters: delegateSchema,
+    };
+    const dayShiftDelegate: CodexTool = {
+      name: "delegate",
+      namespace: "day_shift_delegation",
+      description: "Day Shift delegate",
+      parameters: { type: "object" },
+    };
+    const shellTool: CodexTool = {
+      name: "shell",
+      description: "Execute a shell command",
+      parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+    };
+    const execGatewayTool: CodexTool = {
+      name: "exec",
+      description: "Run nested tools",
+      parameters: {},
+      freeform: true,
+    };
+    const environment = extractChatGptTurnEnvironment(parsed(environmentXml));
+    environment.tools = [shellTool, execGatewayTool, dayShiftDelegate, delegateTool];
+    const socketPath = brokerTestEndpoint(`cgw-h3-goose-delegate-${process.pid}-${Date.now()}`);
+    const broker = TurnBroker.forSocket(socketPath);
+    const token = await broker.register(environment, 60_000);
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["src/cli.ts", "mcp", "--broker-socket", socketPath],
+      cwd: process.cwd(),
+      stderr: "pipe",
+    });
+    const client = new Client({ name: "goose-delegate-test", version: "1.0.0" });
+    const call = (name: string, args: Record<string, unknown>) => client.callTool({ name, arguments: args });
+
+    try {
+      await client.connect(transport);
+      const listed = await client.listTools();
+      const publicTool = listed.tools.find(tool => tool.name === "goose_delegate");
+      expect(publicTool).toBeDefined();
+      expect(publicTool?.description).toContain("exact Goose-native delegate tool");
+      expect(publicTool?.inputSchema).toMatchObject({
+        type: "object",
+        properties: {
+          turn_token: expect.any(Object),
+          provider: expect.any(Object),
+          model: expect.any(Object),
+          instructions: expect.any(Object),
+        },
+        required: expect.arrayContaining(["turn_token", "provider", "model", "instructions"]),
+      });
+      expect(Object.keys(publicTool?.inputSchema.properties ?? {}).sort()).toEqual([
+        "instructions", "model", "provider", "turn_token",
+      ]);
+      expect(publicTool?.annotations).toMatchObject({
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      });
+
+      const malformed = await call("goose_delegate", {
+        turn_token: "not-a-turn-token",
+        provider: "openrouter",
+        model: "poolside/laguna-s-2.1:free",
+        instructions: "Return exactly: FREE_WORKER_DELEGATION_OK",
+      });
+      expect(malformed.isError).toBe(true);
+      expect(JSON.stringify(malformed.content)).toContain("turn_token must be the exact turn_ value");
+
+      const provider = "openrouter";
+      const model = "poolside/laguna-s-2.1:free";
+      const instructions = "Return exactly:\nFREE_WORKER_DELEGATION_OK";
+      const delegatePromise = call("goose_delegate", {
+        turn_token: token,
+        provider,
+        model,
+        instructions,
+        wire_name: "shell",
+      });
+      const [delegateRequest] = await broker.nextToolBatch(token);
+      expect(delegateRequest).toMatchObject({
+        wireName: "delegate",
+        freeform: false,
+        arguments: { provider, model, instructions },
+      });
+      expect(delegateRequest?.wireName).not.toBe("shell");
+      broker.completeTool(token, delegateRequest!.callId, toolResult({ delegated: true }));
+      expect((await delegatePromise).structuredContent).toEqual({ delegated: true });
+    } finally {
+      await client.close().catch(() => {});
+      broker.revoke(token);
+      await broker.close();
+    }
+
+    for (const [label, toolsForTurn, expectedError] of [
+      ["missing", [shellTool, dayShiftDelegate], "did not advertise the required Goose-native delegate tool"],
+      ["ambiguous", [delegateTool, { ...delegateTool }], "advertised an ambiguous Goose-native delegate capability"],
+      ["incompatible", [{ ...delegateTool, parameters: { type: "object", properties: { instructions: { type: "string" } } } }], "does not advertise required field: provider"],
+    ] as const) {
+      const failureSocket = brokerTestEndpoint(`cgw-h3-goose-delegate-${label}-${process.pid}-${Date.now()}`);
+      const failureBroker = TurnBroker.forSocket(failureSocket);
+      const failureEnvironment = extractChatGptTurnEnvironment(parsed(environmentXml));
+      failureEnvironment.tools = [...toolsForTurn];
+      const failureToken = await failureBroker.register(failureEnvironment, 60_000);
+      const failureTransport = new StdioClientTransport({
+        command: process.execPath,
+        args: ["src/cli.ts", "mcp", "--broker-socket", failureSocket],
+        cwd: process.cwd(),
+        stderr: "pipe",
+      });
+      const failureClient = new Client({ name: `goose-delegate-${label}-test`, version: "1.0.0" });
+      try {
+        await failureClient.connect(failureTransport);
+        const response = await failureClient.callTool({
+          name: "goose_delegate",
+          arguments: {
+            turn_token: failureToken,
+            provider: "openrouter",
+            model: "poolside/laguna-s-2.1:free",
+            instructions: "Return exactly: FREE_WORKER_DELEGATION_OK",
+          },
+        });
+        expect(response.isError).toBe(true);
+        expect(JSON.stringify(response.content)).toContain(expectedError);
+      } finally {
+        await failureClient.close().catch(() => {});
+        failureBroker.revoke(failureToken);
+        await failureBroker.close();
+      }
     }
   }, 30_000);
 

@@ -61,6 +61,26 @@ function exactTool(environment: ChatGptTurnEnvironment, name: string): CodexTool
   return environment.tools.find(tool => !tool.namespace && tool.name === name);
 }
 
+function exactUniqueTool(environment: ChatGptTurnEnvironment, name: string): CodexTool {
+  const matches = environment.tools.filter(tool => !tool.namespace && tool.name === name);
+  if (matches.length === 0) throw new Error(`This turn did not advertise the required Goose-native ${name} tool`);
+  if (matches.length > 1) throw new Error(`This turn advertised an ambiguous Goose-native ${name} capability`);
+  return matches[0]!;
+}
+
+function gooseDelegateTool(environment: ChatGptTurnEnvironment): CodexTool {
+  const tool = exactUniqueTool(environment, "delegate");
+  if (tool.freeform) throw new Error("The Goose-native delegate tool must use a structured function schema");
+  const properties = tool.parameters?.properties;
+  if (!properties || typeof properties !== "object" || Array.isArray(properties)) {
+    throw new Error("The Goose-native delegate tool did not advertise a structured properties schema");
+  }
+  for (const field of ["provider", "model", "instructions"] as const) {
+    if (!(field in properties)) throw new Error(`The Goose-native delegate tool does not advertise required field: ${field}`);
+  }
+  return tool;
+}
+
 function namedTool(environment: ChatGptTurnEnvironment, requestedWireName: string): CodexTool {
   const tool = environment.tools.find(candidate => wireName(candidate) === requestedWireName);
   if (!tool) throw new Error(`Tool is not available in this turn: ${requestedWireName}`);
@@ -355,5 +375,30 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     },
   );
 
+
+  server.registerTool(
+    "goose_delegate",
+    {
+      title: "Delegate through Goose",
+      description: "Delegate explicit instructions to the exact Goose-native delegate tool advertised by the current outer turn, forwarding the requested provider and model unchanged. Goose remains responsible for execution, provider access, approvals, and lifecycle.",
+      inputSchema: {
+        turn_token: turnTokenSchema,
+        provider: z.string().min(1).max(1_000),
+        model: z.string().min(1).max(4_000),
+        instructions: z.string().min(1).max(5_000_000),
+      },
+      // Delegation can execute model-directed work outside this MCP server and is neither read-only
+      // nor inherently idempotent. Keep the annotations truthful rather than weakening them for routing.
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async ({ turn_token, provider, model, instructions }, extra) => {
+      const claimed = await claimTurn("goose_delegate", turn_token, extra);
+      const bound = claimed.environment;
+      const tool = gooseDelegateTool(bound);
+      return invoke(claimed.bindingId, bound, tool, {
+        arguments: { provider, model, instructions },
+      });
+    },
+  );
   await server.connect(new StdioServerTransport());
 }
