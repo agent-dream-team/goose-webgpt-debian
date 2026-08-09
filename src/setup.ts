@@ -28,8 +28,8 @@ import {
   restartService,
   uninstallService,
 } from "./service";
-import { connectTunnel, createTunnelConfig, installRuntimeKey, installRuntimeKeyBytes, installTunnelClient, managedRuntimeKeyPath, stopTunnel, waitForTunnelReady } from "./tunnel";
-import { getTunnelServiceStatus, installTunnelService, restartTunnelService, stopTunnelService, tunnelServiceDefinitionMatches, uninstallTunnelService } from "./tunnel-service";
+import { connectTunnel, createTunnelConfig, installRuntimeKey, installRuntimeKeyBytes, installTunnelClient, managedRuntimeKeyPath, stopTunnel } from "./tunnel";
+import { getTunnelServiceStatus, installTunnelService, restartTunnelService, stopTunnelService, tunnelServiceDefinitionMatches, uninstallTunnelService, waitForTunnelServiceReady } from "./tunnel-service";
 import { VERSION } from "./version";
 
 export interface SetupOptions {
@@ -390,7 +390,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
         await assertServiceIdle(config);
         await restartTunnelService();
       }
-      const status = await waitForTunnelReady(config);
+      const status = await waitForTunnelServiceReady(config);
       if (!status.ok) throw new Error(`Tunnel runtime did not become healthy and ready: ${status.detail}`);
       tunnelReady = true;
     }

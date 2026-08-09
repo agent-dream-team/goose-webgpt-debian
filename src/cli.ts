@@ -19,8 +19,8 @@ import { runCommand } from "./process";
 import { startServer } from "./server";
 import { assertServiceIdle, cancelBrowserTurns, getServiceStatus, installService, restartService, startService, stopService, uninstallService } from "./service";
 import { existingFullSetupCredentials, setup, type SetupOptions } from "./setup";
-import { installRuntimeKeyBytes, managedRuntimeKeyPath, stopTunnel, tunnelStatus, waitForTunnelReady } from "./tunnel";
-import { getTunnelServiceStatus, restartTunnelService, startTunnelService, stopTunnelService, uninstallTunnelService } from "./tunnel-service";
+import { installRuntimeKeyBytes, managedRuntimeKeyPath, stopTunnel, tunnelStatus } from "./tunnel";
+import { getTunnelServiceRuntimeStatus, getTunnelServiceStatus, restartTunnelService, startTunnelService, stopTunnelService, uninstallTunnelService, waitForTunnelServiceReady } from "./tunnel-service";
 import { VERSION } from "./version";
 
 const HELP = `codex-chatgpt-web ${VERSION}
@@ -252,10 +252,12 @@ async function tunnelCommand(args: string[]): Promise<void> {
     stopTunnel(config);
   }
   else if (action !== "status") throw new Error(`Unknown tunnel action: ${action}`);
-  const status = action === "start" || action === "restart"
-    ? await waitForTunnelReady(config)
-    : tunnelStatus(config);
   const service = getTunnelServiceStatus();
+  const status = service.supported && (service.installed || service.loaded)
+    ? (action === "start" || action === "restart"
+        ? await waitForTunnelServiceReady(config)
+        : await getTunnelServiceRuntimeStatus(config, service))
+    : tunnelStatus(config);
   stdout.write(`${JSON.stringify({ service, runtime: status }, null, 2)}\n`);
   if (action !== "stop" && (!service.running || !status.ok)) process.exitCode = 1;
 }

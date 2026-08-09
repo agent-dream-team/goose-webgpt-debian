@@ -3,8 +3,8 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig } from "../src/config";
-import { TUNNEL_READY_TIMEOUT_MS, createTunnelConfig, mcpCommand } from "../src/tunnel";
-import { tunnelServiceDefinition } from "../src/tunnel-service";
+import { TUNNEL_READY_TIMEOUT_MS, createTunnelConfig, mcpCommand, parseTunnelStatus } from "../src/tunnel";
+import { getTunnelServiceRuntimeStatus, tunnelHealthUrlFileFromProfile, tunnelServiceDefinition, tunnelServiceRuntimeStatusFromProbes } from "../src/tunnel-service";
 import { existingFullSetupCredentials, tunnelWorkerRuntimeChanged } from "../src/setup";
 
 const roots: string[] = [];
@@ -148,5 +148,88 @@ describe("tunnel launchd ownership", () => {
 
   test("uses a realistic bounded tunnel cold-start budget", () => {
     expect(TUNNEL_READY_TIMEOUT_MS).toBe(120_000);
+  });
+
+  test("uses live service health instead of stale managed-runtime bookkeeping", () => {
+    const stale = parseTunnelStatus(JSON.stringify({
+      process_running: false,
+      healthy: true,
+      ready: true,
+      runtime_state: "stopped",
+    }));
+    const live = tunnelServiceRuntimeStatusFromProbes(
+      { supported: true, installed: true, loaded: true, running: true, label: "test" },
+      { ok: true, status: 200, detail: "live" },
+      { ok: true, status: 200, detail: "ready" },
+    );
+
+    expect(stale).toMatchObject({ ok: false, state: "stopped" });
+    expect(live).toEqual({
+      ok: true,
+      processRunning: true,
+      healthy: true,
+      ready: true,
+      state: "ready",
+      detail: "launchd_running=true healthz=ok readyz=ok",
+    });
+  });
+
+  test("live service health fails closed for readiness and process failures", () => {
+    expect(tunnelServiceRuntimeStatusFromProbes(
+      { supported: true, installed: true, loaded: true, running: true, label: "test" },
+      { ok: true, status: 200 },
+      { ok: false, status: 503, detail: "mcp probe failed" },
+    )).toMatchObject({ ok: false, processRunning: true, healthy: true, ready: false, state: "running" });
+
+    expect(tunnelServiceRuntimeStatusFromProbes(
+      { supported: true, installed: true, loaded: true, running: false, label: "test" },
+      { ok: true, status: 200 },
+      { ok: true, status: 200 },
+    )).toMatchObject({ ok: false, processRunning: false, healthy: false, ready: false, state: "stopped" });
+  });
+
+  test("reads the native tunnel-client health URL from generated profiles", () => {
+    expect(tunnelHealthUrlFileFromProfile(JSON.stringify({ health: { url_file: "/tmp/runtime.url" } }))).toBe("/tmp/runtime.url");
+    expect(tunnelHealthUrlFileFromProfile("health:\n  listen_addr: 127.0.0.1:0\n  url_file: /tmp/runtime.url\n")).toBe("/tmp/runtime.url");
+  });
+
+  test("probes the launchd-owned run process through its native health URL file", async () => {
+    const root = join(tmpdir(), `codex-chatgpt-web-tunnel-health-${process.pid}-${Date.now()}`);
+    roots.push(root);
+    process.env.CODEX_CHATGPT_WEB_HOME = root;
+    const profileDir = join(root, "tunnel", "profiles");
+    const urlFile = join(root, "runtime", "health.url");
+    mkdirSync(profileDir, { recursive: true });
+    mkdirSync(join(root, "runtime"), { recursive: true });
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(request) {
+        const path = new URL(request.url).pathname;
+        return new Response(path === "/healthz" ? "live" : path === "/readyz" ? "ready" : "missing", {
+          status: path === "/healthz" || path === "/readyz" ? 200 : 404,
+        });
+      },
+    });
+    try {
+      writeFileSync(urlFile, `http://127.0.0.1:${server.port}\n`);
+      writeFileSync(join(profileDir, "codex-chatgpt-web.yaml"), JSON.stringify({ health: { url_file: urlFile } }));
+      const config = defaultConfig("full");
+      config.tunnel = createTunnelConfig({
+        binaryPath: join(root, "bin", "tunnel-client"),
+        runtimeKeyFile: join(root, "secrets", "runtime.key"),
+        tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+      });
+      const status = await getTunnelServiceRuntimeStatus(config, {
+        supported: true,
+        installed: true,
+        loaded: true,
+        running: true,
+        label: "test",
+      });
+      expect(status).toMatchObject({ ok: true, processRunning: true, healthy: true, ready: true, state: "ready" });
+    } finally {
+      server.stop(true);
+    }
   });
 });
