@@ -11,10 +11,13 @@ const RETRY_CIRCUIT_CODE = "chatgpt_retry_circuit_open";
 const RETRY_CIRCUIT_MESSAGE = "ChatGPT Web retry circuit is open for this failed standalone Goose turn; no new browser tab was opened. Stop the currently generating Goose turn and start a new user turn before retrying.";
 
 type CircuitState = "active" | "retryable-failed" | "open";
+export type StandaloneRetryKind = "default" | "stock-goose-compaction";
 
 interface RetryCircuitEntry {
   id: string;
   scope: string;
+  kind: StandaloneRetryKind;
+  lineageSize?: number;
   exactKeys: Set<string>;
   attempts: number;
   state: CircuitState;
@@ -128,10 +131,11 @@ export function standaloneRetrySnapshot(parsed: CodexParsedRequest): unknown[] {
 /**
  * Bounded browser-start circuit for standalone Goose.
  *
- * Exact retries share the initial execution key. A changed request joins that same failure lineage
- * only when it structurally extends the last failed input and the appended suffix carries the exact
- * bridge error emitted by that failure. This narrowly contains Goose-style failure-history
- * resubmission without guessing which arbitrary user text is "really" a retry.
+ * Exact retries share the initial execution key. A changed ordinary request joins that same failure
+ * lineage only when it structurally extends the last failed input and the appended suffix carries
+ * the exact bridge error emitted by that failure. Stock Goose compaction is the narrow exception:
+ * its rendered system instructions are rewritten between attempts, so the adapter scopes those
+ * retries by Goose's explicit `agent-session-id` and marks them with `stock-goose-compaction`.
  */
 export class StandaloneRetryCircuit {
   private readonly entries = new Map<string, RetryCircuitEntry>();
@@ -144,13 +148,20 @@ export class StandaloneRetryCircuit {
     private readonly now: () => number = Date.now,
   ) {}
 
-  reserve(scope: string, exactKey: string, snapshot: unknown[]): void {
+  reserve(
+    scope: string,
+    exactKey: string,
+    snapshot: unknown[],
+    kind: StandaloneRetryKind = "default",
+    lineageSize?: number,
+  ): void {
     this.prune();
     const now = this.now();
     let entry = this.entryForExact(exactKey);
     if (!entry) {
-      entry = this.findFailureAncestor(scope, snapshot);
+      entry = this.findFailureAncestor(scope, snapshot, kind, lineageSize);
       if (entry) {
+        if (lineageSize !== undefined) entry.lineageSize = lineageSize;
         entry.exactKeys.add(exactKey);
         this.exactToEntry.set(exactKey, entry.id);
       }
@@ -189,6 +200,8 @@ export class StandaloneRetryCircuit {
     const created: RetryCircuitEntry = {
       id,
       scope,
+      kind,
+      ...(lineageSize !== undefined ? { lineageSize } : {}),
       exactKeys: new Set([exactKey]),
       attempts: 1,
       state: "active",
@@ -208,6 +221,17 @@ export class StandaloneRetryCircuit {
     const message = error instanceof Error ? error.message : String(error);
     rememberFailureMarker(entry, message);
     if (error instanceof ChatGptWebAdapterError) rememberFailureMarker(entry, error.code);
+
+    // Goose's bounded compaction reducer intentionally retries this one provider error with a
+    // smaller rendered history. Restore the browser-attempt slot reserved for that preflight-only
+    // reduction, while retaining any earlier browser-control failure in the same session.
+    if (entry.kind === "stock-goose-compaction"
+      && error instanceof ChatGptWebAdapterError
+      && error.code === "context_length_exceeded") {
+      entry.attempts = Math.max(0, entry.attempts - 1);
+      entry.state = "retryable-failed";
+      return;
+    }
 
     // Terminal entries are monotonic. In particular, cancelOutstanding() opens every retained
     // lineage before aborting its browser session; a failure callback from that already-reserved
@@ -258,10 +282,22 @@ export class StandaloneRetryCircuit {
     return entry;
   }
 
-  private findFailureAncestor(scope: string, snapshot: unknown[]): RetryCircuitEntry | undefined {
+  private findFailureAncestor(
+    scope: string,
+    snapshot: unknown[],
+    kind: StandaloneRetryKind,
+    lineageSize?: number,
+  ): RetryCircuitEntry | undefined {
     let match: RetryCircuitEntry | undefined;
     for (const entry of this.entries.values()) {
-      if (entry.scope !== scope || !descendantCarriesFailure(entry, snapshot)) continue;
+      if (entry.scope !== scope || entry.kind !== kind) continue;
+      if (kind === "stock-goose-compaction") {
+        if (entry.state === "active" || lineageSize === undefined || entry.lineageSize === undefined) continue;
+        if (lineageSize > entry.lineageSize) continue;
+        if (!match || entry.lastTouchedAt > match.lastTouchedAt) match = entry;
+        continue;
+      }
+      if (!descendantCarriesFailure(entry, snapshot)) continue;
       if (!match || entry.lastSnapshot.length > match.lastSnapshot.length) match = entry;
     }
     return match;

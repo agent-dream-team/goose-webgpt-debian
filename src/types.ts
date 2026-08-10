@@ -31,6 +31,12 @@ export interface CodexParsedRequest {
    */
   _compactionRequest?: boolean;
   /**
+   * True only for the current stock Goose `complete_fast()` history-compaction request. Unlike
+   * `_compactionRequest`, this still returns an ordinary Responses assistant-message stream; the
+   * flag exists solely to force the browser turn into tool-free compaction semantics.
+   */
+  _gooseCompactionRequest?: boolean;
+  /**
    * True when the current request newly introduced a stored compaction summary/marker. Historical
    * markers restored by previous_response_id expansion were already acknowledged and do not reset
    * provider-private continuation caches again on every later turn.
@@ -315,7 +321,7 @@ export interface CodexProviderConfig {
     brokerSocketPath?: string;
     /** Persisted, trusted Codex task authority used for follow-up turns that omit the envelope. */
     threadEnvironmentStatePath?: string;
-    /** Optional explicit safety ceiling. Browser turns have no absolute deadline by default. */
+    /** Deprecated compatibility field; accepted but never used as an accepted-turn/model-generation deadline. */
     turnTimeoutMs?: number;
     /** Keep the single controlled browser visible. */
     headed?: boolean;

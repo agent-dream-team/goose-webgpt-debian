@@ -38,6 +38,15 @@ import { resolveChatGptWebContextLimits } from "../../chatgpt-web-models";
 import { LauncherBrowserHelperClient } from "./launcher-helper-client";
 import { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 import { ChatGptWebAdapterError } from "./adapter-error";
+import {
+  CHATGPT_BROWSER_CONTROL_CLEANUP_TIMEOUT_MS,
+  CHATGPT_BROWSER_DIAGNOSTIC_TIMEOUT_MS,
+  CHATGPT_POST_SEND_CONTROL_MAX_CONSECUTIVE_FAILURES,
+  CHATGPT_POST_SEND_CONTROL_PROBE_INTERVAL_MS,
+  CHATGPT_POST_SEND_CONTROL_PROBE_TIMEOUT_MS,
+  startPostSendBrowserControlLiveness,
+  withBrowserControlTimeout,
+} from "./control-liveness";
 
 export { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
 
@@ -444,6 +453,23 @@ export function redactChatGptUiDiagnostic(value: string): string {
 }
 
 const CHATGPT_BROWSER_DIAGNOSTIC_TRACE_LIMIT = 10;
+const CHATGPT_BROWSER_SCREENSHOT_CHECKPOINTS = new Set([
+  "response-stalled-30s",
+  "turn-failed",
+]);
+
+export function shouldCaptureChatGptBrowserDiagnosticScreenshot(checkpoint: string): boolean {
+  return CHATGPT_BROWSER_SCREENSHOT_CHECKPOINTS.has(checkpoint);
+}
+
+export async function captureChatGptBrowserDiagnosticScreenshot(
+  page: Pick<Page, "screenshot">,
+  checkpoint: string,
+): Promise<Buffer | undefined> {
+  if (!shouldCaptureChatGptBrowserDiagnosticScreenshot(checkpoint)) return undefined;
+  return page.screenshot({ animations: "disabled", caret: "hide", timeout: 5_000, type: "png" })
+    .catch(() => undefined);
+}
 
 export function browserDiagnosticCheckpoint(value: string): string {
   const safe = value.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
@@ -491,8 +517,9 @@ class ChatGptBrowserDiagnostics {
       }
       const sequence = String(++this.sequence).padStart(2, "0");
       const stem = `${sequence}-${browserDiagnosticCheckpoint(checkpoint)}`;
-      const [screenshot, state] = await Promise.all([
-        page.screenshot({ animations: "disabled", caret: "hide", timeout: 5_000, type: "png" }),
+      const [screenshot, state] = await withBrowserControlTimeout(
+        () => Promise.all([
+        captureChatGptBrowserDiagnosticScreenshot(page, checkpoint),
         page.evaluate(({ composerSelector, effortControlSelector, effortItemSelector, assistantTurnSelector }) => {
           const visible = (element: Element): boolean => {
             const candidate = element as HTMLElement;
@@ -555,9 +582,12 @@ class ChatGptBrowserDiagnostics {
           effortItemSelector: CHATGPT_EFFORT_ITEM_SELECTOR,
           assistantTurnSelector: CHATGPT_ASSISTANT_TURN_SELECTOR,
         }),
-      ]);
+        ]),
+        CHATGPT_BROWSER_DIAGNOSTIC_TIMEOUT_MS,
+        "ChatGPT browser diagnostic capture timed out",
+      );
       const capturedAt = new Date().toISOString();
-      atomicWriteFile(join(this.directory, `${stem}.png`), screenshot);
+      if (screenshot) atomicWriteFile(join(this.directory, `${stem}.png`), screenshot);
       atomicWriteFile(join(this.directory, `${stem}.json`), `${JSON.stringify({
         version: 1,
         capturedAt,
@@ -822,19 +852,15 @@ export class ChatGptBrowserWorker {
     context: BrowserContext,
     timeoutMs = MANAGED_BROWSER_LIVENESS_PROBE_TIMEOUT_MS,
   ): Promise<boolean> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      await Promise.race([
-        context.cookies(),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("managed browser liveness probe timed out")), timeoutMs);
-        }),
-      ]);
+      await withBrowserControlTimeout(
+        () => context.cookies(),
+        timeoutMs,
+        "managed browser liveness probe timed out",
+      );
       return true;
     } catch {
       return false;
-    } finally {
-      if (timer) clearTimeout(timer);
     }
   }
 
@@ -1237,9 +1263,6 @@ export class ChatGptBrowserWorker {
       await page.keyboard.insertText(text.slice(offset, end));
       if (end < text.length) {
         await this.waitForPromptChunkAttached(page, text.slice(0, end).trimStart());
-        // A plain End key stops at the end of the current visual line in a multiline Lexical
-        // editor. Move to the end of the complete composer before appending the next verified edit.
-        await page.keyboard.press(CHATGPT_COMPOSER_DOCUMENT_END_KEY);
       }
       offset = end;
     }
@@ -1588,9 +1611,6 @@ export class ChatGptBrowserWorker {
         estimatedInputTokens,
         requestedMode.effort,
       );
-      const deadline = this.config.turnTimeoutMs === undefined
-        ? undefined
-        : Date.now() + this.config.turnTimeoutMs;
       const page = await this.runStage(turn.traceId, "browser_page", browserStageTimeouts.browserPage, async (abortSignal) => {
         if (!launcherSurfaceId) {
           const managed = await this.pageForNewTurn();
@@ -1670,7 +1690,6 @@ export class ChatGptBrowserWorker {
           throw new Error("ChatGPT send button is disabled after the complete prompt was attached");
         }
         await settleChatGptUi();
-        await diagnostics.capture(page, "send-ready");
         await throwIfChatGptSessionFailureAlert(page);
         await sendButton.press("Enter");
         const evidence = await this.waitForSubmissionAccepted(
@@ -1684,119 +1703,133 @@ export class ChatGptBrowserWorker {
         );
         console.info(`[chatgpt-web] browser turn ${turn.traceId} submission accepted evidence=${evidence}`);
       });
-      await diagnostics.capture(page, "send-accepted");
+      const controlLiveness = startPostSendBrowserControlLiveness(
+        () => page.evaluate(() => document.readyState),
+        {
+          intervalMs: CHATGPT_POST_SEND_CONTROL_PROBE_INTERVAL_MS,
+          probeTimeoutMs: CHATGPT_POST_SEND_CONTROL_PROBE_TIMEOUT_MS,
+          maxConsecutiveFailures: CHATGPT_POST_SEND_CONTROL_MAX_CONSECUTIVE_FAILURES,
+        },
+      );
+      try {
+        return await Promise.race([
+          (async () => {
+          await diagnostics.capture(page, "send-accepted");
 
-      let lastHeartbeat = 0;
-      let finalText = "";
-      let sawRunning = false;
-      let loggedCompletionWait = false;
-      let capturedResponse = false;
-      const sentAt = Date.now();
-      const visibleTrace = new ChatGptVisibleTraceTracker();
-      const markdownBuffer = new ChatGptMarkdownBuffer();
-      const completionTracker = new ChatGptCompletionTracker();
-      const domHealthTracker = new ChatGptTurnDomHealthTracker();
-      for (;;) {
-        if (page.isClosed()) {
-          throw new Error("ChatGPT browser tab was closed; the Codex turn was terminated");
-        }
-        if (turn.abortSignal?.aborted) {
-          const stop = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).last();
-          if (await stop.isVisible().catch(() => false)) await stop.press("Enter").catch(() => {});
-          throw new DOMException("ChatGPT web turn aborted", "AbortError");
-        }
-        if (deadline !== undefined && Date.now() >= deadline) {
-          throw new Error("ChatGPT web turn timed out");
-        }
-        if (Date.now() - lastHeartbeat >= 10_000) {
-          turn.onHeartbeat?.();
-          lastHeartbeat = Date.now();
-        }
-
-        await throwIfChatGptSessionFailureAlert(page);
-        await throwIfChatGptTerminalErrorAlert(responseTurn);
-
-        if (mode.localTools && await resolveChatGptToolConfirmation(
-          page,
-          this.config.appName,
-          this.config.autoApproveToolCalls,
-          turn.abortSignal,
-          CHATGPT_TOOL_CONFIRMATION_TIMEOUT_MS,
-          () => diagnostics.capture(page, "tool-confirmation-visible"),
-        )) {
-          await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
-          continue;
-        }
-
-        const snapshot = await this.responseDomSnapshot(responseTurn);
-        const stop = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).last();
-        const running = await stop.isVisible().catch(() => false);
-        if (running) sawRunning = true;
-        if (snapshot.responsePresent) {
-          if (!capturedResponse) {
-            capturedResponse = true;
-            await diagnostics.capture(page, "response-visible");
-          }
-          const textDelta = markdownBuffer.observe(snapshot.markdownSegments);
-          for (const trace of visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionVisible)) {
-            if (trace.kind === "commentary") turn.onCommentary?.(trace.text, trace.continuation === true);
-            else turn.onReasoningSummary?.(trace.text, trace.continuation === true);
-          }
-          if (textDelta) turn.onTextDelta(textDelta);
-          const domError = domHealthTracker.update({
-            responsePresent: snapshot.responsePresent,
-            running,
-            currentText: snapshot.visibleText,
-            completionActionVisible: snapshot.completionActionVisible,
-          });
-          if (domError) throw new Error(domError);
-          if (completionTracker.update({
-            responsePresent: snapshot.responsePresent,
-            running,
-            currentText: snapshot.visibleText,
-            currentHtml: snapshot.fullHtml,
-            completionActionVisible: snapshot.completionActionVisible,
-          })) {
-            if (snapshot.visibleText === "api_tool unavailable") {
-              throw new Error(`ChatGPT selected mode rejected the ${JSON.stringify(this.config.appName)} MCP tool (api_tool unavailable)`);
+          let lastHeartbeat = 0;
+          let finalText = "";
+          let sawRunning = false;
+          let loggedCompletionWait = false;
+          let capturedResponse = false;
+          const sentAt = Date.now();
+          const visibleTrace = new ChatGptVisibleTraceTracker();
+          const markdownBuffer = new ChatGptMarkdownBuffer();
+          const completionTracker = new ChatGptCompletionTracker();
+          const domHealthTracker = new ChatGptTurnDomHealthTracker();
+          for (;;) {
+            if (page.isClosed()) {
+              throw new Error("ChatGPT browser tab was closed; the Codex turn was terminated");
             }
-            const final = markdownBuffer.finish();
-            if (!final.markdown && snapshot.visibleText) {
-              throw new Error("ChatGPT completed with visible text that could not be serialized as Markdown");
+            if (turn.abortSignal?.aborted) {
+              const stop = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).last();
+              if (await stop.isVisible().catch(() => false)) await stop.press("Enter").catch(() => {});
+              throw new DOMException("ChatGPT web turn aborted", "AbortError");
             }
-            if (final.delta) turn.onTextDelta(final.delta);
-            finalText = final.markdown;
-            break;
-          }
-          if (!loggedCompletionWait && Date.now() - sentAt >= 30_000) {
-            loggedCompletionWait = true;
-            await diagnostics.capture(page, "response-stalled-30s");
-            const diagnostic = await this.stalledTurnDiagnostic(page, responseTurn).catch(error => JSON.stringify({
-              diagnosticError: error instanceof Error ? error.message : String(error),
-            }));
-            console.warn(
-              `[chatgpt-web] waiting for completed-turn evidence (running=${running}, sawRunning=${sawRunning}, textChars=${snapshot.visibleText.length}, completionActionVisible=${snapshot.completionActionVisible}, ui=${diagnostic})`,
-            );
-          }
-        } else {
-          const domError = domHealthTracker.update({
-            responsePresent: false,
-            running,
-            currentText: "",
-            completionActionVisible: false,
-          });
-          if (domError) throw new Error(domError);
-        }
-        await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
-      }
+            if (Date.now() - lastHeartbeat >= 10_000) {
+              turn.onHeartbeat?.();
+              lastHeartbeat = Date.now();
+            }
 
-      if (this.context && this.config.browserHost === "managed-chrome") {
-        const state = await this.context.storageState();
-        atomicWriteFile(this.config.storageStatePath, `${JSON.stringify(state)}\n`);
+            await throwIfChatGptSessionFailureAlert(page);
+            await throwIfChatGptTerminalErrorAlert(responseTurn);
+
+            if (mode.localTools && await resolveChatGptToolConfirmation(
+              page,
+              this.config.appName,
+              this.config.autoApproveToolCalls,
+              turn.abortSignal,
+              CHATGPT_TOOL_CONFIRMATION_TIMEOUT_MS,
+              () => diagnostics.capture(page, "tool-confirmation-visible"),
+            )) {
+              await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
+              continue;
+            }
+
+            const snapshot = await this.responseDomSnapshot(responseTurn);
+            const stop = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).last();
+            const running = await stop.isVisible().catch(() => false);
+            if (running) sawRunning = true;
+            if (snapshot.responsePresent) {
+              if (!capturedResponse) {
+                capturedResponse = true;
+                await diagnostics.capture(page, "response-visible");
+              }
+              const textDelta = markdownBuffer.observe(snapshot.markdownSegments);
+              for (const trace of visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionVisible)) {
+                if (trace.kind === "commentary") turn.onCommentary?.(trace.text, trace.continuation === true);
+                else turn.onReasoningSummary?.(trace.text, trace.continuation === true);
+              }
+              if (textDelta) turn.onTextDelta(textDelta);
+              const domError = domHealthTracker.update({
+                responsePresent: snapshot.responsePresent,
+                running,
+                currentText: snapshot.visibleText,
+                completionActionVisible: snapshot.completionActionVisible,
+              });
+              if (domError) throw new Error(domError);
+              if (completionTracker.update({
+                responsePresent: snapshot.responsePresent,
+                running,
+                currentText: snapshot.visibleText,
+                currentHtml: snapshot.fullHtml,
+                completionActionVisible: snapshot.completionActionVisible,
+              })) {
+                if (snapshot.visibleText === "api_tool unavailable") {
+                  throw new Error(`ChatGPT selected mode rejected the ${JSON.stringify(this.config.appName)} MCP tool (api_tool unavailable)`);
+                }
+                const final = markdownBuffer.finish();
+                if (!final.markdown && snapshot.visibleText) {
+                  throw new Error("ChatGPT completed with visible text that could not be serialized as Markdown");
+                }
+                if (final.delta) turn.onTextDelta(final.delta);
+                finalText = final.markdown;
+                break;
+              }
+              if (!loggedCompletionWait && Date.now() - sentAt >= 30_000) {
+                loggedCompletionWait = true;
+                await diagnostics.capture(page, "response-stalled-30s");
+                const diagnostic = await this.stalledTurnDiagnostic(page, responseTurn).catch(error => JSON.stringify({
+                  diagnosticError: error instanceof Error ? error.message : String(error),
+                }));
+                console.warn(
+                  `[chatgpt-web] waiting for completed-turn evidence (running=${running}, sawRunning=${sawRunning}, textChars=${snapshot.visibleText.length}, completionActionVisible=${snapshot.completionActionVisible}, ui=${diagnostic})`,
+                );
+              }
+            } else {
+              const domError = domHealthTracker.update({
+                responsePresent: false,
+                running,
+                currentText: "",
+                completionActionVisible: false,
+              });
+              if (domError) throw new Error(domError);
+            }
+            await new Promise(resolveSleep => setTimeout(resolveSleep, 250));
+          }
+
+          if (this.context && this.config.browserHost === "managed-chrome") {
+            const state = await this.context.storageState();
+            atomicWriteFile(this.config.storageStatePath, `${JSON.stringify(state)}\n`);
+          }
+          await diagnostics.capture(page, "turn-completed");
+          console.info(`[chatgpt-web] browser turn ${turn.traceId} completed (markdownChars=${finalText.length})`);
+          return finalText;
+          })(),
+          controlLiveness.failure,
+        ]);
+      } finally {
+        controlLiveness.stop();
       }
-      await diagnostics.capture(page, "turn-completed");
-      console.info(`[chatgpt-web] browser turn ${turn.traceId} completed (markdownChars=${finalText.length})`);
-      return finalText;
     } catch (error) {
       if (diagnosticPage && !diagnosticPage.isClosed()) {
         await diagnostics.capture(diagnosticPage, "turn-failed", error);
@@ -1805,13 +1838,23 @@ export class ChatGptBrowserWorker {
     } finally {
       prepared.release();
       if (turnConnection) {
-        await turnConnection.close().catch(error => {
+        const connectionToClose = turnConnection;
+        await withBrowserControlTimeout(
+          () => connectionToClose.close(),
+          CHATGPT_BROWSER_CONTROL_CLEANUP_TIMEOUT_MS,
+          "launcher browser connection cleanup timed out",
+        ).catch(error => {
           console.error(
             `[chatgpt-web] failed to release launcher browser connection for ${turn.traceId}: ${error instanceof Error ? error.message : String(error)}`,
           );
         });
       } else if (managedPage && !managedPage.isClosed()) {
-        await managedPage.close().catch(error => {
+        const pageToClose = managedPage;
+        await withBrowserControlTimeout(
+          () => pageToClose.close(),
+          CHATGPT_BROWSER_CONTROL_CLEANUP_TIMEOUT_MS,
+          "managed browser tab cleanup timed out",
+        ).catch(error => {
           console.error(
             `[chatgpt-web] failed to close managed browser tab for ${turn.traceId}: ${error instanceof Error ? error.message : String(error)}`,
           );

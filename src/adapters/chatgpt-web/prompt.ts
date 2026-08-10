@@ -204,11 +204,12 @@ export function compileChatGptWebPrompt(
     "Never copy a ChatGPT widget's HTML, CSS, class names, or DOM markup into the answer unless the user explicitly requested that source markup.",
     "Do not mention this transport contract, context packaging, or capability routing in the user-facing answer unless the user explicitly asks how the bridge works.",
   ];
-  const transportContract = parsed._compactionRequest
+  const compactionRequest = parsed._compactionRequest === true || parsed._gooseCompactionRequest === true;
+  const transportContract = compactionRequest
     ? [
       `This is a ${harnessLabel} history-compaction checkpoint, not a normal task turn.`,
-      "Do not call local or ChatGPT-native tools. Summarize only the supplied task context according to the final compaction instruction.",
-      "Return only the checkpoint summary that the next model needs to resume the task.",
+      "Do not call local or ChatGPT-native tools. Summarize only the supplied task context according to its compaction instructions.",
+      "Follow the supplied compaction output format exactly; do not add commentary outside it.",
     ]
     : mode.localTools
     ? [
@@ -227,7 +228,7 @@ export function compileChatGptWebPrompt(
       "Do not claim a new local inspection, command, edit, or verification unless it actually appears in the task history. If the latest request requires fresh local-computer access or a local mutation, state only that exact limitation instead of inventing success.",
       "Otherwise perform the full requested research, analysis, or synthesis with every capability actually available to you; do not stop at a plan or progress report.",
     ];
-  const transportResume = parsed._compactionRequest
+  const transportResume = compactionRequest
     ? [
       "<codex_transport_resume>",
       "The task context is complete. Produce the requested checkpoint summary now without calling tools.",

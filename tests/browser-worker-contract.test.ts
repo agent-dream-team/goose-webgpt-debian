@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import type { Page } from "playwright-core";
-import { CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_PROMPT_INSERT_CHUNK_CHARS, ChatGptBrowserWorker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_TABS, assertChatGptWebInputWithinContextWindow, browserDiagnosticCheckpoint, chatGptPromptChunkEnd, chatGptSubmissionEvidence, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_PROMPT_INSERT_CHUNK_CHARS, ChatGptBrowserWorker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_TABS, assertChatGptWebInputWithinContextWindow, browserDiagnosticCheckpoint, captureChatGptBrowserDiagnosticScreenshot, chatGptPromptChunkEnd, chatGptSubmissionEvidence, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert } from "../src/adapters/chatgpt-web/browser-worker";
 import { CHATGPT_CONNECTOR_NAME, defaultChromeExecutable } from "../src/config";
 
 test("Codex context uses the owned CDP composer transport, never the operating-system clipboard", () => {
@@ -337,7 +337,7 @@ test("isManagedBrowserConnectionLive clears its internal timer once the probe se
   }
 });
 
-test("browser turns have no absolute deadline unless one is explicitly configured", () => {
+test("legacy turnTimeoutMs stays parse-compatible without imposing an accepted-turn deadline", () => {
   const provider = { adapter: "chatgpt-web" as const, baseUrl: "browser://chatgpt" };
   expect(resolveBrowserConfig(provider).turnTimeoutMs).toBeUndefined();
   expect(resolveBrowserConfig({
@@ -348,6 +348,8 @@ test("browser turns have no absolute deadline unless one is explicitly configure
     ...provider,
     chatgptWeb: { turnTimeoutMs: 0 },
   })).toThrow("turnTimeoutMs must be a positive finite number");
+  const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  expect(workerSource).not.toContain("ChatGPT web turn timed out");
 });
 
 test("resolveBrowserConfig defaults to the current connector identity and rejects the retired one", () => {
@@ -450,9 +452,10 @@ test("active composer resolution waits for exactly one visible editor", async ()
   expect(await activeComposer.call({}, page, 500)).toBe(composer);
 });
 
-test("prompt insertion crosses the previous 200k failure boundary only after exact chunk sync and document-end caret moves", async () => {
+test("prompt insertion crosses the previous 200k failure boundary after exact chunk sync without intermediate document-end caret moves", async () => {
   const prompt = "x".repeat(204_438);
   const calls: Array<[string, string?]> = [];
+  const chunkPrefixes: string[] = [];
   const composer = {
     fill: async (value: string) => { calls.push(["fill", value]); },
     focus: async () => { calls.push(["focus"]); },
@@ -475,6 +478,7 @@ test("prompt insertion crosses the previous 200k failure boundary only after exa
     insertPromptText,
     waitForPromptChunkAttached: async (_page: unknown, expected: string) => {
       calls.push(["chunkCommitted", String(expected.length)]);
+      chunkPrefixes.push(expected);
     },
     assertPromptAttached: async (_page: unknown, value: string) => {
       calls.push(["assertPrompt", String(value.length)]);
@@ -487,12 +491,14 @@ test("prompt insertion crosses the previous 200k failure boundary only after exa
     ["focus"],
     ["insertText", "100000"],
     ["chunkCommitted", "100000"],
-    ["press", CHATGPT_COMPOSER_DOCUMENT_END_KEY],
     ["insertText", "100000"],
     ["chunkCommitted", "200000"],
-    ["press", CHATGPT_COMPOSER_DOCUMENT_END_KEY],
     ["insertText", "4438"],
     ["assertPrompt", "204438"],
+  ]);
+  expect(chunkPrefixes).toEqual([
+    prompt.slice(0, CHATGPT_PROMPT_INSERT_CHUNK_CHARS),
+    prompt.slice(0, CHATGPT_PROMPT_INSERT_CHUNK_CHARS * 2),
   ]);
 });
 
@@ -1295,6 +1301,38 @@ test("browser stage diagnostics use safe bounded artifact names", () => {
   expect(browserDiagnosticCheckpoint("x".repeat(200))).toHaveLength(80);
 });
 
+test("browser diagnostics only invoke screenshots for stalled and failed checkpoints", async () => {
+  const screenshots: string[] = [];
+  const page = {
+    screenshot: async () => {
+      screenshots.push("captured");
+      return Buffer.from("png");
+    },
+  } as unknown as Pick<Page, "screenshot">;
+
+  for (const checkpoint of [
+    "browser-page-acquired",
+    "composer-ready",
+    "effort-selection-complete",
+    "prompt-attachment-complete",
+    "send-accepted",
+    "response-visible",
+    "turn-completed",
+  ]) {
+    expect(await captureChatGptBrowserDiagnosticScreenshot(page, checkpoint)).toBeUndefined();
+  }
+  expect(screenshots).toHaveLength(0);
+
+  expect(await captureChatGptBrowserDiagnosticScreenshot(page, "response-stalled-30s")).toEqual(Buffer.from("png"));
+  expect(await captureChatGptBrowserDiagnosticScreenshot(page, "turn-failed")).toEqual(Buffer.from("png"));
+  expect(screenshots).toHaveLength(2);
+
+  const failingPage = {
+    screenshot: async () => { throw new Error("synthetic screenshot failure"); },
+  } as unknown as Pick<Page, "screenshot">;
+  expect(await captureChatGptBrowserDiagnosticScreenshot(failingPage, "turn-failed")).toBeUndefined();
+});
+
 test("browser stage diagnostics preserve every critical local checkpoint", () => {
   const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
   for (const checkpoint of [
@@ -1311,7 +1349,6 @@ test("browser stage diagnostics preserve every critical local checkpoint", () =>
     "connector-selected",
     "prompt-attachment-complete",
     "file-attachment-complete",
-    "send-ready",
     "send-accepted",
     "tool-confirmation-visible",
     "response-visible",
@@ -1325,6 +1362,11 @@ test("browser stage diagnostics preserve every critical local checkpoint", () =>
   expect(workerSource).toContain('page.screenshot({ animations: "disabled", caret: "hide"');
   expect(workerSource).toContain("atomicWriteFile(join(this.directory, `${stem}.png`), screenshot)");
   expect(workerSource).toContain("CHATGPT_BROWSER_DIAGNOSTIC_TRACE_LIMIT = 10");
+  const sendStage = workerSource.slice(
+    workerSource.indexOf('this.runStage(turn.traceId, "send"'),
+    workerSource.indexOf("const controlLiveness = startPostSendBrowserControlLiveness"),
+  );
+  expect(sendStage).not.toContain("diagnostics.capture");
 });
 
 test("visible DOM trace interleaves statuses and explicit intermediate commentary", () => {

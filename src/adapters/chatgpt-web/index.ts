@@ -20,7 +20,15 @@ function brokerSocketPath(provider: CodexProviderConfig): string {
   return resolveBrokerEndpoint(configured || defaultBrokerEndpoint());
 }
 
-function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: Error) => void } {
+function stockGooseCompactionLineageSize(parsed: CodexParsedRequest): number | undefined {
+  if (!parsed._gooseCompactionRequest) return undefined;
+  const body = parsed._rawBody;
+  if (!body || typeof body !== "object" || Array.isArray(body)) return undefined;
+  const instructions = (body as Record<string, unknown>).instructions;
+  return typeof instructions === "string" ? instructions.length : undefined;
+}
+
+function deferred<T>():  { promise: Promise<T>; resolve: (value: T) => void; reject: (error: Error) => void } {
   let resolvePromise!: (value: T) => void;
   let rejectPromise!: (error: Error) => void;
   const promise = new Promise<T>((resolveDeferred, rejectDeferred) => {
@@ -157,7 +165,6 @@ function validateBatchTools(parsed: CodexParsedRequest, requests: BrokerToolRequ
 export function createChatGptWebAdapter(provider: CodexProviderConfig): ProviderAdapter {
   const worker = ChatGptBrowserWorker.forProvider(provider);
   const broker = TurnBroker.forSocket(brokerSocketPath(provider));
-  const timeoutMs = provider.chatgptWeb?.turnTimeoutMs;
   const standaloneGoose = provider.chatgptWeb?.standalone === true;
   const configuredCapabilities: ChatGptWebCapabilities = {
     localToolsEnabled: provider.chatgptWeb?.localToolsEnabled === true,
@@ -216,7 +223,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
       prepare: async () => {
         const turnToken = await broker.register(
           environment,
-          timeoutMs === undefined ? undefined : timeoutMs + 60_000,
+          undefined,
           traceId,
         );
         activeToken = turnToken;
@@ -264,7 +271,8 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
           + "Codex MultiAgent V2 currently encrypts cross-backend task payloads.",
         );
       }
-      const turnCapabilities = parsed._compactionRequest
+      const readOnlyCompaction = parsed._compactionRequest === true || parsed._gooseCompactionRequest === true;
+      const turnCapabilities = readOnlyCompaction
         ? { ...configuredCapabilities, localToolsEnabled: false }
         : configuredCapabilities;
       const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities);
@@ -293,11 +301,17 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
       const executionKey = `${executionNamespace}:${chatGptTurnExecutionKey(parsed)}`;
       await chatGptTurnSessions.waitForRetirement(executionKey);
       const traceId = createHash("sha256").update(executionKey).digest("hex").slice(0, 12);
+      const gooseCompactionSessionId = parsed._gooseCompactionRequest
+        ? incoming.headers.get("agent-session-id")?.trim() || undefined
+        : undefined;
+      const gooseCompactionLineageSize = stockGooseCompactionLineageSize(parsed);
+      const retryKind = gooseCompactionSessionId ? "stock-goose-compaction" as const : "default" as const;
       const retryScope = standaloneGoose
         ? createHash("sha256").update(JSON.stringify({
           executionNamespace,
           modelId: parsed.modelId,
           reasoning: parsed.options.reasoning,
+          ...(gooseCompactionSessionId ? { gooseCompactionSessionId } : {}),
         })).digest("hex")
         : undefined;
       const retrySnapshot = standaloneGoose ? standaloneRetrySnapshot(parsed) : undefined;
@@ -310,7 +324,13 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
               // Reserve only when the exact-key session registry is about to create a real browser
               // runtime. Exact duplicate HTTP requests and tool continuations reuse the existing
               // session and therefore cannot spend retry budget.
-              standaloneRetryCircuit.reserve(retryScope, executionKey, retrySnapshot);
+              standaloneRetryCircuit.reserve(
+                retryScope,
+                executionKey,
+                retrySnapshot,
+                retryKind,
+                gooseCompactionLineageSize,
+              );
             }
             return startRuntime(parsed, environment, traceId, turnCapabilities);
           },
@@ -346,7 +366,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
                 events.push(event);
                 emit(event);
               };
-              if (!parsed._compactionRequest) emitProContextWarning(parsed, turnCapabilities, emitCaptured);
+              if (!readOnlyCompaction) emitProContextWarning(parsed, turnCapabilities, emitCaptured);
               const trace = session.runtime.trace.drain();
               reasoning = trace.map(event => event.text);
               emitTraceEvents(trace, emitCaptured);
@@ -402,7 +422,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
               emitTraceEvents(trace, emitRound);
             };
             const emitNewText = (deltas: string[]) => emitTextDeltas(deltas, emitRound);
-            if (!parsed._compactionRequest) emitProContextWarning(parsed, turnCapabilities, emitRound);
+            if (!readOnlyCompaction) emitProContextWarning(parsed, turnCapabilities, emitRound);
             emitNewTrace(session.runtime.trace.drain());
             emitNewText(session.runtime.text.drain());
             const nextTools = turnToken

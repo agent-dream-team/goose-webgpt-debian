@@ -27,6 +27,7 @@ import {
   decodeCompactionSummary,
   extractCompactUserMessages,
 } from "./responses/compaction";
+import { isStockGooseCompactionRequestBody } from "./responses/goose-compaction";
 import { parseRequest } from "./responses/parser";
 import { expandPreviousResponseInput, flushResponseState, rememberResponseState } from "./responses/state";
 import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "./types";
@@ -416,6 +417,7 @@ export async function responseRequest(
   const requestedPreviousResponseId = raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { previous_response_id?: unknown }).previous_response_id
     : undefined;
+  const stockGooseCompaction = config.standalone === true && isStockGooseCompactionRequestBody(raw);
   const standalonePrepared = prepareStandaloneToolRequest(prepareStandaloneTextRequest(raw, config), config);
   const expanded = expandPreviousResponseInput(standalonePrepared);
   let parsed: CodexParsedRequest;
@@ -426,6 +428,7 @@ export async function responseRequest(
   } catch (error) {
     return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
   }
+  if (stockGooseCompaction) parsed._gooseCompactionRequest = true;
   if (typeof requestedPreviousResponseId === "string" && expanded === raw) {
     return formatErrorResponse(
       409,
@@ -435,13 +438,16 @@ export async function responseRequest(
   }
 
   const compaction = parsed._compactionRequest === true;
-  if (compaction) {
-    // History compaction is a dedicated summarization turn. It must never bind the active Codex
-    // tool bridge or continue an in-flight MCP round; the returned summary becomes the next turn's
-    // replacement history through the Responses compaction contract.
+  const readOnlyCompaction = compaction || parsed._gooseCompactionRequest === true;
+  if (readOnlyCompaction) {
+    // Every compaction turn is read-only. Native Codex compaction still uses its synthetic
+    // compaction-item wire response below; stock Goose compaction keeps the ordinary text stream
+    // its OpenAI-compatible provider expects.
     delete parsed.context.tools;
     delete parsed.options.toolChoice;
     delete parsed.options.parallelToolCalls;
+  }
+  if (compaction) {
     parsed.context.messages.push({ role: "user", content: COMPACT_PROMPT, timestamp: Date.now() });
   }
 
