@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { standaloneRetryCircuit } from "../src/adapters/chatgpt-web/retry-circuit";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, closeTurnBrokers } from "../src/adapters/chatgpt-web/turn-broker";
 import { defaultBrokerEndpoint, defaultConfig } from "../src/config";
@@ -112,10 +113,13 @@ test("HTTP turn tracking releases a stream requested by an already disconnected 
 });
 
 test("authenticated lifecycle control cancels orphaned browser turns", async () => {
-  const config = { ...defaultConfig("browser-only"), port: 0 };
+  const config = { ...defaultConfig("browser-only"), standalone: true, port: 0 };
   const server = startServer(config);
   let cancelled = 0;
   chatGptTurnSessions.clear();
+  standaloneRetryCircuit.clear();
+  const retrySnapshot = [{ type: "message", role: "user", content: "runaway turn" }];
+  standaloneRetryCircuit.reserve("lifecycle-cancel", "cancelled-exact-key", retrySnapshot);
   chatGptTurnSessions.getOrCreate("orphan", () => ({
     mode: "read-only",
     browser: new Promise<string>(() => {}),
@@ -145,8 +149,14 @@ test("authenticated lifecycle control cancels orphaned browser turns", async () 
     });
     expect(cancelled).toBe(1);
     expect(chatGptTurnSessions.activeCount()).toBe(0);
+    expect(() => standaloneRetryCircuit.reserve(
+      "lifecycle-cancel",
+      "cancelled-exact-key",
+      retrySnapshot,
+    )).toThrow("retry circuit is open");
   } finally {
     chatGptTurnSessions.clear();
+    standaloneRetryCircuit.clear();
     await server.stop(true);
   }
 });

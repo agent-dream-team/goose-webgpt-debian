@@ -3,6 +3,7 @@ import { closeChatGptBrowserWorkers } from "./adapters/chatgpt-web/browser-worke
 import { closeTurnBrokers, TurnBroker } from "./adapters/chatgpt-web/turn-broker";
 import { timingSafeEqual } from "node:crypto";
 import { chatGptTurnSessions } from "./adapters/chatgpt-web/turn-execution";
+import { standaloneRetryCircuit } from "./adapters/chatgpt-web/retry-circuit";
 import { stripVolatileTurnContextParts } from "./adapters/chatgpt-web/environment";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
 import type { AppConfig } from "./config";
@@ -656,6 +657,9 @@ export function startServer(
       }
       if (req.method === "POST" && url.pathname === "/admin/cancel-browser-turns") {
         if (!controlAuthorized(req)) return new Response("Unauthorized", { status: 401 });
+        // Open the retry circuit before deleting the sessions: a still-generating standalone Goose
+        // client may immediately resubmit the cancelled logical turn after this response.
+        standaloneRetryCircuit.cancelOutstanding();
         const cancelled = chatGptTurnSessions.clear();
         return Response.json({ status: "ok", cancelled_browser_turns: cancelled, ...activity() });
       }

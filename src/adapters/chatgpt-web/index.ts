@@ -9,6 +9,7 @@ import { ChatGptBrowserWorker } from "./browser-worker";
 import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity, extractStandaloneGooseToolEnvironment } from "./environment";
 import { resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
+import { standaloneRetryCircuit, standaloneRetrySnapshot } from "./retry-circuit";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult } from "./turn-broker";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptTurnExecutionKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
 import { estimateChatGptWebUsage } from "./usage";
@@ -292,10 +293,42 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
       const executionKey = `${executionNamespace}:${chatGptTurnExecutionKey(parsed)}`;
       await chatGptTurnSessions.waitForRetirement(executionKey);
       const traceId = createHash("sha256").update(executionKey).digest("hex").slice(0, 12);
-      const session = chatGptTurnSessions.getOrCreate(
-        executionKey,
-        () => startRuntime(parsed, environment, traceId, turnCapabilities),
-      );
+      const retryScope = standaloneGoose
+        ? createHash("sha256").update(JSON.stringify({
+          executionNamespace,
+          modelId: parsed.modelId,
+          reasoning: parsed.options.reasoning,
+        })).digest("hex")
+        : undefined;
+      const retrySnapshot = standaloneGoose ? standaloneRetrySnapshot(parsed) : undefined;
+      let session: ChatGptTurnSession;
+      try {
+        session = chatGptTurnSessions.getOrCreate(
+          executionKey,
+          () => {
+            if (retryScope && retrySnapshot) {
+              // Reserve only when the exact-key session registry is about to create a real browser
+              // runtime. Exact duplicate HTTP requests and tool continuations reuse the existing
+              // session and therefore cannot spend retry budget.
+              standaloneRetryCircuit.reserve(retryScope, executionKey, retrySnapshot);
+            }
+            return startRuntime(parsed, environment, traceId, turnCapabilities);
+          },
+        );
+      } catch (error) {
+        if (error instanceof ChatGptWebAdapterError) {
+          emit({
+            type: "error",
+            message: error.message,
+            status: error.status,
+            errorType: error.errorType,
+            code: error.code,
+            retryable: error.retryable,
+          });
+          return;
+        }
+        throw error;
+      }
       const heartbeat = setInterval(() => emit({ type: "heartbeat" }), 10_000);
       try {
         emit({ type: "heartbeat" });
@@ -325,6 +358,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
               session.setFinalEvents(events);
             }
             emitBrowserCompletion(settled, estimateChatGptWebUsage(parsed, { answer: settled.answer, reasoning }, turnCapabilities), emit);
+            if (standaloneGoose) standaloneRetryCircuit.noteSuccess(executionKey);
             return;
           }
 
@@ -412,6 +446,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
                   estimateChatGptWebUsage(parsed, { answer: next.outcome.answer, reasoning: roundReasoning }, turnCapabilities),
                   emit,
                 );
+                if (standaloneGoose) standaloneRetryCircuit.noteSuccess(executionKey);
                 return;
               }
               if (!turnToken || session.runtime.mode !== "tools") {
@@ -432,6 +467,9 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
           }
         });
       } catch (error) {
+        if (standaloneGoose && retrySnapshot) {
+          standaloneRetryCircuit.noteFailure(executionKey, retrySnapshot, error);
+        }
         if (error instanceof ChatGptWebAdapterError && error.retryable) {
           // Reconnects must replay an active/successful browser turn, but retryable terminal
           // ChatGPT failures need a genuinely new Temporary Chat. Retaining a failed session here
