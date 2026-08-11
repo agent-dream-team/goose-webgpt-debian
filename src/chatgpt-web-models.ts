@@ -14,6 +14,10 @@ export interface ChatGptWebContextLimits {
   autoCompactTokenLimit: number;
 }
 
+export function resolveChatGptWebContextWindow(effort: ChatGptWebAdapterEffort): number {
+  return resolveChatGptWebContextLimits(effort).contextWindow;
+}
+
 /** Resolve the product limit for the selected visible ChatGPT mode. */
 export function resolveChatGptWebContextLimits(
   effort: ChatGptWebAdapterEffort,

@@ -2,6 +2,25 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const { EventEmitter } = require("node:events");
+const Module = require("node:module");
+
+const originalLoad = Module._load;
+Module._load = function patchedLoad(request, parent, isMain) {
+  if (request === "electron") {
+    class WebContentsView {
+      constructor() {
+        this.webContents = {};
+      }
+    }
+    return {
+      WebContentsView,
+      shell: { openExternal: async () => {} },
+    };
+  }
+  return originalLoad.call(this, request, parent, isMain);
+};
+
 const {
   browserViewVisible,
   constrainBrowserBounds,
@@ -15,6 +34,7 @@ const {
   isChatGptCloudflareChallengeResponse,
   isTemporaryChatUrl,
   initializationNavigationWasSuperseded,
+  validateChatGptStorageState,
 } = require("../electron/browser-host.cjs");
 
 test("only a proven replacement navigation suppresses initial ERR_ABORTED noise", () => {
@@ -147,30 +167,57 @@ test("smoke preserves an already-hydrated Temporary Chat page", () => {
   assert.equal(isTemporaryChatUrl("not a url"), false);
 });
 
-test("session inspection navigates an authenticated ordinary chat surface to Temporary Chat", async () => {
-  let currentUrl = "https://chatgpt.com/";
-  const navigations = [];
+test("session inspection delegates to the shared browser helper without changing Goose capability semantics", async () => {
+  const calls = [];
   const fixture = {
-    view: {
-      webContents: {
-        getURL: () => currentUrl,
-        loadURL: async (url) => {
-          navigations.push(url);
-          currentUrl = url;
+    helper: { executable: "/runtime/electron", script: "/runtime/browser-helper.cjs" },
+    descriptorPath: "/runtime/launcher-browser.json",
+    logger: { info() {} },
+    view: { webContents: { getURL: () => "https://chatgpt.com/" } },
+    runBrowserHelperOperation: async options => {
+      calls.push(options);
+      return {
+        type: "result",
+        value: {
+          authenticated: true,
+          temporary: true,
+          url: "https://chatgpt.com/?temporary-chat=true",
+          proAvailable: true,
         },
-      },
+      };
     },
-    probeAuthentication: async () => ({ authenticated: true }),
   };
 
-  const inspected = await BrowserHost.prototype.runSessionInspection.call(fixture, false);
+  const inspected = await BrowserHost.prototype.runSessionInspection.call(fixture, true);
 
-  assert.deepEqual(navigations, ["https://chatgpt.com/?temporary-chat=true"]);
   assert.deepEqual(inspected, {
     authenticated: true,
     temporary: true,
     url: "https://chatgpt.com/?temporary-chat=true",
+    proAvailable: true,
   });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].operation, "inspect");
+  assert.equal(calls[0].appName, "Goose Native");
+  assert.deepEqual(calls[0].payload, { detectPro: true });
+});
+
+test("session inspection fails closed on incomplete shared-helper Pro evidence", async () => {
+  const fixture = {
+    helper: {},
+    descriptorPath: "/runtime/launcher-browser.json",
+    logger: { info() {} },
+    view: { webContents: { getURL: () => "https://chatgpt.com/?temporary-chat=true" } },
+    runBrowserHelperOperation: async () => ({
+      type: "result",
+      value: { authenticated: true, temporary: true, url: "https://chatgpt.com/?temporary-chat=true" },
+    }),
+  };
+
+  await assert.rejects(
+    BrowserHost.prototype.runSessionInspection.call(fixture, true),
+    /incomplete ChatGPT Pro capability evidence/,
+  );
 });
 
 test("browser surface reactivation preserves its last measured bounds", () => {
@@ -239,25 +286,29 @@ test("authentication windows stay in the owned browser surface", () => {
   assert.equal(allowedAuthUrl("https://chatgpt.com/auth/login"), true);
   assert.equal(allowedAuthUrl("https://example.com/login"), false);
   const source = require("node:fs").readFileSync(require.resolve("../electron/browser-host.cjs"), "utf8");
-  assert.match(source, /createWindow:\s*\(options\)\s*=>\s*this\.createAuthView\(options\)/);
-  assert.doesNotMatch(source, /overrideBrowserWindowOptions/);
+  assert.match(source, /routeAuthenticationToSystemBrowser\(url\)/);
+  assert.match(source, /openLogin\(\{ force = false \} = {}\)/);
+  assert.doesNotMatch(source, /createWindow:\s*\(options\)\s*=>\s*this\.createAuthView\(options\)/);
 });
 
 test("concurrent login requests share one authentication operation", async () => {
   let resolveLogin;
-  let waits = 0;
+  let loginCalls = 0;
   const fixture = {
     state: { authenticated: false },
     loginOperation: null,
     show() {},
+    setState() {},
     snapshot() { return { authenticated: false }; },
     logger: { info() {} },
     view: { webContents: { getURL: () => "https://chatgpt.com/", loadURL: async () => {} } },
-    probeAuthentication: async () => {},
-    waitForAuthenticated: async () => {
-      waits += 1;
-      return await new Promise((resolve) => { resolveLogin = resolve; });
+    loginWithSystemBrowser: async () => {
+      loginCalls += 1;
+      return await new Promise((resolve) => {
+        resolveLogin = resolve;
+      });
     },
+    installSystemBrowserLogin: async () => ({ authenticated: true, storageState: { cookies: [], origins: [] } }),
     activateHomeSurface() {},
     withManualOperation: async (_name, action) => await action(),
   };
@@ -265,9 +316,10 @@ test("concurrent login requests share one authentication operation", async () =>
   const second = BrowserHost.prototype.openLogin.call(fixture);
   assert.equal(first, second);
   await Promise.resolve();
-  assert.equal(waits, 1);
-  resolveLogin({ authenticated: true });
-  assert.deepEqual(await first, { authenticated: true });
+  assert.equal(loginCalls, 1);
+  resolveLogin({ authenticated: true, cleanup: async () => {}, storageState: { cookies: [], origins: [] } });
+  const snapshot = await first;
+  assert.equal(snapshot.authenticated, true);
 });
 
 test("logout clears only the owned ChatGPT session and returns to the sign-in surface", async () => {
@@ -447,319 +499,34 @@ test("embedded ChatGPT is constrained to the owned horizontal viewport", () => {
   assert.match(CHATGPT_VIEWPORT_CSS, /overscroll-behavior-x:\s*none !important/);
 });
 
-test("smoke effort selection uses trusted input and semantic checked state", async () => {
-  const source = require("node:fs").readFileSync(require.resolve("../electron/browser-host.cjs"), "utf8");
-  const cdpSource = require("node:fs").readFileSync(require.resolve("../electron/cdp-input.cjs"), "utf8");
-  assert.match(source, /aria-controls/);
-  assert.match(source, /\[role="menu"\]:has\(\[role="menuitemradio"\]\)/);
-  assert.match(source, /\[role="group"\]:has\(\[role="menuitemradio"\]\)/);
-  assert.match(source, /\[role="menuitemradio"\]/);
-  assert.match(cdpSource, /Input\.dispatchKeyEvent/);
-  assert.match(cdpSource, /Input\.dispatchMouseEvent/);
-  assert.match(cdpSource, /debuggerClient/);
-  assert.doesNotMatch(source, /:popover-open/);
-  assert.doesNotMatch(source, /data-radix-collection-item/);
+test("launcher delegates smoke execution to the shared browser worker", async () => {
+  const source = fs.readFileSync(path.join(__dirname, "../electron/browser-host.cjs"), "utf8");
+  assert.doesNotMatch(source, /Input\.dispatch|send-button|conversation-turn-|menuitemradio/);
+  assert.match(source, /operation:\s*"smoke"/);
+  assert.match(source, /operation:\s*"inspect"/);
 
-  let controlReads = 0;
-  let menuReads = 0;
-  const trustedClicks = [];
-  const trustedKeys = [];
-  const inputEvents = [];
+  const calls = [];
   const fixture = {
-    pressBrowserKey: BrowserHost.prototype.pressBrowserKey,
-    pressTrustedBrowserKey: BrowserHost.prototype.pressTrustedBrowserKey,
-    clickTrustedBrowserPoint: BrowserHost.prototype.clickTrustedBrowserPoint,
-    readEffortControl: BrowserHost.prototype.readEffortControl,
-    readEffortMenu: BrowserHost.prototype.readEffortMenu,
-    waitForEffortControl: BrowserHost.prototype.waitForEffortControl,
-    waitForEffortMenu: BrowserHost.prototype.waitForEffortMenu,
-    openEffortMenu: BrowserHost.prototype.openEffortMenu,
-    chooseEffortMenuItem: BrowserHost.prototype.chooseEffortMenuItem,
-    dispatchTrustedClick: async (input) => trustedClicks.push(input),
-    dispatchTrustedKey: async (input) => trustedKeys.push(input),
-    evaluatePage: async ({ expression }) => {
-      if (expression.includes("effort-control-read")) {
-        controlReads += 1;
-        if (controlReads === 1) {
-          return {
-            found: false,
-            composer: true,
-            readyState: "complete",
-            url: "https://chatgpt.com/?temporary-chat=true",
-          };
-        }
-        return {
-          found: true,
-          label: "Instant",
-          point: { x: 120, y: 80 },
-          composer: true,
-          readyState: "complete",
-          url: "https://chatgpt.com/?temporary-chat=true",
-        };
-      }
-      if (expression.includes("effort-menu-read")) {
-        menuReads += 1;
-        if ([1, 3].includes(menuReads)) {
-          return { open: false, count: 0, target: null };
-        }
-        return {
-          open: true,
-          count: 5,
-          target: {
-            label: "Instant 5.5",
-            checked: menuReads >= 4 ? "true" : "false",
-            point: { x: 160, y: 140 },
-          },
-        };
-      }
-      throw new Error("Unexpected browser script");
-    },
-    evaluateBrowserPage: BrowserHost.prototype.evaluateBrowserPage,
-    view: {
-      webContents: {
-        debugger: {},
-        getURL: () => "https://chatgpt.com/?temporary-chat=true",
-        sendInputEvent: (event) => inputEvents.push(event),
-      },
+    helper: { executable: "/runtime/electron", script: "/runtime/browser-helper.cjs" },
+    descriptorPath: "/runtime/launcher-browser.json",
+    logger: { info: (...args) => calls.push(["log", ...args]) },
+    show: () => calls.push(["show"]),
+    waitForSurfaceReady: async () => calls.push(["ready"]),
+    setState: patch => calls.push(["state", patch]),
+    runBrowserHelperOperation: async options => {
+      calls.push(["helper", options]);
+      return { type: "result", value: { effort: "High", response: "CODEX WEB GPT READY" } };
     },
   };
 
-  const result = await BrowserHost.prototype.selectHighEffort.call(fixture, {
-    readyTimeoutMs: 100,
-    optionTimeoutMs: 100,
-    confirmTimeoutMs: 100,
-    pollMs: 1,
+  assert.deepEqual(await BrowserHost.prototype.runSmokeTest.call(fixture), {
+    ok: true,
+    effort: "High",
+    response: "CODEX WEB GPT READY",
   });
-
-  assert.deepEqual(result, { effort: "High", changed: true });
-  assert.equal(controlReads, 5);
-  assert.equal(menuReads, 4);
-  assert.deepEqual(trustedClicks, [
-    { debuggerClient: {}, point: { x: 120, y: 80 } },
-    { debuggerClient: {}, point: { x: 160, y: 140 } },
-    { debuggerClient: {}, point: { x: 120, y: 80 } },
-  ]);
-  assert.deepEqual(trustedKeys, []);
-  assert.deepEqual(inputEvents, [
-    { type: "keyDown", keyCode: "Escape" },
-    { type: "keyUp", keyCode: "Escape" },
-  ]);
-});
-
-test("effort selection waits for an already-open menu to hydrate instead of closing it", async () => {
-  let activations = 0;
-  let menuReads = 0;
-  const inputEvents = [];
-  const fixture = {
-    pressBrowserKey: BrowserHost.prototype.pressBrowserKey,
-    waitForEffortControl: async () => ({ found: true, expanded: "true" }),
-    readEffortMenu: async () => {
-      menuReads += 1;
-      return menuReads === 1
-        ? { open: false, count: 0, target: null }
-        : {
-            open: true,
-            count: 5,
-            target: { label: "Высокий", checked: "true" },
-          };
-    },
-    waitForEffortMenu: BrowserHost.prototype.waitForEffortMenu,
-    openEffortMenu: async () => {
-      activations += 1;
-      throw new Error("must not toggle an already-open menu");
-    },
-    view: {
-      webContents: {
-        sendInputEvent: event => inputEvents.push(event),
-      },
-    },
-  };
-
-  const result = await BrowserHost.prototype.selectHighEffort.call(fixture, {
-    readyTimeoutMs: 100,
-    optionTimeoutMs: 100,
-    confirmTimeoutMs: 100,
-    pollMs: 1,
-  });
-
-  assert.deepEqual(result, { effort: "High", changed: false });
-  assert.equal(activations, 0);
-  assert.equal(menuReads, 2);
-  assert.deepEqual(inputEvents, [
-    { type: "keyDown", keyCode: "Escape" },
-    { type: "keyUp", keyCode: "Escape" },
-  ]);
-});
-
-test("smoke submission focuses the send button before trusted Enter and waits for an accepted user turn", async () => {
-  const keys = [];
-  let sendReads = 0;
-  let submissionReads = 0;
-  const fixture = {
-    readSmokeSendButton: BrowserHost.prototype.readSmokeSendButton,
-    readSmokeSubmissionState: BrowserHost.prototype.readSmokeSubmissionState,
-    evaluateBrowserPage: BrowserHost.prototype.evaluateBrowserPage,
-    evaluatePage: async ({ expression }) => {
-      if (expression.includes("smoke-send-button-read")) {
-        sendReads += 1;
-        return sendReads < 3
-          ? { ready: false, reason: "disabled" }
-          : { ready: true, point: { x: 300, y: 220 } };
-      }
-      if (expression.includes("smoke-send-button-focus")) return true;
-      assert.match(expression, /smoke-submission-read/);
-      submissionReads += 1;
-      return {
-        accepted: submissionReads >= 2,
-        userTurnCount: submissionReads >= 2 ? 1 : 0,
-        stopVisible: false,
-      };
-    },
-    view: { webContents: { debugger: {} } },
-  };
-
-  await BrowserHost.prototype.waitForSmokeSendButton.call(fixture, 100, 1);
-  assert.equal(await BrowserHost.prototype.focusSmokeSendButton.call(fixture), true);
-  await BrowserHost.prototype.pressTrustedBrowserKey.call({
-    view: fixture.view,
-    dispatchTrustedKey: async input => keys.push(input),
-  }, "Enter");
-  const submitted = await BrowserHost.prototype.waitForSmokeSubmissionAccepted.call(
-    fixture,
-    0,
-    100,
-    1,
-  );
-
-  assert.equal(sendReads, 3);
-  assert.equal(submissionReads, 2);
-  assert.deepEqual(keys, [{
-    debuggerClient: {},
-    key: "Enter",
-  }]);
-  assert.deepEqual(submitted, {
-    accepted: true,
-    userTurnCount: 1,
-    stopVisible: false,
-  });
-});
-
-test("smoke observes current ChatGPT turn metadata without assuming an HTML section", () => {
-  const source = require("node:fs").readFileSync(require.resolve("../electron/browser-host.cjs"), "utf8");
-  assert.match(source, /\[data-testid\^="conversation-turn-"\]\[data-turn="assistant"\]/);
-  assert.match(source, /\[data-testid\^="conversation-turn-"\]\[data-message-author-role="assistant"\]/);
-  assert.match(source, /\[data-testid\^="conversation-turn-"\]\[data-turn="user"\]/);
-  assert.doesNotMatch(source, /section\[data-testid\^="conversation-turn-"/);
-});
-
-test("smoke submission fails quickly when ChatGPT never creates a user turn", async () => {
-  const fixture = {
-    readSmokeSubmissionState: async () => ({
-      accepted: false,
-      userTurnCount: 0,
-      stopVisible: false,
-    }),
-  };
-  await assert.rejects(
-    BrowserHost.prototype.waitForSmokeSubmissionAccepted.call(fixture, 0, 2, 1),
-    /did not accept .*userTurnsBefore=0; userTurnsNow=0/,
-  );
-});
-
-test("launcher clears the ChatGPT composer through trusted editing input", async () => {
-  const inputEvents = [];
-  const waited = [];
-  const fixture = {
-    pressBrowserKey: BrowserHost.prototype.pressBrowserKey,
-    pressBrowserShortcut: BrowserHost.prototype.pressBrowserShortcut,
-    waitForComposerText: async expected => { waited.push(expected); },
-    view: {
-      webContents: {
-        focus() {},
-        sendInputEvent: event => inputEvents.push(event),
-      },
-    },
-  };
-
-  await BrowserHost.prototype.clearFocusedComposer.call(fixture);
-
-  const modifier = process.platform === "darwin" ? "meta" : "control";
-  assert.deepEqual(inputEvents, [
-    { type: "keyDown", keyCode: "A", modifiers: [modifier] },
-    { type: "keyUp", keyCode: "A", modifiers: [modifier] },
-    { type: "keyDown", keyCode: "Backspace" },
-    { type: "keyUp", keyCode: "Backspace" },
-  ]);
-  assert.deepEqual(waited, [""]);
-});
-
-test("smoke effort selection is idempotent without comparing localized labels", async () => {
-  const inputEvents = [];
-  const fixture = {
-    pressBrowserKey: BrowserHost.prototype.pressBrowserKey,
-    readEffortMenu: async () => ({
-      open: true,
-      count: 5,
-      target: { label: "Instant 5.5", checked: "true", point: { x: 140, y: 130 } },
-    }),
-    waitForEffortControl: async () => ({
-      found: true,
-      label: "高",
-      point: { x: 90, y: 70 },
-    }),
-    waitForEffortMenu: async () => ({
-      open: true,
-      count: 5,
-      target: { label: "Instant 5.5", checked: "true", point: { x: 140, y: 130 } },
-    }),
-    view: {
-      webContents: {
-        sendInputEvent: (event) => inputEvents.push(event),
-      },
-    },
-  };
-
-  const result = await BrowserHost.prototype.selectHighEffort.call(fixture);
-
-  assert.deepEqual(result, { effort: "High", changed: false });
-  assert.deepEqual(inputEvents, [
-    { type: "keyDown", keyCode: "Escape" },
-    { type: "keyUp", keyCode: "Escape" },
-  ]);
-});
-
-test("smoke effort selection fails closed with rendering diagnostics", async () => {
-  const fixture = {
-    pressBrowserKey: BrowserHost.prototype.pressBrowserKey,
-    readEffortControl: BrowserHost.prototype.readEffortControl,
-    readEffortMenu: BrowserHost.prototype.readEffortMenu,
-    waitForEffortControl: BrowserHost.prototype.waitForEffortControl,
-    waitForEffortMenu: BrowserHost.prototype.waitForEffortMenu,
-    evaluateBrowserPage: BrowserHost.prototype.evaluateBrowserPage,
-    evaluatePage: async () => ({
-      found: false,
-      composer: true,
-      readyState: "complete",
-      url: "https://chatgpt.com/?temporary-chat=true",
-    }),
-    view: {
-      webContents: {
-        debugger: {},
-        getURL: () => "https://chatgpt.com/?temporary-chat=true",
-        sendInputEvent() {},
-      },
-    },
-  };
-
-  await assert.rejects(
-    BrowserHost.prototype.selectHighEffort.call(fixture, {
-      readyTimeoutMs: 2,
-      optionTimeoutMs: 2,
-      confirmTimeoutMs: 2,
-      pollMs: 1,
-    }),
-    /effort control did not become ready .*composer=ready/,
-  );
+  const helperCall = calls.find(call => call[0] === "helper")[1];
+  assert.equal(helperCall.operation, "smoke");
+  assert.equal(helperCall.appName, "Goose Native");
 });
 
 test("connector verification is effort-independent and works while the browser surface is hidden", async () => {
@@ -771,6 +538,7 @@ test("connector verification is effort-independent and works while the browser s
     setState: (patch) => calls.push(["state", patch]),
     show: () => calls.push(["show"]),
     waitForAuthenticated: async () => calls.push(["authenticated"]),
+    refreshChatGptHomeDocument: async () => calls.push(["refresh"]),
     selectHighEffort: async () => {
       throw new Error("connector verification must not select an effort");
     },
@@ -793,7 +561,6 @@ test("connector verification is effort-independent and works while the browser s
   assert.deepEqual(
     calls.filter(([type]) => ["load", "helper"].includes(type)),
     [
-      ["load", "https://chatgpt.com/?temporary-chat=true"],
       ["helper", {
         helper: fixture.helper,
         descriptorPath: fixture.descriptorPath,
@@ -867,12 +634,87 @@ test("a replacement helper takes over only after the previous owner exited", () 
   assert.equal(warnings[0][1].previousHelperPid, deadPid);
 });
 
+test("a live turn heartbeat refreshes its lease and rejects another helper", () => {
+  const tab = {
+    id: "tab-heartbeat",
+    traceId: "trace_heartbeat",
+    helperPid: 444,
+    status: "running",
+    lastHeartbeatAt: 1,
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[tab.id, tab]]),
+    closedTurnOwners: new Map(),
+    snapshot: () => ({ activeTabId: tab.id }),
+  });
+
+  const before = Date.now();
+  const snapshot = BrowserHost.prototype.heartbeatTurn.call(fixture, tab.traceId, tab.helperPid);
+
+  assert.deepEqual(snapshot, { activeTabId: tab.id });
+  assert.ok(tab.lastHeartbeatAt >= before);
+  assert.throws(
+    () => BrowserHost.prototype.heartbeatTurn.call(fixture, tab.traceId, 445),
+    /ownership mismatch: expected 444, received 445/,
+  );
+});
+
+test("bootstrap and heartbeat expiry reap orphan turn surfaces", () => {
+  for (const [kind, tab, now, evidence] of [
+    ["bootstrap", {
+      id: "tab-bootstrap-orphan",
+      traceId: "trace_bootstrap_orphan",
+      helperPid: 555,
+      status: "running",
+      bootstrapReady: false,
+      bootstrapDeadlineAt: 100,
+      lastHeartbeatAt: 100,
+    }, 101, "browser_surface_bootstrap_timeout"],
+    ["heartbeat", {
+      id: "tab-heartbeat-orphan",
+      traceId: "trace_heartbeat_orphan",
+      helperPid: 556,
+      status: "running",
+      bootstrapReady: true,
+      bootstrapDeadlineAt: 1,
+      lastHeartbeatAt: 100,
+    }, 60_100, "helper_heartbeat_expired"],
+  ]) {
+    const closed = [];
+    const warnings = [];
+    tab.view = { webContents: { isDestroyed: () => false, close: () => closed.push("contents") } };
+    const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+      turnTabs: new Map([[tab.id, tab]]),
+      closedTurnOwners: new Map(),
+      selectedTabId: tab.id,
+      window: { contentView: { removeChildView: () => closed.push("view") } },
+      view: { webContents: { getURL: () => "about:blank#codex-web-gpt-browser-host" } },
+      syncViewVisibility() {},
+      hide() {},
+      snapshot: () => ({ tabs: [] }),
+      publishState() {},
+      writeDescriptor() {},
+      logger: { warn: (event, detail) => warnings.push([event, detail]) },
+    });
+
+    BrowserHost.prototype.reapExpiredTurnTabs.call(fixture, now);
+
+    assert.equal(fixture.turnTabs.size, 0, kind);
+    assert.equal(fixture.closedTurnOwners.get(tab.traceId), tab.helperPid, kind);
+    assert.deepEqual(closed, ["view", "contents"], kind);
+    assert.equal(warnings[0][0], "browser.orphan_turn_reaped", kind);
+    assert.equal(warnings[0][1].evidence, evidence, kind);
+  }
+});
+
 test("connector verification preserves an already hydrated Temporary Chat page", async () => {
+  let refreshed = false;
   let loaded = false;
   const fixture = {
     logger: { info() {} },
     setState() {},
     waitForAuthenticated: async () => {},
+    refreshChatGptHomeDocument: async () => { refreshed = true; },
     helper: { executable: "/runtime/electron", script: "/runtime/browser-helper.cjs" },
     descriptorPath: "/runtime/launcher-browser.json",
     verifyConnectorWithBrowserHelper: async ({ appName }) => ({ ok: true, appName }),
@@ -886,6 +728,7 @@ test("connector verification preserves an already hydrated Temporary Chat page",
 
   await BrowserHost.prototype.runConnectorVerification.call(fixture, "Codex Native");
 
+  assert.equal(refreshed, true);
   assert.equal(loaded, false);
 });
 

@@ -262,6 +262,7 @@ export const LAUNCHER_CAPABILITY_INSPECTION_TIMEOUT_MS = 120_000;
 
 export type LauncherTurnActivity =
   | { phase: "start"; traceId: string; helperPid: number }
+  | { phase: "heartbeat"; traceId: string; helperPid: number }
   | {
       phase: "end";
       traceId: string;
@@ -271,6 +272,8 @@ export type LauncherTurnActivity =
     };
 
 export const LAUNCHER_TURN_START_TIMEOUT_MS = 5_000;
+export const LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS = 10_000;
+export const LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS = 5_000;
 export const LAUNCHER_TURN_END_TIMEOUT_MS = 15_000;
 
 export async function notifyLauncherTurn(
@@ -278,7 +281,9 @@ export async function notifyLauncherTurn(
   activity: LauncherTurnActivity,
   timeoutMs = activity.phase === "end"
     ? LAUNCHER_TURN_END_TIMEOUT_MS
-    : LAUNCHER_TURN_START_TIMEOUT_MS,
+    : activity.phase === "heartbeat"
+      ? LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS
+      : LAUNCHER_TURN_START_TIMEOUT_MS,
 ): Promise<{ surfaceId?: string }> {
   const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
   const controller = new AbortController();

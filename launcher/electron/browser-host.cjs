@@ -3,13 +3,11 @@ const path = require("node:path");
 const { randomBytes } = require("node:crypto");
 const { WebContentsView, shell } = require("electron");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
-const { verifyConnectorWithBrowserHelper } = require("./browser-helper-verifier.cjs");
-const { processRunning } = require("./process-tree.cjs");
 const {
-  dispatchTrustedClick,
-  dispatchTrustedKey,
-  evaluatePage,
-} = require("./cdp-input.cjs");
+  runBrowserHelperOperation,
+  verifyConnectorWithBrowserHelper,
+} = require("./browser-helper-verifier.cjs");
+const { processRunning } = require("./process-tree.cjs");
 const {
   browserViewVisible,
   constrainBrowserBounds,
@@ -20,14 +18,20 @@ const {
 const TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";
 const CHATGPT_ORIGIN = "https://chatgpt.com";
 const IDLE_BROWSER_URL = "about:blank#codex-web-gpt-browser-host";
-const SMOKE_TEXT = "Reply with exactly: CODEX WEB GPT READY";
 const SMOKE_EXPECTED = "CODEX WEB GPT READY";
-const SMOKE_SUBMISSION_TIMEOUT_MS = 15_000;
-const SMOKE_RESPONSE_TIMEOUT_MS = 120_000;
-const SMOKE_COMPLETION_SETTLE_MS = 1_500;
+const GOOSE_CONNECTOR_NAME = "Goose Native";
 const MAX_BROWSER_VIEW_DIMENSION = 16_384;
 const MAX_BROWSER_TABS = 5;
+// Lease/initialization guards only: live turns remain active while their helper heartbeats.
+const TURN_HEARTBEAT_SWEEP_MS = 5_000;
+const TURN_HEARTBEAT_TIMEOUT_MS = 60_000;
+const TURN_TAB_BOOTSTRAP_TIMEOUT_MS = 120_000;
+const BROWSER_NAVIGATION_TIMEOUT_MS = 60_000;
 const CHATGPT_PARTITION = "persist:codex-web-gpt-chatgpt";
+const MAX_LOGIN_COOKIES = 4_096;
+const MAX_LOGIN_ORIGINS = 128;
+const MAX_LOGIN_LOCAL_STORAGE_ENTRIES = 4_096;
+const MAX_LOGIN_STATE_STRING_CHARS = 2 * 1024 * 1024;
 const CHATGPT_BACKEND_REQUEST_FILTER = { urls: [`${CHATGPT_ORIGIN}/backend-api/*`] };
 const CLOUDFLARE_CHALLENGE_RECOVERY_DELAY_MS = 500;
 const CLOUDFLARE_CHALLENGE_RECOVERY_SETTLE_MS = 1_000;
@@ -37,22 +41,6 @@ const COMPOSER_SELECTOR = [
   '[contenteditable="true"][data-lexical-editor="true"]',
   '[contenteditable="true"][role="textbox"]',
   "textarea",
-].join(", ");
-const EFFORT_MENU_SELECTOR = [
-  '[data-testid="composer-intelligence-picker-content"]:has([role="menuitemradio"])',
-  '[role="menu"]:has([role="menuitemradio"])',
-  '[role="group"]:has([role="menuitemradio"])',
-].join(", ");
-const COMPLETION_ACTION_SELECTOR = 'button[data-testid="copy-turn-action-button"]';
-const ASSISTANT_TURN_SELECTOR = [
-  '[data-testid^="conversation-turn-"][data-turn="assistant"]',
-  '[data-testid^="conversation-turn-"][data-message-author-role="assistant"]',
-  '[data-testid^="conversation-turn-"]:has([data-message-author-role="assistant"])',
-].join(", ");
-const USER_TURN_SELECTOR = [
-  '[data-testid^="conversation-turn-"][data-turn="user"]',
-  '[data-testid^="conversation-turn-"][data-message-author-role="user"]',
-  '[data-testid^="conversation-turn-"]:has([data-message-author-role="user"])',
 ].join(", ");
 const CHATGPT_VIEWPORT_CSS = `
   html,
@@ -154,18 +142,129 @@ function isChatGptCloudflareChallengeResponse(details) {
     && responseHeaderIncludes(details.responseHeaders, "cf-mitigated", "challenge");
 }
 
+function isAllowedLoginCookieDomain(domain) {
+  const hostname = domain.replace(/^\./, "").toLowerCase();
+  return hostname === "chatgpt.com"
+    || hostname.endsWith(".chatgpt.com")
+    || hostname === "openai.com"
+    || hostname.endsWith(".openai.com");
+}
+
+function boundedLoginStateString(value, label, { allowEmpty = true } = {}) {
+  if (typeof value !== "string" || (!allowEmpty && !value)) {
+    throw new Error(`System-browser login state has an invalid ${label}`);
+  }
+  if (value.length > MAX_LOGIN_STATE_STRING_CHARS) {
+    throw new Error(`System-browser login state ${label} is too large`);
+  }
+  return value;
+}
+
+function validateChatGptStorageState(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("System-browser login returned an invalid storage-state object");
+  }
+  if (!Array.isArray(value.cookies) || value.cookies.length > MAX_LOGIN_COOKIES) {
+    throw new Error("System-browser login returned an invalid cookie collection");
+  }
+  if (!Array.isArray(value.origins) || value.origins.length > MAX_LOGIN_ORIGINS) {
+    throw new Error("System-browser login returned an invalid origin collection");
+  }
+
+  const sameSiteValues = new Map([
+    ["Strict", "strict"],
+    ["Lax", "lax"],
+    ["None", "no_restriction"],
+  ]);
+  const cookies = [];
+  for (const raw of value.cookies) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new Error("System-browser login returned an invalid cookie");
+    }
+    const domain = boundedLoginStateString(raw.domain, "cookie domain", { allowEmpty: false });
+    if (!isAllowedLoginCookieDomain(domain)) continue;
+    // Electron cannot represent CHIPS. Never flatten a partitioned cookie into an unpartitioned one.
+    if (raw.partitionKey !== undefined) continue;
+    const name = boundedLoginStateString(raw.name, "cookie name", { allowEmpty: false });
+    const cookieValue = boundedLoginStateString(raw.value, "cookie value");
+    const cookiePath = boundedLoginStateString(raw.path, "cookie path", { allowEmpty: false });
+    if (!cookiePath.startsWith("/")) throw new Error("System-browser login state has an invalid cookie path");
+    if (typeof raw.secure !== "boolean" || typeof raw.httpOnly !== "boolean") {
+      throw new Error("System-browser login state has invalid cookie security attributes");
+    }
+    const sameSite = sameSiteValues.get(raw.sameSite);
+    if (!sameSite) throw new Error("System-browser login state has an invalid cookie SameSite value");
+    if (typeof raw.expires !== "number" || !Number.isFinite(raw.expires)) {
+      throw new Error("System-browser login state has an invalid cookie expiry");
+    }
+    const hostname = domain.replace(/^\./, "").toLowerCase();
+    const normalizedDomain = `${domain.startsWith(".") ? "." : ""}${hostname}`;
+    const url = new URL(`https://${hostname}${cookiePath}`).toString();
+    cookies.push({
+      url,
+      name,
+      value: cookieValue,
+      ...(domain.startsWith(".") ? { domain: normalizedDomain } : {}),
+      path: cookiePath,
+      secure: raw.secure,
+      httpOnly: raw.httpOnly,
+      sameSite,
+      ...(raw.expires > 0 ? { expirationDate: raw.expires } : {}),
+    });
+  }
+  if (cookies.length === 0) {
+    throw new Error("System-browser login state contains no ChatGPT/OpenAI cookies");
+  }
+
+  const localStorage = [];
+  for (const raw of value.origins) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw) || typeof raw.origin !== "string") {
+      throw new Error("System-browser login returned an invalid origin state");
+    }
+    if (raw.origin !== CHATGPT_ORIGIN) continue;
+    if (!Array.isArray(raw.localStorage) || raw.localStorage.length > MAX_LOGIN_LOCAL_STORAGE_ENTRIES) {
+      throw new Error("System-browser login returned invalid ChatGPT local storage");
+    }
+    for (const entry of raw.localStorage) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new Error("System-browser login returned an invalid ChatGPT local-storage entry");
+      }
+      localStorage.push({
+        name: boundedLoginStateString(entry.name, "local-storage name"),
+        value: boundedLoginStateString(entry.value, "local-storage value"),
+      });
+    }
+  }
+  if (localStorage.length > MAX_LOGIN_LOCAL_STORAGE_ENTRIES) {
+    throw new Error("System-browser login returned too many ChatGPT local-storage entries");
+  }
+  return { cookies, localStorage };
+}
+
+function javaScriptLiteral(value) {
+  return JSON.stringify(value).replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
+}
+
+function appendFailure(primary, label, secondary) {
+  const first = primary instanceof Error ? primary.message : String(primary);
+  const second = secondary instanceof Error ? secondary.message : String(secondary);
+  return new Error(`${first}; ${label}: ${second}`);
+}
+
 class BrowserHost {
-  constructor({ window, descriptorPath, cdpPort, control, helper, logger, publishState }) {
+  constructor({ window, descriptorPath, cdpPort, control, helper, logger, loginWithSystemBrowser, publishState }) {
+    if (typeof loginWithSystemBrowser !== "function") {
+      throw new Error("Browser host system-browser login operation is unavailable");
+    }
     this.window = window;
     this.descriptorPath = descriptorPath;
     this.cdpPort = cdpPort;
     this.control = control;
     this.helper = helper;
     this.logger = logger;
+    this.loginWithSystemBrowser = loginWithSystemBrowser;
     this.publishState = publishState;
-    this.dispatchTrustedClick = dispatchTrustedClick;
-    this.dispatchTrustedKey = dispatchTrustedKey;
-    this.evaluatePage = evaluatePage;
+    this.runBrowserHelperOperation = runBrowserHelperOperation;
     this.verifyConnectorWithBrowserHelper = verifyConnectorWithBrowserHelper;
     this.surfaceId = randomBytes(24).toString("base64url");
     this.visible = false;
@@ -181,6 +280,8 @@ class BrowserHost {
     this.cloudflareChallengeRecoverySettleMs = CLOUDFLARE_CHALLENGE_RECOVERY_SETTLE_MS;
     this.viewportCssKey = null;
     this.authView = null;
+    this.turnLeaseSweep = setInterval(() => this.reapExpiredTurnTabs(), TURN_HEARTBEAT_SWEEP_MS);
+    this.turnLeaseSweep.unref?.();
     this.boundsReady = false;
     this.bounds = { x: 0, y: 0, width: 1, height: 1 };
     this.state = {
@@ -220,6 +321,10 @@ class BrowserHost {
       this.setState({ status: "error", message: "Embedded browser failed to initialize" });
     });
     this.writeDescriptor();
+  }
+
+  currentOperation() {
+    return this.manualOperation || (this.loginOperation ? "ChatGPT login" : null);
   }
 
   get activeTraceId() {
@@ -276,6 +381,9 @@ class BrowserHost {
       url: IDLE_BROWSER_URL,
       loading: true,
       message: "ChatGPT is working",
+      bootstrapReady: false,
+      bootstrapDeadlineAt: Date.now() + TURN_TAB_BOOTSTRAP_TIMEOUT_MS,
+      lastHeartbeatAt: Date.now(),
     };
     this.turnTabs.set(id, tab);
     this.window.contentView.addChildView(view);
@@ -283,10 +391,13 @@ class BrowserHost {
     view.setVisible(false);
     this.bindTurnContents(tab);
     void view.webContents.loadURL(IDLE_BROWSER_URL).catch((error) => {
-      tab.status = "error";
-      tab.loading = false;
-      tab.message = error instanceof Error ? error.message : String(error);
-      this.publishState?.(this.snapshot());
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error("browser.tab_initialization_failed", {
+        tabId: tab.id,
+        traceId: tab.traceId,
+        message,
+      });
+      this.removeTurnTab(tab, true);
     });
     return tab;
   }
@@ -311,6 +422,7 @@ class BrowserHost {
     contents.on("did-finish-load", () => {
       tab.url = contents.getURL();
       tab.loading = false;
+      if (tab.url.startsWith(CHATGPT_ORIGIN)) tab.bootstrapReady = true;
       void contents.insertCSS(CHATGPT_VIEWPORT_CSS).catch(() => {});
       const encoded = JSON.stringify(tab.surfaceId);
       void contents.executeJavaScript(`(() => {
@@ -337,8 +449,6 @@ class BrowserHost {
     });
     contents.on("did-fail-load", (_event, errorCode, errorDescription, url, mainFrame) => {
       if (!mainFrame || errorCode === -3) return;
-      tab.status = "error";
-      tab.loading = false;
       tab.url = url;
       tab.message = errorDescription;
       this.logger.error("browser.tab_navigation_failed", {
@@ -348,13 +458,17 @@ class BrowserHost {
         errorDescription,
         url,
       });
-      this.publishState?.(this.snapshot());
+      this.removeTurnTab(tab, true);
     });
     contents.on("render-process-gone", (_event, details) => {
-      tab.status = "error";
-      tab.loading = false;
       tab.message = `Browser renderer stopped: ${details.reason}`;
-      this.publishState?.(this.snapshot());
+      this.logger.error("browser.tab_renderer_gone", {
+        tabId: tab.id,
+        traceId: tab.traceId,
+        reason: details.reason,
+        exitCode: details.exitCode,
+      });
+      this.removeTurnTab(tab, true);
     });
   }
 
@@ -362,10 +476,8 @@ class BrowserHost {
     const contents = this.view.webContents;
     contents.setWindowOpenHandler(({ url }) => {
       if (allowedAuthUrl(url)) {
-        return {
-          action: "allow",
-          createWindow: (options) => this.createAuthView(options),
-        };
+        this.routeAuthenticationToSystemBrowser(url);
+        return { action: "deny" };
       }
       let parsed;
       try { parsed = new URL(url); } catch { return { action: "deny" }; }
@@ -376,6 +488,11 @@ class BrowserHost {
       }
       return { action: "deny" };
     });
+    const routeNavigation = (event, url) => {
+      if (this.routeAuthenticationToSystemBrowser(url)) event.preventDefault();
+    };
+    contents.on("will-navigate", routeNavigation);
+    contents.on("will-redirect", routeNavigation);
     contents.on("did-start-navigation", (_event, url, _inPlace, mainFrame) => {
       if (!mainFrame) return;
       this.setState(this.activeTraceId || this.manualOperation
@@ -411,6 +528,84 @@ class BrowserHost {
       this.logger.error("browser.renderer_gone", { reason: details.reason, exitCode: details.exitCode });
       this.setState({ status: "error", message: `Browser renderer stopped: ${details.reason}` });
     });
+  }
+
+  routeAuthenticationToSystemBrowser(url) {
+    if (!allowedAuthUrl(url)) return false;
+    void this.openLogin({ force: true }).catch((error) => {
+      this.logger.error("browser.system_login_failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    });
+    return true;
+  }
+
+  async hardRefreshHome(timeoutMs = BROWSER_NAVIGATION_TIMEOUT_MS) {
+    const contents = this.view?.webContents;
+    if (!contents || contents.isDestroyed()) {
+      throw new Error("The managed ChatGPT page is not available for connector verification");
+    }
+    this.setState({
+      status: "loading",
+      message: "Refreshing the ChatGPT connector catalog",
+      loading: true,
+    });
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      let reloadStarted = false;
+      const cleanup = () => {
+        clearTimeout(timeout);
+        contents.off("did-start-loading", onStarted);
+        contents.off("did-stop-loading", onStopped);
+        contents.off("did-finish-load", onFinished);
+        contents.off("did-fail-load", onFailed);
+        contents.off("render-process-gone", onRendererGone);
+        contents.off("destroyed", onDestroyed);
+      };
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (error) reject(error);
+        else resolve();
+      };
+      const onStarted = () => { reloadStarted = true; };
+      const onStopped = () => { if (reloadStarted) finish(); };
+      const onFinished = () => { if (reloadStarted) finish(); };
+      const onFailed = (_event, errorCode, errorDescription, url, mainFrame) => {
+        if (!mainFrame || errorCode === -3) return;
+        finish(new Error(`ChatGPT hard refresh failed: ${errorDescription} (${url})`));
+      };
+      const onRendererGone = (_event, details) => {
+        finish(new Error(`ChatGPT renderer stopped during hard refresh: ${details.reason}`));
+      };
+      const onDestroyed = () => finish(new Error("ChatGPT closed during hard refresh"));
+      const timeout = setTimeout(() => {
+        finish(new Error("ChatGPT hard refresh did not finish within 60 seconds"));
+        if (!contents.isDestroyed()) contents.stop();
+      }, timeoutMs);
+      timeout.unref?.();
+      contents.on("did-start-loading", onStarted);
+      contents.on("did-stop-loading", onStopped);
+      contents.on("did-finish-load", onFinished);
+      contents.on("did-fail-load", onFailed);
+      contents.on("render-process-gone", onRendererGone);
+      contents.on("destroyed", onDestroyed);
+      try {
+        contents.reloadIgnoringCache();
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  async refreshChatGptHomeDocument() {
+    if (isTemporaryChatUrl(this.view.webContents.getURL())) {
+      await this.hardRefreshHome();
+    } else {
+      await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
+    }
+    await this.waitForAuthenticated(60_000);
   }
 
   bindChatGptBackendRecovery() {
@@ -535,6 +730,40 @@ class BrowserHost {
     this.publishState?.(this.snapshot());
   }
 
+  heartbeatTurn(traceId, helperPid) {
+    const tab = [...this.turnTabs.values()].find(candidate => candidate.traceId === traceId);
+    if (!tab) {
+      const closedOwner = this.closedTurnOwners.get(traceId);
+      if (closedOwner === helperPid) throw new Error(`Browser turn ${traceId} was already released`);
+      throw new Error(`Browser turn ownership mismatch: no browser tab owns ${traceId}`);
+    }
+    if (tab.helperPid !== helperPid) {
+      throw new Error(`Browser helper ownership mismatch: expected ${tab.helperPid}, received ${helperPid}`);
+    }
+    if (tab.status !== "running") throw new Error(`Browser turn ${traceId} is no longer running`);
+    tab.lastHeartbeatAt = Date.now();
+    return this.snapshot();
+  }
+
+  reapExpiredTurnTabs(now = Date.now()) {
+    for (const tab of [...this.turnTabs.values()]) {
+      if (tab.status !== "running") continue;
+      const bootstrapExpired = tab.bootstrapReady !== true
+        && now >= (tab.bootstrapDeadlineAt ?? Number.POSITIVE_INFINITY);
+      const heartbeatExpired = tab.bootstrapReady === true
+        && now - (tab.lastHeartbeatAt ?? 0) >= TURN_HEARTBEAT_TIMEOUT_MS;
+      if (!bootstrapExpired && !heartbeatExpired) continue;
+      const evidence = bootstrapExpired ? "browser_surface_bootstrap_timeout" : "helper_heartbeat_expired";
+      this.logger.warn("browser.orphan_turn_reaped", {
+        tabId: tab.id,
+        traceId: tab.traceId,
+        helperPid: tab.helperPid,
+        evidence,
+      });
+      this.removeTurnTab(tab, true);
+    }
+  }
+
   setBounds(bounds) {
     const [width, height] = this.window.getContentSize();
     this.bounds = constrainBrowserBounds(normalizeBounds(bounds), { width, height });
@@ -583,6 +812,7 @@ class BrowserHost {
   }
 
   removeTurnTab(tab, abortRunning) {
+    if (!this.turnTabs.has(tab.id)) return;
     this.turnTabs.delete(tab.id);
     if (abortRunning && tab.status === "running") {
       this.closedTurnOwners.set(tab.traceId, tab.helperPid);
@@ -592,6 +822,14 @@ class BrowserHost {
     if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
     if (this.selectedTabId === tab.id) {
       this.selectedTabId = [...this.turnTabs.keys()].at(-1) || "home";
+      const homeContents = this.view?.webContents;
+      if (this.selectedTabId === "home"
+        && !this.activeTraceId
+        && homeContents
+        && typeof homeContents.getURL === "function"
+        && homeContents.getURL() === IDLE_BROWSER_URL) {
+        this.hide?.();
+      }
     }
     this.syncViewVisibility();
     this.publishState?.(this.snapshot());
@@ -774,6 +1012,9 @@ class BrowserHost {
       existing.status = "running";
       existing.loading = true;
       existing.message = "ChatGPT is working";
+      existing.bootstrapReady = false;
+      existing.bootstrapDeadlineAt = Date.now() + TURN_TAB_BOOTSTRAP_TIMEOUT_MS;
+      existing.lastHeartbeatAt = Date.now();
       if (!existing.view.webContents.isDestroyed()) {
         existing.view.webContents.setBackgroundThrottling(false);
       }
@@ -837,8 +1078,114 @@ class BrowserHost {
     });
   }
 
-  openLogin() {
-    if (this.state.authenticated) {
+  async clearOwnedChatGptSession() {
+    if (!(this.turnTabs instanceof Map)) throw new Error("Owned ChatGPT browser tab registry is unavailable");
+    const ownedContents = [this.view, ...[...this.turnTabs.values()].map((tab) => tab.view)]
+      .map((view) => view?.webContents)
+      .filter((contents) => contents && !contents.isDestroyed());
+    if (ownedContents.length === 0) throw new Error("Owned ChatGPT browser session is unavailable");
+    const parked = await Promise.allSettled(
+      ownedContents.map((contents) => contents.loadURL(IDLE_BROWSER_URL)),
+    );
+    const parkFailures = parked
+      .filter((result) => result.status === "rejected")
+      .map((result) => result.reason instanceof Error ? result.reason.message : String(result.reason));
+    if (parkFailures.length > 0) {
+      throw new Error(`Could not isolate every owned ChatGPT renderer before clearing login state: ${parkFailures.join("; ")}`);
+    }
+    const browserSession = ownedContents[0].session;
+    await browserSession.clearStorageData();
+    browserSession.flushStorageData();
+    await browserSession.cookies.flushStore();
+  }
+
+  async discardImportedChatGptSession() {
+    let failure = null;
+    try {
+      await this.clearOwnedChatGptSession();
+    } catch (error) {
+      failure = error;
+    }
+    this.setState({ authenticated: false, loading: false, url: IDLE_BROWSER_URL });
+    if (failure) throw failure;
+  }
+
+  async installSystemBrowserLogin(transfer) {
+    if (!transfer || typeof transfer !== "object" || typeof transfer.cleanup !== "function") {
+      throw new Error("System-browser login returned an invalid transfer handle");
+    }
+    let primaryError = null;
+    let sessionMutated = false;
+    let sessionDiscarded = false;
+    let state;
+    try {
+      state = validateChatGptStorageState(transfer.storageState);
+    } catch (error) {
+      primaryError = error;
+    }
+
+    const contents = this.view?.webContents;
+    if (!primaryError) {
+      try {
+        if (!contents || contents.isDestroyed()) throw new Error("Owned ChatGPT browser session is unavailable");
+        sessionMutated = true;
+        await this.clearOwnedChatGptSession();
+        for (const cookie of state.cookies) await contents.session.cookies.set(cookie);
+        contents.session.flushStorageData();
+        await contents.session.cookies.flushStore();
+        await contents.loadURL(TEMPORARY_CHAT_URL);
+        if (state.localStorage.length > 0) {
+          const entries = javaScriptLiteral(state.localStorage);
+          await contents.executeJavaScript(`(() => {
+            if (location.origin !== ${JSON.stringify(CHATGPT_ORIGIN)}) {
+              throw new Error("ChatGPT storage import reached an unexpected origin");
+            }
+            for (const entry of ${entries}) localStorage.setItem(entry.name, entry.value);
+          })()`, true);
+          await contents.loadURL(TEMPORARY_CHAT_URL);
+        }
+        const browser = await this.waitForAuthenticated(60_000);
+        if (browser?.authenticated !== true) {
+          throw new Error("Imported ChatGPT session did not produce an authenticated Electron composer");
+        }
+        await this.persistSession();
+        this.activateHomeSurface();
+        this.show();
+        this.logger.info("browser.system_login_imported");
+      } catch (error) {
+        primaryError = error;
+      }
+    }
+
+    if (primaryError && sessionMutated) {
+      try {
+        sessionDiscarded = true;
+        await this.discardImportedChatGptSession();
+      } catch (error) {
+        primaryError = appendFailure(primaryError, "clearing the partial Electron login failed", error);
+      }
+    }
+    try {
+      await transfer.cleanup();
+    } catch (error) {
+      primaryError = primaryError
+        ? appendFailure(primaryError, "removing temporary system-browser login state failed", error)
+        : new Error(`Removing temporary system-browser login state failed: ${error instanceof Error ? error.message : String(error)}`);
+      if (sessionMutated && !sessionDiscarded) {
+        try {
+          sessionDiscarded = true;
+          await this.discardImportedChatGptSession();
+        } catch (clearError) {
+          primaryError = appendFailure(primaryError, "clearing Electron login after cleanup failure failed", clearError);
+        }
+      }
+    }
+    if (primaryError) throw primaryError;
+    return this.snapshot();
+  }
+
+  openLogin({ force = false } = {}) {
+    if (this.state.authenticated && !force) {
       this.activateHomeSurface();
       this.show();
       return Promise.resolve(this.snapshot());
@@ -850,13 +1197,15 @@ class BrowserHost {
     }
     const operation = this.withManualOperation("ChatGPT login", async () => {
       this.show();
-      this.logger.info("browser.login_opened");
-      const current = this.view.webContents.getURL();
-      if (!current.startsWith(CHATGPT_ORIGIN)) {
-        await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
-      }
-      await this.probeAuthentication();
-      return await this.waitForAuthenticated();
+      this.setState({
+        authenticated: false,
+        status: "loading",
+        message: "Waiting for sign-in in system Chrome/Chromium",
+        loading: true,
+      });
+      this.logger.info("browser.system_login_started");
+      const transfer = await this.loginWithSystemBrowser();
+      return await this.installSystemBrowserLogin(transfer);
     });
     const tracked = operation.finally(() => {
       if (this.loginOperation === tracked) this.loginOperation = null;
@@ -914,9 +1263,19 @@ class BrowserHost {
       return this.snapshot();
     }
     const probe = (contents) => contents.executeJavaScript(`(() => {
-      const composer = ${visibleElementScript(COMPOSER_SELECTOR)};
-      return { composer: Boolean(composer), readyState: document.readyState };
-    })()`, true).catch(() => ({ composer: false, readyState: "unknown" }));
+      const visible = (element) => {
+        const style = getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        return element.isConnected
+          && style.display !== "none"
+          && style.visibility !== "hidden"
+          && style.opacity !== "0"
+          && rect.width > 0
+          && rect.height > 0;
+      };
+      const composerCount = Array.from(document.querySelectorAll(${JSON.stringify(COMPOSER_SELECTOR)})).filter(visible).length;
+      return { composer: composerCount === 1, composerCount, readyState: document.readyState };
+    })()`, true).catch(() => ({ composer: false, composerCount: 0, readyState: "unknown" }));
     let result = await probe(this.view.webContents);
     if (!result.composer && this.authView && !this.authView.webContents.isDestroyed()) {
       const authResult = await probe(this.authView.webContents);
@@ -971,443 +1330,23 @@ class BrowserHost {
     await this.waitForSurfaceReady();
     this.setState({ status: "testing", message: "Running browser smoke test" });
     this.logger.info("smoke.started");
-    if (!isTemporaryChatUrl(this.view.webContents.getURL())) {
-      await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
+    const result = await this.runBrowserHelperOperation({
+      helper: this.helper,
+      descriptorPath: this.descriptorPath,
+      appName: GOOSE_CONNECTOR_NAME,
+      operation: "smoke",
+      logger: this.logger,
+    });
+    const evidence = result?.value;
+    if (!evidence
+      || typeof evidence.effort !== "string"
+      || !evidence.effort
+      || evidence.response !== SMOKE_EXPECTED) {
+      throw new Error("Browser helper returned invalid smoke-test evidence");
     }
-    await this.waitForAuthenticated(60_000);
-
-    const effortResult = await this.selectHighEffort();
-    this.logger.info("smoke.effort_selected", effortResult);
-    const beforeAssistantCount = await this.assistantTurnCount();
-    const beforeUserCount = await this.userTurnCount();
-    if (!await this.focusComposer()) {
-      throw new Error("ChatGPT composer was not available for the smoke test");
-    }
-    await this.clearFocusedComposer();
-    this.view.webContents.focus();
-    this.view.webContents.insertText(SMOKE_TEXT);
-    await this.waitForComposerText(SMOKE_TEXT);
-    await this.waitForSmokeSendButton();
-    if (!await this.focusSmokeSendButton()) {
-      throw new Error("ChatGPT send button could not receive focus for the smoke test");
-    }
-    await this.pressTrustedBrowserKey("Enter");
-    const submitted = await this.waitForSmokeSubmissionAccepted(beforeUserCount);
-    this.logger.info("smoke.submitted", submitted);
-
-    const deadline = Date.now() + SMOKE_RESPONSE_TIMEOUT_MS;
-    let completionCandidate = null;
-    while (Date.now() < deadline) {
-      const outcome = await this.view.webContents.executeJavaScript(`(() => {
-        const turns = Array.from(document.querySelectorAll(${JSON.stringify(ASSISTANT_TURN_SELECTOR)}));
-        const latest = turns.at(-1);
-        const rendered = latest?.querySelector('.markdown');
-        const text = rendered ? (rendered.innerText || rendered.textContent || '').trim() : '';
-        const completionActionVisible = latest
-          ? Array.from(latest.querySelectorAll(${JSON.stringify(COMPLETION_ACTION_SELECTOR)})).some((button) => {
-              const style = getComputedStyle(button);
-              const rect = button.getBoundingClientRect();
-              return style.display !== 'none'
-                && style.visibility !== 'hidden'
-                && rect.width > 0
-                && rect.height > 0;
-            })
-          : false;
-        const stopVisible = Array.from(document.querySelectorAll('[data-testid="stop-button"]')).some((button) => {
-          const style = getComputedStyle(button);
-          const rect = button.getBoundingClientRect();
-          return style.display !== 'none'
-            && style.visibility !== 'hidden'
-            && rect.width > 0
-            && rect.height > 0;
-        });
-        return { count: turns.length, text, stopVisible, completionActionVisible };
-      })()`, true);
-      const complete = outcome.count > beforeAssistantCount
-        && outcome.text === SMOKE_EXPECTED
-        && !outcome.stopVisible
-        && outcome.completionActionVisible;
-      if (!complete) {
-        completionCandidate = null;
-      } else if (completionCandidate?.text !== outcome.text) {
-        completionCandidate = { text: outcome.text, since: Date.now() };
-      } else if (Date.now() - completionCandidate.since >= SMOKE_COMPLETION_SETTLE_MS) {
-        this.logger.info("smoke.completed", { responseChars: outcome.text.length });
-        this.setState({ status: "ready", message: "Smoke test passed", authenticated: true });
-        return { ok: true, effort: effortResult.effort, response: SMOKE_EXPECTED };
-      }
-      await sleep(500);
-    }
-    this.logger.error("smoke.timed_out");
-    this.setState({ status: "error", message: "Smoke test timed out" });
-    throw new Error("ChatGPT smoke test timed out before the expected answer appeared");
-  }
-
-  async pressTrustedBrowserKey(key) {
-    try {
-      await this.dispatchTrustedKey({
-        debuggerClient: this.view.webContents.debugger,
-        key,
-      });
-    } catch (error) {
-      throw new Error(
-        `ChatGPT trusted browser key failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-  }
-
-  async clickTrustedBrowserPoint(point) {
-    try {
-      await this.dispatchTrustedClick({
-        debuggerClient: this.view.webContents.debugger,
-        point,
-      });
-    } catch (error) {
-      throw new Error(
-        `ChatGPT trusted browser click failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-  }
-
-  async evaluateBrowserPage(expression) {
-    const contents = this.view.webContents;
-    try {
-      return await this.evaluatePage({
-        debuggerClient: contents.debugger,
-        expression,
-      });
-    } catch (error) {
-      throw new Error(
-        `ChatGPT page inspection failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-  }
-
-  pressBrowserKey(keyCode) {
-    const contents = this.view.webContents;
-    contents.sendInputEvent({ type: "keyDown", keyCode });
-    contents.sendInputEvent({ type: "keyUp", keyCode });
-  }
-
-  pressBrowserShortcut(keyCode, modifiers) {
-    const contents = this.view.webContents;
-    contents.sendInputEvent({ type: "keyDown", keyCode, modifiers });
-    contents.sendInputEvent({ type: "keyUp", keyCode, modifiers });
-  }
-
-  async focusComposer() {
-    return await this.view.webContents.executeJavaScript(`(() => {
-      const composer = ${visibleElementScript(COMPOSER_SELECTOR)};
-      if (!composer) return false;
-      composer.focus({ preventScroll: true });
-      return document.activeElement === composer || composer.contains(document.activeElement);
-    })()`, true);
-  }
-
-  async readComposerText() {
-    return await this.view.webContents.executeJavaScript(`(() => {
-      const composer = ${visibleElementScript(COMPOSER_SELECTOR)};
-      if (!composer) return null;
-      const text = String('value' in composer ? composer.value : composer.innerText || composer.textContent || '')
-        .replace(/\\r\\n/g, '\\n');
-      return /^\\s*$/.test(text) ? '' : text;
-    })()`, true);
-  }
-
-  async waitForComposerText(expected, timeoutMs = 10_000, pollMs = 50) {
-    const deadline = Date.now() + timeoutMs;
-    let actual = null;
-    do {
-      actual = await this.readComposerText();
-      if (actual === expected) return;
-      await sleep(pollMs);
-    } while (Date.now() < deadline);
-    throw new Error(
-      `ChatGPT composer did not preserve the expected text`
-      + ` (expectedChars=${expected.length}; actualChars=${typeof actual === "string" ? actual.length : "missing"})`,
-    );
-  }
-
-  async clearFocusedComposer() {
-    this.view.webContents.focus();
-    this.pressBrowserShortcut("A", [process.platform === "darwin" ? "meta" : "control"]);
-    this.pressBrowserKey("Backspace");
-    await this.waitForComposerText("");
-  }
-
-  async readSmokeSendButton() {
-    return await this.evaluateBrowserPage(`(() => {
-      /* smoke-send-button-read */
-      const button = ${visibleElementScript('[data-testid="send-button"]')};
-      if (!button) return { ready: false, reason: 'missing' };
-      if (button.disabled || button.getAttribute('aria-disabled') === 'true') {
-        return { ready: false, reason: 'disabled' };
-      }
-      return { ready: true };
-    })()`);
-  }
-
-  async waitForSmokeSendButton(timeoutMs = 10_000, pollMs = 100) {
-    const deadline = Date.now() + timeoutMs;
-    let state;
-    do {
-      state = await this.readSmokeSendButton();
-      if (state.ready) return state;
-      await sleep(pollMs);
-    } while (Date.now() < deadline);
-    throw new Error(
-      `ChatGPT send button did not become available for the smoke test`
-      + ` (state=${state?.reason || "unknown"})`,
-    );
-  }
-
-  async focusSmokeSendButton() {
-    return await this.evaluateBrowserPage(`(() => {
-      /* smoke-send-button-focus */
-      const button = ${visibleElementScript('[data-testid="send-button"]')};
-      if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return false;
-      button.focus({ preventScroll: true });
-      return document.activeElement === button;
-    })()`);
-  }
-
-  async readSmokeSubmissionState(beforeUserCount) {
-    return await this.evaluateBrowserPage(`(() => {
-      /* smoke-submission-read */
-      const beforeUserCount = ${beforeUserCount};
-      const userTurnCount = document.querySelectorAll(${JSON.stringify(USER_TURN_SELECTOR)}).length;
-      const stopVisible = Array.from(document.querySelectorAll('[data-testid="stop-button"]')).some((button) => {
-        const rect = button.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
-      });
-      return {
-        accepted: userTurnCount > beforeUserCount,
-        userTurnCount,
-        stopVisible,
-      };
-    })()`);
-  }
-
-  async waitForSmokeSubmissionAccepted(
-    beforeUserCount,
-    timeoutMs = SMOKE_SUBMISSION_TIMEOUT_MS,
-    pollMs = 100,
-  ) {
-    const deadline = Date.now() + timeoutMs;
-    let state;
-    do {
-      state = await this.readSmokeSubmissionState(beforeUserCount);
-      if (state.accepted) return state;
-      await sleep(pollMs);
-    } while (Date.now() < deadline);
-    throw new Error(
-      `ChatGPT did not accept the smoke-test message after activating the send button`
-      + ` (userTurnsBefore=${beforeUserCount}; userTurnsNow=${state?.userTurnCount ?? "unknown"};`
-      + ` stopVisible=${state?.stopVisible === true})`,
-    );
-  }
-
-  async readEffortControl() {
-    return this.evaluateBrowserPage(`(() => {
-      /* effort-control-read */
-      const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
-      const visible = (element) => {
-        const style = getComputedStyle(element);
-        const rect = element.getBoundingClientRect();
-        return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-      };
-      const composer = ${visibleElementScript(COMPOSER_SELECTOR)};
-      const form = composer?.closest('form');
-      const controls = Array.from(form?.querySelectorAll(
-        'button[aria-haspopup="menu"][data-tone="neutral"]'
-      ) || []).filter(visible);
-      const control = controls.at(-1);
-      if (!control) {
-        return {
-          found: false,
-          composer: Boolean(composer),
-          form: Boolean(form),
-          readyState: document.readyState,
-          url: location.href,
-        };
-      }
-      const rect = control.getBoundingClientRect();
-      return {
-        found: true,
-        label: normalize(control.innerText || control.textContent),
-        expanded: control.getAttribute('aria-expanded'),
-        point: { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 },
-        composer: Boolean(composer),
-        form: true,
-        readyState: document.readyState,
-        url: location.href,
-      };
-    })()`);
-  }
-
-  async waitForEffortControl(timeoutMs, pollMs) {
-    const deadline = Date.now() + timeoutMs;
-    let control;
-    do {
-      control = await this.readEffortControl();
-      if (control.found) return control;
-      await sleep(pollMs);
-    } while (Date.now() < deadline);
-    throw new Error(
-      `ChatGPT effort control did not become ready`
-      + ` (url=${control?.url || this.view.webContents.getURL()};`
-      + ` document=${control?.readyState || "unknown"}; composer=${control?.composer ? "ready" : "missing"};`
-      + ` composerForm=${control?.form ? "ready" : "missing"})`,
-    );
-  }
-
-  async readEffortMenu(targetIndex) {
-    return await this.evaluateBrowserPage(`(() => {
-        /* effort-menu-read */
-        const targetIndex = ${targetIndex};
-        const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
-        const visible = (element) => {
-          const style = getComputedStyle(element);
-          const rect = element.getBoundingClientRect();
-          return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-        };
-        const composer = ${visibleElementScript(COMPOSER_SELECTOR)};
-        const control = Array.from(composer?.closest('form')?.querySelectorAll(
-          'button[aria-haspopup="menu"][data-tone="neutral"]'
-        ) || []).filter(visible).at(-1);
-        const controlledId = control?.getAttribute('aria-controls');
-        const controlled = controlledId ? document.getElementById(controlledId) : null;
-        const roots = [
-          ...(controlled ? [controlled] : []),
-          ...Array.from(document.querySelectorAll(${JSON.stringify(EFFORT_MENU_SELECTOR)})),
-        ];
-        const candidates = [...new Set(roots)].filter(visible).map((menu) => ({
-          menu,
-          items: Array.from(menu.querySelectorAll('[role="menuitemradio"]')).filter(visible),
-        })).filter(candidate => candidate.items.length > 0)
-          .sort((left, right) => right.items.length - left.items.length);
-        const candidate = candidates[0];
-        const target = candidate?.items[targetIndex];
-        if (!candidate || !target) {
-          return { open: Boolean(candidate), count: candidate?.items.length || 0, target: null };
-        }
-        const rect = target.getBoundingClientRect();
-        return {
-          open: true,
-          count: candidate.items.length,
-          target: {
-            label: normalize(target.innerText || target.textContent),
-            checked: target.getAttribute('aria-checked'),
-            point: { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 },
-          },
-        };
-      })()`);
-  }
-
-  async openEffortMenu(targetIndex, timeoutMs, pollMs, knownControl) {
-    let control = knownControl?.found ? knownControl : await this.readEffortControl();
-    if (!control.found) {
-      throw new Error("ChatGPT effort control disappeared before its menu could open");
-    }
-    if (control.expanded !== "true") {
-      // Re-resolve immediately before activation so the click is derived from the current
-      // composer-owned semantic control, never from a stale or hard-coded viewport coordinate.
-      control = await this.readEffortControl();
-      if (!control.found || !control.point) {
-        throw new Error("ChatGPT effort control disappeared before activation");
-      }
-      await this.clickTrustedBrowserPoint(control.point);
-    }
-    return await this.waitForEffortMenu(targetIndex, timeoutMs, pollMs);
-  }
-
-  async chooseEffortMenuItem(targetIndex, knownMenu) {
-    const menu = knownMenu?.target ? knownMenu : await this.readEffortMenu(targetIndex);
-    if (!menu.target?.point) {
-      throw new Error(`ChatGPT effort item index ${targetIndex} disappeared before activation`);
-    }
-    await this.clickTrustedBrowserPoint(menu.target.point);
-  }
-
-  async waitForEffortMenu(targetIndex, timeoutMs, pollMs) {
-    const deadline = Date.now() + timeoutMs;
-    let menu;
-    do {
-      menu = await this.readEffortMenu(targetIndex);
-      if (menu.target) return menu;
-      await sleep(pollMs);
-    } while (Date.now() < deadline);
-    throw new Error(
-      `ChatGPT effort menu did not expose item index ${targetIndex}`
-      + ` (open=${menu?.open === true}; itemCount=${menu?.count || 0})`,
-    );
-  }
-
-  async selectHighEffort({
-    readyTimeoutMs = 70_000,
-    optionTimeoutMs = 70_000,
-    confirmTimeoutMs = 40_000,
-    pollMs = 200,
-  } = {}) {
-    const targetIndex = 2;
-    const control = await this.waitForEffortControl(readyTimeoutMs, pollMs);
-    let menu = await this.readEffortMenu(targetIndex);
-    if (!menu.target) {
-      menu = menu.open || control.expanded === "true"
-        ? await this.waitForEffortMenu(targetIndex, optionTimeoutMs, pollMs)
-        : await this.openEffortMenu(targetIndex, optionTimeoutMs, pollMs, control);
-    }
-    if (menu.target.checked !== "true" && menu.target.checked !== "false") {
-      throw new Error(`ChatGPT effort item index ${targetIndex} has no semantic checked state`);
-    }
-    if (menu.target.checked === "true") {
-      this.pressBrowserKey("Escape");
-      return { effort: "High", changed: false };
-    }
-    await this.chooseEffortMenuItem(targetIndex, menu);
-
-    const deadline = Date.now() + confirmTimeoutMs;
-    let confirmed = menu;
-    do {
-      confirmed = await this.readEffortMenu(targetIndex);
-      if (!confirmed.target) {
-        const current = await this.readEffortControl();
-        if (current.found) {
-          confirmed = await this.openEffortMenu(
-            targetIndex,
-            Math.max(1, Math.min(5_000, deadline - Date.now())),
-            pollMs,
-            current,
-          );
-        }
-      }
-      if (confirmed.target?.checked === "true") {
-        this.pressBrowserKey("Escape");
-        return { effort: "High", changed: true };
-      }
-      if (confirmed.target && confirmed.target.checked !== "false") {
-        throw new Error(`ChatGPT effort item index ${targetIndex} lost its semantic checked state`);
-      }
-      await sleep(pollMs);
-    } while (Date.now() < deadline);
-    throw new Error(
-      `ChatGPT did not confirm effort item index ${targetIndex}`
-      + ` (aria-checked=${JSON.stringify(confirmed?.target?.checked ?? null)})`,
-    );
-  }
-
-  async assistantTurnCount() {
-    return this.view.webContents.executeJavaScript(
-      `document.querySelectorAll(${JSON.stringify(ASSISTANT_TURN_SELECTOR)}).length`,
-      true,
-    );
-  }
-
-  async userTurnCount() {
-    return this.view.webContents.executeJavaScript(
-      `document.querySelectorAll(${JSON.stringify(USER_TURN_SELECTOR)}).length`,
-      true,
-    );
+    this.logger.info("smoke.completed", { effort: evidence.effort, responseChars: evidence.response.length });
+    this.setState({ status: "ready", message: "Smoke test passed", authenticated: true });
+    return { ok: true, ...evidence };
   }
 
   async verifyConnector(appName) {
@@ -1420,10 +1359,7 @@ class BrowserHost {
     }
     const connectorName = appName.trim();
     this.setState({ status: "testing", message: "Checking ChatGPT connector" });
-    if (!isTemporaryChatUrl(this.view.webContents.getURL())) {
-      await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
-    }
-    await this.waitForAuthenticated(60_000);
+    await this.refreshChatGptHomeDocument();
     const result = await this.verifyConnectorWithBrowserHelper({
       helper: this.helper,
       descriptorPath: this.descriptorPath,
@@ -1442,30 +1378,26 @@ class BrowserHost {
   async runSessionInspection(detectPro = false) {
     const initialUrl = this.view.webContents.getURL();
     const startedIdle = initialUrl === IDLE_BROWSER_URL;
-    if (!isTemporaryChatUrl(initialUrl)) await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
-    const state = await this.probeAuthentication();
-    if (!state.authenticated) {
-      throw new Error("The embedded ChatGPT session is not authenticated");
+    const result = await this.runBrowserHelperOperation({
+      helper: this.helper,
+      descriptorPath: this.descriptorPath,
+      appName: GOOSE_CONNECTOR_NAME,
+      operation: "inspect",
+      payload: { detectPro },
+      logger: this.logger,
+    });
+    const inspected = result?.value;
+    if (!inspected
+      || inspected.authenticated !== true
+      || inspected.temporary !== true
+      || typeof inspected.url !== "string") {
+      throw new Error("Browser helper returned invalid ChatGPT session evidence");
     }
-    const url = this.view.webContents.getURL();
-    const parsed = new URL(url);
-    if (parsed.origin !== CHATGPT_ORIGIN || parsed.searchParams.get("temporary-chat") !== "true") {
-      throw new Error(`The embedded browser is not on Temporary Chat (${url})`);
-    }
-    let proAvailable;
-    if (detectPro) {
-      const control = await this.waitForEffortControl(30_000, 200);
-      let menu = await this.readEffortMenu(0);
-      if (!menu.target) {
-        menu = menu.open || control.expanded === "true"
-          ? await this.waitForEffortMenu(0, 70_000, 200)
-          : await this.openEffortMenu(0, 70_000, 200, control);
-      }
-      proAvailable = menu.count >= 5;
-      this.pressBrowserKey("Escape");
+    if (detectPro && typeof inspected.proAvailable !== "boolean") {
+      throw new Error("Browser helper returned incomplete ChatGPT Pro capability evidence");
     }
     if (startedIdle) await this.returnToIdle();
-    return { authenticated: true, temporary: true, url, ...(detectPro ? { proAvailable } : {}) };
+    return inspected;
   }
 
   async withManualOperation(name, action) {
@@ -1507,12 +1439,21 @@ class BrowserHost {
     writePrivateFileAtomic(this.descriptorPath, `${JSON.stringify(descriptor, null, 2)}\n`);
   }
 
+  async persistSession() {
+    const contents = this.view?.webContents;
+    if (!contents || contents.isDestroyed()) return;
+    const browserSession = contents.session;
+    browserSession.flushStorageData();
+    await browserSession.cookies.flushStore();
+  }
+
   destroy() {
     try {
       const current = JSON.parse(fs.readFileSync(this.descriptorPath, "utf8"));
       if (current.pid === process.pid) fs.rmSync(this.descriptorPath, { force: true });
     } catch {}
     this.closeAuthView(this.authView, true);
+    if (this.turnLeaseSweep) clearInterval(this.turnLeaseSweep);
     for (const tab of this.turnTabs.values()) {
       try { this.window.contentView.removeChildView(tab.view); } catch {}
       if (!tab.view.webContents.isDestroyed()) tab.view.webContents.close();
@@ -1531,4 +1472,5 @@ module.exports = {
   isChatGptCloudflareChallengeResponse,
   isTemporaryChatUrl,
   TEMPORARY_CHAT_URL,
+  validateChatGptStorageState,
 };

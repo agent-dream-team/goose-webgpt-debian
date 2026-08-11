@@ -7,8 +7,8 @@ import { CHATGPT_CONNECTOR_NAME, defaultChromeExecutable } from "../src/config";
 test("Codex context uses the owned CDP composer transport, never the operating-system clipboard", () => {
   const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
   expect(workerSource).toContain('composer.fill("")');
-  expect(workerSource).toContain("this.insertPromptText(page, prompt)");
-  expect(workerSource).toContain("this.insertPromptText(page, ` ${prompt}`)");
+  expect(workerSource).toContain("this.insertPromptText(page, prompt, abortSignal)");
+  expect(workerSource).toContain("this.insertPromptText(page, ` ${prompt}`, abortSignal)");
   expect(workerSource).not.toMatch(/\bclipboard\b|pbcopy|pbpaste/i);
 });
 
@@ -423,7 +423,7 @@ test("connector verification and real tool turns share one Playwright selector",
   expect(workerSource).toContain("composer.pressSequentially(this.connectorMentionTrigger(), { delay: 25 })");
   expect(workerSource).not.toMatch(/pressSequentially\("@c"/);
   expect(workerSource).toContain('page.locator(\'.__menu-item[tabindex="0"]\')');
-  expect(workerSource).toContain('appResult.dispatchEvent("click")');
+  expect(workerSource).toContain('appResult.click({ force: true, timeout: 10_000 })');
   expect(workerSource).not.toContain('composer.press("Enter")');
   expect(workerSource).toContain("this.selectedConnectorControl(selectedComposer)");
   expect(workerSource).toContain("'[data-id^=\"plugin:\"][data-keyword]'");
@@ -480,6 +480,7 @@ test("prompt insertion crosses the previous 200k failure boundary after exact ch
       calls.push(["chunkCommitted", String(expected.length)]);
       chunkPrefixes.push(expected);
     },
+    reanchorPromptCaret: async () => { calls.push(["reanchor"]); },
     assertPromptAttached: async (_page: unknown, value: string) => {
       calls.push(["assertPrompt", String(value.length)]);
     },
@@ -491,8 +492,10 @@ test("prompt insertion crosses the previous 200k failure boundary after exact ch
     ["focus"],
     ["insertText", "100000"],
     ["chunkCommitted", "100000"],
+    ["reanchor"],
     ["insertText", "100000"],
     ["chunkCommitted", "200000"],
+    ["reanchor"],
     ["insertText", "4438"],
     ["assertPrompt", "204438"],
   ]);
@@ -553,6 +556,7 @@ test("prompt insertion carries an emoji crossing the 100k chunk boundary through
 
   await insertPromptText.call({
     waitForPromptChunkAttached: async (_page: unknown, expected: string) => { chunkSyncs.push(expected); },
+    reanchorPromptCaret: async () => {},
   }, page, prompt);
 
   expect(inserted.join("")).toBe(prompt);
@@ -566,6 +570,61 @@ test("prompt insertion carries an emoji crossing the 100k chunk boundary through
     expect(lastUnit >= 0xd800 && lastUnit <= 0xdbff).toBeFalse();
   }
   expect(chunkSyncs).toEqual(["x".repeat(CHATGPT_PROMPT_INSERT_CHUNK_CHARS - 1)]);
+});
+
+test("prompt insertion stops after its stage is aborted before another native edit", async () => {
+  const controller = new AbortController();
+  const inserted: string[] = [];
+  const page = {
+    keyboard: {
+      insertText: async (value: string) => {
+        inserted.push(value);
+        controller.abort();
+      },
+    },
+  };
+  const insertPromptText = (ChatGptBrowserWorker.prototype as unknown as {
+    insertPromptText(page: unknown, text: string, abortSignal?: AbortSignal): Promise<void>;
+  }).insertPromptText;
+
+  await expect(insertPromptText.call({
+    waitForPromptChunkAttached: async () => {},
+    reanchorPromptCaret: async () => {},
+  }, page, "x".repeat(CHATGPT_PROMPT_INSERT_CHUNK_CHARS * 2 + 1), controller.signal))
+    .rejects.toThrow("aborted");
+  expect(inserted).toHaveLength(1);
+});
+
+test("caret re-anchor fails closed and uses the live DOM Selection API", async () => {
+  const reanchorPromptCaret = (ChatGptBrowserWorker.prototype as unknown as {
+    reanchorPromptCaret(page: unknown): Promise<void>;
+  }).reanchorPromptCaret;
+  let evaluateOptions: unknown;
+  const composer = {
+    focus: async () => {},
+    evaluate: async (_fn: unknown, _arg: unknown, options: unknown) => {
+      evaluateOptions = options;
+      return false;
+    },
+  };
+
+  await expect(reanchorPromptCaret.call({
+    activeComposer: async () => composer,
+  }, {})).rejects.toThrow("could not re-anchor the prompt caret");
+  expect(evaluateOptions).toEqual({ timeout: 20_000 });
+
+  const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
+  const reanchorSource = workerSource.slice(
+    workerSource.indexOf("private async reanchorPromptCaret"),
+    workerSource.indexOf("private async insertPromptText"),
+  );
+  expect(reanchorSource).toContain("window.getSelection()");
+  expect(reanchorSource).toContain("document.createRange()");
+  expect(reanchorSource).toContain("selection.addRange(range)");
+  expect(reanchorSource).toContain("selection.anchorNode === targetNode");
+  expect(reanchorSource).toContain("selection.anchorOffset === targetOffset");
+  expect(reanchorSource).toContain('[data-id^="plugin:"][data-keyword]');
+  expect(reanchorSource).toContain("[data-inline-selection-pill-cursor-target]");
 });
 
 test("final prompt integrity verification remains fail-closed on same-length corruption", async () => {
@@ -594,10 +653,10 @@ test("connector selection re-resolves the active composer after ChatGPT replaces
   const appResult = {
     waitFor: async () => { calls.push(["waitForResult"]); },
     count: async () => 1,
-    dispatchEvent: async (event: string) => {
-      expect(event).toBe("click");
+    click: async (options: { force: boolean; timeout: number }) => {
+      expect(options).toEqual({ force: true, timeout: 10_000 });
       connectorSelected = true;
-      calls.push(["dispatchResult", event]);
+      calls.push(["clickResult"]);
     },
   };
   const selectedConnector = {
@@ -670,7 +729,7 @@ test("connector selection re-resolves the active composer after ChatGPT replaces
     ["focus"],
     ["pressSequentially", "@c"],
     ["waitForResult"],
-    ["dispatchResult", "click"],
+    ["clickResult"],
     ["waitForSelectedConnector"],
   ]);
 });
@@ -692,9 +751,10 @@ test("connector selection triggers the configured Goose Native mention instead o
   const appResult = {
     waitFor: async () => { calls.push(["waitForResult"]); },
     count: async () => 1,
-    dispatchEvent: async (event: string) => {
+    click: async (options: { force: boolean; timeout: number }) => {
+      expect(options).toEqual({ force: true, timeout: 10_000 });
       connectorSelected = true;
-      calls.push(["dispatchResult", event]);
+      calls.push(["clickResult"]);
     },
   };
   const selectedConnector = {
@@ -799,7 +859,8 @@ test("connector selection retriggers the complete mention after a fresh-page hyd
       if (menuAttempt === 1) throw timeout;
     },
     count: async () => 1,
-    dispatchEvent: async () => {
+    click: async (options: { force: boolean; timeout: number }) => {
+      expect(options).toEqual({ force: true, timeout: 10_000 });
       selected = true;
       calls.push("activate");
     },
@@ -860,7 +921,8 @@ test("tool-capable prompts use the shared Playwright connector selection before 
   const appResult = {
     waitFor: async () => { calls.push(["connectorMenu"]); },
     count: async () => 1,
-    dispatchEvent: async () => {
+    click: async (options: { force: boolean; timeout: number }) => {
+      expect(options).toEqual({ force: true, timeout: 10_000 });
       selected = true;
       calls.push(["selectConnector"]);
     },

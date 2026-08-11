@@ -601,13 +601,14 @@ async function requestQuit() {
   }
   shutdownInProgress = true;
   try {
-    const activeOperation = runtimeHost?.currentOperation();
+    const activeOperation = runtimeHost?.currentOperation() || browserHost?.currentOperation();
     if (activeOperation) {
       throw new Error(`Wait for ${activeOperation} to finish before quitting Codex Web GPT`);
     }
     await runtimeSupervisor?.shutdown();
     stopCatalogVerificationMonitor();
     quitting = true;
+    await browserHost?.persistSession();
     browserHost?.destroy();
     await browserControl?.close();
     exitCommitted = true;
@@ -686,15 +687,6 @@ async function start() {
     getBrowserHost: () => browserHost,
     getPreferences: () => stateStore.read(),
   }).start();
-  browserHost = new BrowserHost({
-    window: mainWindow,
-    descriptorPath: BROWSER_DESCRIPTOR_PATH,
-    cdpPort,
-    control: browserControl.descriptor(),
-    helper: { executable: process.execPath, script: BROWSER_HELPER_PATH },
-    logger,
-    publishState: (state) => send("launcher:browser-state", state),
-  });
   runtimeSupervisor = new RuntimeSupervisor({
     app,
     logger,
@@ -714,6 +706,16 @@ async function start() {
     browserDescriptorPath: BROWSER_DESCRIPTOR_PATH,
     publishOperation,
     supervisor: runtimeSupervisor,
+  });
+  browserHost = new BrowserHost({
+    window: mainWindow,
+    descriptorPath: BROWSER_DESCRIPTOR_PATH,
+    cdpPort,
+    control: browserControl.descriptor(),
+    helper: { executable: process.execPath, script: BROWSER_HELPER_PATH },
+    logger,
+    loginWithSystemBrowser: () => runtimeHost.captureSystemBrowserLogin(),
+    publishState: (state) => send("launcher:browser-state", state),
   });
   const updaterRuntimeRoot = runtimeRootProvider();
   updateController = createUpdateController({

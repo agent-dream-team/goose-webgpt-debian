@@ -15,6 +15,7 @@ import {
   uninstallCodexIntegration,
 } from "../src/codex-integration";
 import { defaultConfig } from "../src/config";
+import { CHATGPT_WEB_MODEL_ROUTES, resolveChatGptWebContextLimits } from "../src/chatgpt-web-models";
 
 const roots: string[] = [];
 
@@ -22,16 +23,20 @@ function fixture(): { root: string; codexHome: string; appHome: string } {
   const root = join(tmpdir(), `codex-chatgpt-web-integration-${process.pid}-${Date.now()}-${Math.random()}`);
   const codexHome = join(root, "codex");
   const appHome = join(root, "app");
+  const gooseHome = join(root, "goose");
   mkdirSync(codexHome, { recursive: true });
+  mkdirSync(gooseHome, { recursive: true });
   roots.push(root);
   process.env.CODEX_HOME = codexHome;
   process.env.CODEX_CHATGPT_WEB_HOME = appHome;
+  process.env.GOOSE_CONFIG_HOME = gooseHome;
   return { root, codexHome, appHome };
 }
 
 afterEach(() => {
   delete process.env.CODEX_HOME;
   delete process.env.CODEX_CHATGPT_WEB_HOME;
+  delete process.env.GOOSE_CONFIG_HOME;
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -52,6 +57,24 @@ describe("reversible native Codex route integration", () => {
       model: "gpt-5.6-sol",
       contextWindow: 371_851,
     });
+  });
+
+  test("reads ChatGPT Web model slugs as exact per-route context overrides", () => {
+    const { codexHome } = fixture();
+    for (const route of CHATGPT_WEB_MODEL_ROUTES) {
+      writeFileSync(join(codexHome, "config.toml"), `model = ${JSON.stringify(route.slug)}\n`);
+      expect(readCodexModelContextOverride()).toEqual({
+        model: route.slug,
+        contextWindow: resolveChatGptWebContextLimits(route.adapterEffort).contextWindow,
+      });
+    }
+  });
+
+  test("ignores unrelated model slugs without a top-level model_context_window override", () => {
+    const { codexHome } = fixture();
+    writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.6-sol"\n');
+
+    expect(readCodexModelContextOverride()).toBeUndefined();
   });
 
   test("keeps the built-in openai provider and manages the bounded V1 Web surface", () => {
@@ -76,6 +99,28 @@ describe("reversible native Codex route integration", () => {
     expect(uninstallCodexIntegration()).toEqual({ changed: true });
     expect(readFileSync(configPath, "utf8")).toBe(original);
     expect(uninstallCodexIntegration()).toEqual({ changed: false });
+  });
+
+  test("writes Goose custom provider metadata with exact per-route context limits", () => {
+    const { codexHome, root } = fixture();
+    const configPath = join(codexHome, "config.toml");
+    const gooseProviderPath = join(root, "goose", "custom_providers", "custom_chatgpt_web__local_1.json");
+    writeFileSync(configPath, 'model = "gpt-5.6-sol"\n');
+
+    installCodexIntegration(defaultConfig("browser-only"));
+    const provider = JSON.parse(readFileSync(gooseProviderPath, "utf8")) as {
+      models: Array<{ name: string; context_limit: number }>;
+    };
+    expect(provider.models.map(model => ({ name: model.name, context_limit: model.context_limit }))).toEqual([
+      { name: "chatgpt-web/light", context_limit: 150_000 },
+      { name: "chatgpt-web/medium", context_limit: 150_000 },
+      { name: "chatgpt-web/high", context_limit: 185_000 },
+      { name: "chatgpt-web/extra-high", context_limit: 256_000 },
+      { name: "chatgpt-web/pro", context_limit: 272_000 },
+    ]);
+
+    uninstallCodexIntegration();
+    expect(() => readFileSync(gooseProviderPath, "utf8")).toThrow();
   });
 
   test("accepts an explicitly persisted built-in openai provider and restores it exactly", () => {

@@ -90,7 +90,9 @@ class BrowserControlServer {
       writeJson(response, 401, { error: "unauthorized" });
       return;
     }
-    const isTurn = request.url === "/v1/turn/start" || request.url === "/v1/turn/end";
+    const isTurn = request.url === "/v1/turn/start"
+      || request.url === "/v1/turn/heartbeat"
+      || request.url === "/v1/turn/end";
     const isSessionInspect = request.url === "/v1/session/inspect";
     if (request.method !== "POST" || (!isTurn && !isSessionInspect)) {
       writeJson(response, 404, { error: "not_found" });
@@ -116,6 +118,11 @@ class BrowserControlServer {
         const lease = host.beginTurn(body.traceId, preferences.showBrowserDuringTurns === true, body.helperPid);
         this.logger.info("browser.turn_started", { traceId: body.traceId });
         writeJson(response, 200, { ok: true, ...lease });
+        return;
+      } else if (request.url === "/v1/turn/heartbeat") {
+        host.heartbeatTurn(body.traceId, body.helperPid);
+        this.logger.debug?.("browser.turn_heartbeat", { traceId: body.traceId });
+        writeJson(response, 200, { ok: true });
         return;
       } else {
         if (!['completed', 'failed', 'aborted'].includes(body.status)) throw new Error("turn status is invalid");

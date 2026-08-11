@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   LAUNCHER_TURN_END_TIMEOUT_MS,
+  LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS,
+  LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS,
   LAUNCHER_TURN_START_TIMEOUT_MS,
   LAUNCHER_CAPABILITY_INSPECTION_TIMEOUT_MS,
   LAUNCHER_BROWSER_HOST_KIND,
@@ -62,6 +64,8 @@ test("launcher descriptor is owner-only, loopback-only, and process-bound", () =
 
 test("launcher turn control sends authenticated lifecycle events", async () => {
   expect(LAUNCHER_TURN_START_TIMEOUT_MS).toBe(5_000);
+  expect(LAUNCHER_TURN_HEARTBEAT_INTERVAL_MS).toBe(10_000);
+  expect(LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS).toBe(5_000);
   expect(LAUNCHER_TURN_END_TIMEOUT_MS).toBe(15_000);
   let received: { authorization?: string; body?: unknown } = {};
   const server = createServer(async (request, response) => {
@@ -91,6 +95,12 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
     })).resolves.toEqual({ surfaceId: "launcher_surface_id_0123456789AB" });
     expect(received.authorization).toBe("Bearer launcher-control-token-0123456789abcdefghijklmnop");
     expect(received.body).toEqual({ phase: "start", traceId: "abc123def456", helperPid: process.pid });
+    await notifyLauncherTurn(path, {
+      phase: "heartbeat",
+      traceId: "abc123def456",
+      helperPid: process.pid,
+    });
+    expect(received.body).toEqual({ phase: "heartbeat", traceId: "abc123def456", helperPid: process.pid });
     await notifyLauncherTurn(path, {
       phase: "end",
       traceId: "abc123def456",

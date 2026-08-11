@@ -4,6 +4,12 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { AppConfig } from "./config";
 import { atomicWriteFile, expandUserPath, getConfigDir } from "./config";
+import {
+  CHATGPT_WEB_MODEL_ROUTES,
+  requireChatGptWebModelRoute,
+  resolveChatGptWebContextWindow,
+  type ChatGptWebModelRoute,
+} from "./chatgpt-web-models";
 
 const MANAGED_COMMENT = "# Managed by codex-chatgpt-web; `codex-chatgpt-web uninstall` restores prior values.";
 const MANAGED_REMOTE_COMPACTION_LINE =
@@ -14,6 +20,7 @@ const MANAGED_MULTI_AGENT_V2_LINE =
   "multi_agent_v2 = false # Managed by codex-chatgpt-web: keeps routed Web subagent payloads readable.";
 const MANAGED_MULTI_AGENT_V2_TABLE_LINE =
   "enabled = false # Managed by codex-chatgpt-web: keeps routed Web subagent payloads readable.";
+const GOOSE_CUSTOM_PROVIDER_NAME = "custom_chatgpt_web__local_1";
 
 interface PreviousAssignment {
   present: boolean;
@@ -43,6 +50,7 @@ export interface CodexIntegrationJournal {
   previousRemoteCompactionV2: PreviousFeatureAssignment;
   previousMultiAgent: PreviousFeatureAssignment;
   previousMultiAgentV2: PreviousFeatureAssignment;
+  gooseCustomProvider?: GooseProviderSnapshot;
   format?: {
     lineEnding: "\n" | "\r\n";
     trailingNewline: boolean;
@@ -61,6 +69,7 @@ interface LegacyCodexIntegrationJournalV5 {
   previous: Record<ManagedAssignmentKey, PreviousAssignment>;
   previousRemoteCompactionV2: PreviousFeatureAssignment;
   previousMultiAgent: PreviousFeatureAssignment;
+  gooseCustomProvider?: GooseProviderSnapshot;
   format?: {
     lineEnding: "\n" | "\r\n";
     trailingNewline: boolean;
@@ -75,6 +84,7 @@ interface LegacyCodexIntegrationJournalV4 {
     openai_base_url: string;
   };
   previous: Record<ManagedAssignmentKey, PreviousAssignment>;
+  gooseCustomProvider?: GooseProviderSnapshot;
   format?: {
     lineEnding: "\n" | "\r\n";
     trailingNewline: boolean;
@@ -88,6 +98,7 @@ interface LegacyCodexIntegrationJournalV3 {
     openai_base_url: string;
   };
   previous: Record<ManagedAssignmentKey, PreviousAssignment>;
+  gooseCustomProvider?: GooseProviderSnapshot;
   format?: {
     lineEnding: "\n" | "\r\n";
     trailingNewline: boolean;
@@ -108,6 +119,7 @@ interface LegacyCodexIntegrationJournal {
     model_provider: PreviousAssignment;
     model_catalog_json: PreviousAssignment;
   };
+  gooseCustomProvider?: GooseProviderSnapshot;
 }
 
 type ManagedRouteJournal =
@@ -121,6 +133,44 @@ interface FileSnapshot {
   path: string;
   exists: boolean;
   data?: Buffer;
+}
+
+interface GooseProviderSnapshot {
+  present: boolean;
+  rawText?: string;
+}
+
+interface GooseCustomProviderModel {
+  name: string;
+  context_limit: number;
+  input_token_cost: null;
+  output_token_cost: null;
+  currency: null;
+  supports_cache_control: null;
+  reasoning: boolean;
+}
+
+interface GooseCustomProviderConfig {
+  name: string;
+  engine: "openai";
+  display_name: string;
+  description: string;
+  api_key_env: string;
+  base_url: string;
+  models: GooseCustomProviderModel[];
+  headers: null;
+  timeout_seconds: null;
+  supports_streaming: true;
+  requires_auth: false;
+  catalog_provider_id: null;
+  base_path: string;
+  env_vars: null;
+  dynamic_models: null;
+  skip_canonical_filtering: false;
+  model_doc_link: null;
+  setup_steps: [];
+  fast_model: null;
+  preserves_thinking: false;
 }
 
 export interface InstallCodexIntegrationOptions {
@@ -158,6 +208,15 @@ export function getCodexJournalPath(): string {
   return join(getConfigDir(), "codex", "integration-journal.json");
 }
 
+function getGooseConfigDir(): string {
+  const configured = process.env.GOOSE_CONFIG_HOME?.trim();
+  return resolve(expandUserPath(configured || join(homedir(), ".config/goose")));
+}
+
+function getGooseCustomProviderPath(): string {
+  return join(getGooseConfigDir(), "custom_providers", `${GOOSE_CUSTOM_PROVIDER_NAME}.json`);
+}
+
 function routeUrl(config: AppConfig): string {
   return `http://${config.host}:${config.port}/v1`;
 }
@@ -179,6 +238,73 @@ function restoreFileSnapshot(snapshot: FileSnapshot): void {
   } else {
     rmSync(snapshot.path, { force: true });
   }
+}
+
+function snapshotGooseCustomProviderConfig(): GooseProviderSnapshot {
+  const path = getGooseCustomProviderPath();
+  return existsSync(path)
+    ? { present: true, rawText: readFileSync(path, "utf8") }
+    : { present: false };
+}
+
+function gooseCustomProviderModels(): GooseCustomProviderModel[] {
+  return CHATGPT_WEB_MODEL_ROUTES.map(route => ({
+    name: route.slug,
+    context_limit: resolveChatGptWebContextWindow(route.adapterEffort),
+    input_token_cost: null,
+    output_token_cost: null,
+    currency: null,
+    supports_cache_control: null,
+    reasoning: false,
+  }));
+}
+
+function gooseCustomProviderConfig(): GooseCustomProviderConfig {
+  return {
+    name: GOOSE_CUSTOM_PROVIDER_NAME,
+    engine: "openai",
+    display_name: "ChatGPT Web (local)",
+    description: "Custom ChatGPT Web (local) provider",
+    api_key_env: "",
+    base_url: "http://127.0.0.1:17841",
+    models: gooseCustomProviderModels(),
+    headers: null,
+    timeout_seconds: null,
+    supports_streaming: true,
+    requires_auth: false,
+    catalog_provider_id: null,
+    base_path: "v1/responses",
+    env_vars: null,
+    dynamic_models: null,
+    skip_canonical_filtering: false,
+    model_doc_link: null,
+    setup_steps: [],
+    fast_model: null,
+    preserves_thinking: false,
+  };
+}
+
+function writeGooseCustomProviderConfig(): void {
+  const path = getGooseCustomProviderPath();
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  atomicWriteFile(path, `${JSON.stringify(gooseCustomProviderConfig(), null, 2)}\n`);
+}
+
+function restoreGooseCustomProviderConfig(snapshot: GooseProviderSnapshot): void {
+  const path = getGooseCustomProviderPath();
+  if (snapshot.present) {
+    if (snapshot.rawText === undefined) throw new Error("Goose provider snapshot is missing data");
+    atomicWriteFile(path, snapshot.rawText);
+    return;
+  }
+  rmSync(path, { force: true });
+}
+
+function journalGooseCustomProviderSnapshot(
+  journal: { gooseCustomProvider?: GooseProviderSnapshot },
+  fallback: GooseProviderSnapshot,
+): GooseProviderSnapshot {
+  return journal.gooseCustomProvider ?? fallback;
 }
 
 function writeFilesWithCompensation(
@@ -293,9 +419,13 @@ export function readCodexModelContextOverride(): CodexModelContextOverride | und
   const text = readFileSync(path, "utf8");
   const lines = splitLines(text);
   const contextWindow = findTopLevelPositiveInteger(lines, "model_context_window");
-  if (contextWindow === undefined) return undefined;
   const model = findTopLevelAssignment(lines, "model").value;
-  return model ? { model, contextWindow } : undefined;
+  if (model && model.startsWith("chatgpt-web/")) {
+    const route = requireChatGptWebModelRoute(model, true);
+    return { model, contextWindow: resolveChatGptWebContextWindow(route.adapterEffort) };
+  }
+  if (contextWindow === undefined || !model) return undefined;
+  return { model, contextWindow };
 }
 
 function assignments(lines: string[]): Record<ManagedAssignmentKey, PreviousAssignment> {
@@ -956,6 +1086,7 @@ export function installCodexIntegration(
   const configPath = getCodexConfigPath();
   mkdirSync(dirname(configPath), { recursive: true, mode: 0o700 });
   const currentText = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
+  const gooseCustomProvider = snapshotGooseCustomProviderConfig();
   const existing = readJournal();
   const installedUrl = routeUrl(config);
   if (existing) assertJournalTargetsConfig(existing, configPath);
@@ -996,6 +1127,7 @@ export function installCodexIntegration(
     const updated: CodexIntegrationJournal = {
       ...existing,
       active: true,
+      gooseCustomProvider: journalGooseCustomProviderSnapshot(existing, gooseCustomProvider),
       installed: {
         openai_base_url: installedUrl,
         remote_compaction_v2: false,
@@ -1010,6 +1142,7 @@ export function installCodexIntegration(
       { path: configPath, data: installedText },
       { path: getCodexJournalPath(), data: `${JSON.stringify(updated, null, 2)}\n` },
     ], [getCodexModelsCachePath()]);
+    writeGooseCustomProviderConfig();
     return updated;
   }
 
@@ -1046,6 +1179,7 @@ export function installCodexIntegration(
       version: 6,
       active: true,
       configPath: existing.configPath,
+      gooseCustomProvider: journalGooseCustomProviderSnapshot(existing, gooseCustomProvider),
       installed: {
         openai_base_url: installedUrl,
         remote_compaction_v2: false,
@@ -1062,6 +1196,7 @@ export function installCodexIntegration(
       { path: configPath, data: installedText },
       { path: getCodexJournalPath(), data: `${JSON.stringify(updated, null, 2)}\n` },
     ], [getCodexModelsCachePath()]);
+    writeGooseCustomProviderConfig();
     return updated;
   }
 
@@ -1080,6 +1215,7 @@ export function installCodexIntegration(
       version: 6,
       active: true,
       configPath: existing.configPath,
+      gooseCustomProvider: journalGooseCustomProviderSnapshot(existing, gooseCustomProvider),
       installed: {
         openai_base_url: installedUrl,
         remote_compaction_v2: false,
@@ -1096,6 +1232,7 @@ export function installCodexIntegration(
       { path: configPath, data: features.text },
       { path: getCodexJournalPath(), data: `${JSON.stringify(updated, null, 2)}\n` },
     ], [getCodexModelsCachePath()]);
+    writeGooseCustomProviderConfig();
     return updated;
   }
 
@@ -1111,6 +1248,7 @@ export function installCodexIntegration(
     version: 6,
     active: true,
     configPath,
+    gooseCustomProvider,
     installed: {
       openai_base_url: installedUrl,
       remote_compaction_v2: false,
@@ -1127,6 +1265,7 @@ export function installCodexIntegration(
     { path: configPath, data: patched.text },
     { path: getCodexJournalPath(), data: `${JSON.stringify(journal, null, 2)}\n` },
   ], [getCodexModelsCachePath()]);
+  writeGooseCustomProviderConfig();
   if (existing?.version === 2 && existsSync(existing.catalogPath)) rmSync(existing.catalogPath);
   return journal;
 }
@@ -1155,6 +1294,7 @@ export function deactivateCodexIntegration(): SetCodexIntegrationActiveResult {
     { path: existing.configPath, data: restored },
     { path: getCodexJournalPath(), data: `${JSON.stringify(disconnected, null, 2)}\n` },
   ], [getCodexModelsCachePath()]);
+  restoreGooseCustomProviderConfig(journalGooseCustomProviderSnapshot(existing, { present: false }));
   return { changed: true, active: false };
 }
 
@@ -1194,6 +1334,7 @@ export function activateCodexIntegration(): SetCodexIntegrationActiveResult {
       { path: existing.configPath, data: multiAgentV2.text },
       { path: getCodexJournalPath(), data: `${JSON.stringify(connected, null, 2)}\n` },
     ], [getCodexModelsCachePath()]);
+    writeGooseCustomProviderConfig();
     return { changed: true, active: true };
   }
   let routedText: string;
@@ -1246,6 +1387,7 @@ export function activateCodexIntegration(): SetCodexIntegrationActiveResult {
     { path: existing.configPath, data: features.text },
     { path: getCodexJournalPath(), data: `${JSON.stringify(connected, null, 2)}\n` },
   ], [getCodexModelsCachePath()]);
+  writeGooseCustomProviderConfig();
   return { changed: true, active: true };
 }
 
@@ -1274,6 +1416,7 @@ export function uninstallCodexIntegration(): UninstallCodexIntegrationResult {
     if (catalogSnapshot?.exists) rmSync(catalogSnapshot.path);
     rmSync(modelsCacheSnapshot.path, { force: true });
     rmSync(getCodexJournalPath(), { force: true });
+    restoreGooseCustomProviderConfig(journalGooseCustomProviderSnapshot(journal, { present: false }));
   } catch (error) {
     const rollbackFailures: string[] = [];
     for (const snapshot of [modelsCacheSnapshot, catalogSnapshot, configSnapshot]) {

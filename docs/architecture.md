@@ -51,10 +51,11 @@ The desktop launcher owns one persistent Electron partition and up to five task-
 tabs. Each Codex task is leased an independent `WebContentsView` and surface ID; Playwright attaches
 to that exact surface through a launcher-owned loopback CDP endpoint. It does not launch another
 browser or copy authentication state. Each tab opens a fresh Temporary Chat, shares only the local
-login partition, and keeps its own document and lifecycle. Completed tabs remain inspectable until
-closed. Closing a running tab destroys its page and terminates that browser turn. A sixth concurrent
-turn fails explicitly; the cap avoids excessive parallel traffic that could trigger account abuse
-controls.
+login partition, and keeps its own document and lifecycle. Terminal task tabs are released when the
+turn completes, fails, or is aborted; the result/history remains owned by the outer harness rather
+than the embedded browser. Closing a running tab destroys its page and terminates that browser turn.
+A sixth concurrent turn fails explicitly; the cap avoids excessive parallel traffic that could
+trigger account abuse controls.
 
 The complete serialized Codex task is inserted as one inline JSON envelope. Image bytes stay out of
 the JSON and are attached natively with stable references. The runtime does not create a context
@@ -97,6 +98,18 @@ mode.
 Setup keeps Codex's built-in `openai` provider and switches only `openai_base_url`. The daemon
 forwards the authenticated official model catalog and appends only the routed models owned by the
 `chatgpt-web/` namespace; no static catalog is installed.
+
+On this repository, the launcher-local Electron 41.7.1 bundle was observed to partially extract
+under Node 24.16.0, leaving `Frameworks` and the Electron version marker missing. The project code
+was not the cause. A clean official Electron bootstrap under Node 20.20.2 repaired the launcher
+bundle using:
+
+```text
+force_no_cache=true npx -y node@20 launcher/node_modules/electron/install.js
+```
+
+Before introducing any future local bootstrap workaround, re-check current upstream Electron and
+`miuuyy/codex-chatgpt-web`, because this dependency behavior may change.
 
 The built-in provider attempts a Responses WebSocket prewarm. The local route explicitly returns
 HTTP `426`, which is Codex's native capability-negotiation signal for an immediate, session-sticky
