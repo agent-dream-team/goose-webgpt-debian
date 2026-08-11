@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
@@ -10,6 +10,17 @@ import { LAUNCHER_BROWSER_HOST_KIND } from "../src/launcher-browser-host";
 const roots: string[] = [];
 afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+test("the production browser helper heartbeats for the full active run", () => {
+  const source = readFileSync(join(import.meta.dir, "../src/adapters/chatgpt-web/browser-helper-main.ts"), "utf8");
+  const firstHeartbeat = source.indexOf("emitHeartbeat();");
+  const browserRun = source.indexOf("ChatGptBrowserWorker.forProvider(provider).run(turn)");
+  expect(source).toContain("const HELPER_HEARTBEAT_INTERVAL_MS = 10_000;");
+  expect(source).toContain("const heartbeatTimer = setInterval(emitHeartbeat, HELPER_HEARTBEAT_INTERVAL_MS);");
+  expect(source).toContain("clearInterval(heartbeatTimer);");
+  expect(firstHeartbeat).toBeGreaterThan(-1);
+  expect(firstHeartbeat).toBeLessThan(browserRun);
 });
 
 test("Bun daemon streams a prepared browser turn through the persistent Node helper", async () => {
@@ -249,6 +260,67 @@ test("helper process exit is cleaned up and a later turn respawns successfully",
   try {
     await expect(client.run(turn("process-failure-1"))).rejects.toThrow("exited with status 17");
     await expect(client.run(turn("process-respawn-2"))).resolves.toBe("respawned-after-exit");
+  } finally {
+    await client.close();
+  }
+});
+
+test("a live-but-silent helper is terminated and the next turn respawns a fresh helper", async () => {
+  const root = mkdtempSync(join(tmpdir(), "goose-launcher-helper-heartbeat-respawn-"));
+  roots.push(root);
+  const attempts = join(root, "attempts.txt");
+  const helper = join(root, "helper.cjs");
+  writeFileSync(helper, `
+    const fs = require("node:fs");
+    const readline = require("node:readline").createInterface({ input: process.stdin });
+    let attempt = 1;
+    try { attempt = Number(fs.readFileSync(${JSON.stringify("ATTEMPTS_PLACEHOLDER")}, "utf8")) + 1; } catch {}
+    fs.writeFileSync(${JSON.stringify("ATTEMPTS_PLACEHOLDER")}, String(attempt));
+    const send = value => process.stdout.write(JSON.stringify(value) + "\\n");
+    send({ type: "ready" });
+    readline.on("line", line => {
+      const message = JSON.parse(line);
+      if (message.type === "shutdown") process.exit(0);
+      if (message.type !== "run") return;
+      if (attempt === 1) return;
+      setTimeout(() => send({ type: "event", id: message.id, event: "heartbeat" }), 80);
+      setTimeout(() => send({ type: "result", id: message.id, text: "respawned-after-heartbeat-expiry" }), 240);
+    });
+  `.replaceAll("ATTEMPTS_PLACEHOLDER", attempts), { mode: 0o700 });
+  const descriptorPath = join(root, "launcher.json");
+  writeFileSync(descriptorPath, `${JSON.stringify({
+    version: 1,
+    kind: LAUNCHER_BROWSER_HOST_KIND,
+    pid: process.pid,
+    endpoint: "http://127.0.0.1:39001",
+    control: { endpoint: "http://127.0.0.1:9", token: "launcher-control-token-0123456789abcdefghijklmnop" },
+    helper: { executable: process.execPath, script: helper },
+    partition: "persist:codex-web-gpt-chatgpt",
+    idleUrl: "about:blank#codex-web-gpt-browser-host",
+    surfaceId: "launcher_surface_id_0123456789AB",
+    createdAt: new Date().toISOString(),
+  })}\n`, { mode: 0o600 });
+  const client = new LauncherBrowserHelperClient({
+    appName: "Goose Native",
+    browserHost: "launcher",
+    browserHostDescriptorPath: descriptorPath,
+    storageStatePath: join(root, "unused-state.json"),
+    chromeExecutablePath: join(root, "unused-chrome"),
+    turnTimeoutMs: 60_000,
+    headed: true,
+    autoApproveToolCalls: false,
+  }, { heartbeatTimeoutMs: 200 });
+  const turn = (traceId: string): BrowserTurn => ({
+    traceId,
+    modelId: "gpt-5.6-sol",
+    reasoning: "high",
+    capabilities: { localToolsEnabled: false, proAvailable: false },
+    prepare: async () => ({ text: "inspect", images: [], release() {} }),
+    onTextDelta() {},
+  });
+  try {
+    await expect(client.run(turn("heartbeat-expiry-1"))).rejects.toThrow("heartbeat expired after 200ms");
+    await expect(client.run(turn("heartbeat-respawn-2"))).resolves.toBe("respawned-after-heartbeat-expiry");
   } finally {
     await client.close();
   }

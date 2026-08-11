@@ -71,6 +71,7 @@ console.warn = diagnostic;
 console.error = diagnostic;
 
 const abortControllers = new Map<string, AbortController>();
+const HELPER_HEARTBEAT_INTERVAL_MS = 10_000;
 let shuttingDown = false;
 let shutdownPromise: Promise<void> | undefined;
 
@@ -120,6 +121,10 @@ async function run(message: RunMessage): Promise<void> {
   };
   const abortController = new AbortController();
   abortControllers.set(message.id, abortController);
+  const emitHeartbeat = () => writeProtocol({ type: "event", id: message.id, event: "heartbeat" });
+  emitHeartbeat();
+  const heartbeatTimer = setInterval(emitHeartbeat, HELPER_HEARTBEAT_INTERVAL_MS);
+  heartbeatTimer.unref?.();
   const turn: BrowserTurn = {
     traceId: message.turn.traceId,
     modelId: message.turn.modelId,
@@ -127,7 +132,7 @@ async function run(message: RunMessage): Promise<void> {
     capabilities: message.turn.capabilities,
     prepare: async () => ({ ...message.turn.prepared, release: () => {} }),
     abortSignal: abortController.signal,
-    onHeartbeat: () => writeProtocol({ type: "event", id: message.id, event: "heartbeat" }),
+    onHeartbeat: emitHeartbeat,
     onReasoningSummary: (text, continuation) => writeProtocol({
       type: "event",
       id: message.id,
@@ -155,6 +160,7 @@ async function run(message: RunMessage): Promise<void> {
       } : {}),
     });
   } finally {
+    clearInterval(heartbeatTimer);
     abortControllers.delete(message.id);
   }
 }

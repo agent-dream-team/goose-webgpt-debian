@@ -10,7 +10,14 @@ interface PendingTurn {
   resolve: (value: string) => void;
   reject: (error: Error) => void;
   abortListener?: () => void;
+  heartbeatTimer?: ReturnType<typeof setTimeout>;
   sent?: boolean;
+}
+
+export const LAUNCHER_BROWSER_HELPER_HEARTBEAT_TIMEOUT_MS = 45_000;
+
+interface LauncherBrowserHelperClientOptions {
+  heartbeatTimeoutMs?: number;
 }
 
 type HelperMessage =
@@ -113,8 +120,14 @@ export class LauncherBrowserHelperClient {
   private readyResolve?: () => void;
   private readyReject?: (error: Error) => void;
   private readonly pending = new Map<string, PendingTurn>();
+  private readonly heartbeatTimeoutMs: number;
 
-  constructor(private readonly config: ResolvedBrowserConfig) {}
+  constructor(
+    private readonly config: ResolvedBrowserConfig,
+    options: LauncherBrowserHelperClientOptions = {},
+  ) {
+    this.heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? LAUNCHER_BROWSER_HELPER_HEARTBEAT_TIMEOUT_MS;
+  }
 
   async run(turn: BrowserTurn): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
@@ -155,6 +168,7 @@ export class LauncherBrowserHelperClient {
         // Setting this before the synchronous write call makes an abort either prevent dispatch or
         // queue an `abort` after the `run` frame; it can never overtake the run frame in the pipe.
         pending.sent = true;
+        this.armHeartbeatTimeout(this.child, turn.traceId);
         void this.send({
           type: "run",
           id: turn.traceId,
@@ -283,7 +297,10 @@ export class LauncherBrowserHelperClient {
     const pending = this.pending.get(message.id);
     if (!pending) return;
     if (message.type === "event") {
-      if (message.event === "heartbeat") pending.turn.onHeartbeat?.();
+      if (message.event === "heartbeat") {
+        this.armHeartbeatTimeout(child, message.id);
+        pending.turn.onHeartbeat?.();
+      }
       else if (message.event === "reasoning" && message.text) {
         pending.turn.onReasoningSummary?.(message.text, message.continuation === true);
       }
@@ -313,10 +330,34 @@ export class LauncherBrowserHelperClient {
   private finish(id: string): void {
     const pending = this.pending.get(id);
     if (!pending) return;
+    if (pending.heartbeatTimer) clearTimeout(pending.heartbeatTimer);
     if (pending.abortListener && pending.turn.abortSignal) {
       pending.turn.abortSignal.removeEventListener("abort", pending.abortListener);
     }
     this.pending.delete(id);
+  }
+
+  private armHeartbeatTimeout(child: ChildProcessWithoutNullStreams | undefined, id: string): void {
+    const pending = this.pending.get(id);
+    if (!child || !pending || this.heartbeatTimeoutMs <= 0) return;
+    if (pending.heartbeatTimer) clearTimeout(pending.heartbeatTimer);
+    pending.heartbeatTimer = setTimeout(() => {
+      if (this.child !== child || !this.pending.has(id)) return;
+      const error = new Error(`Launcher browser helper heartbeat expired after ${this.heartbeatTimeoutMs}ms`);
+      this.child = undefined;
+      this.ready = undefined;
+      this.readyResolve = undefined;
+      this.readyReject = undefined;
+      this.finishWithError(id, error);
+      if (Number.isInteger(child.pid) && child.exitCode === null && child.signalCode === null) {
+        void this.terminateChild(child, 0).catch(cleanupError => {
+          console.error(
+            `[chatgpt-web-helper] heartbeat-expiry cleanup failed: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+          );
+        });
+      }
+    }, this.heartbeatTimeoutMs);
+    pending.heartbeatTimer.unref?.();
   }
 
   private finishWithError(id: string, error: Error): void {
