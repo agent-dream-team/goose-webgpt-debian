@@ -196,6 +196,21 @@ test("launcher refreshes persisted ChatGPT authentication before presenting setu
   assert.match(i18nSource, /checkingSignIn: "Checking saved session"/);
 });
 
+test("launcher waits for BrowserHost readiness before startup authentication refresh", () => {
+  assert.match(electronMain, /await browserHost\.ready\(\);/);
+  assert.match(electronMain, /browserHost\.startupAuthenticationRefresh = browserHost\.refreshAuthentication\(\)\.finally\(/);
+  assert.match(browserHostSource, /this\.initializationReadyPromise = new Promise/);
+  assert.match(browserHostSource, /void this\.view\.webContents\.loadURL\(IDLE_BROWSER_URL\)\.catch\(/);
+  assert.match(browserHostSource, /this\.writeDescriptor\(\);[\s\S]*?await this\.probeAuthentication\(\);[\s\S]*?this\.resolveInitializationReady\(\);/);
+  assert.match(browserHostSource, /await this\.ready\(\);[\s\S]*?if \(this\.activeTraceId\)/);
+});
+
+test("launcher bootstrap-only mode skips runtime migration startup while preserving BrowserHost startup", () => {
+  assert.match(electronMain, /CODEX_WEB_GPT_LAUNCHER_BOOTSTRAP_ONLY/);
+  assert.match(electronMain, /launcher\.bootstrap_only/);
+  assert.match(electronMain, /if \(launcherBootstrapOnly\) \{\s*logger\.info\("launcher\.bootstrap_only"/s);
+});
+
 test("launcher reminds authenticated users to refresh the private ChatGPT session every 48 hours", () => {
   assert.match(electronMain, /sessionRefreshReminderAt:\s*nextSessionRefreshReminderAt\(\)/);
   assert.match(electronMain, /launcher:session-reminder-dismiss/);

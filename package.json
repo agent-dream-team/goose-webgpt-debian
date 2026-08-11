@@ -37,6 +37,7 @@
     "smoke:codex": "bun run scripts/smoke-codex-catalog.ts",
     "launcher": "bun run scripts/start-launcher.ts",
     "app": "bun run scripts/start-launcher.ts",
+    "launcher:goose": "bun run scripts/start-goose-launcher.ts",
     "app:package": "bun run --cwd launcher package",
     "app:smoke": "bun run --cwd launcher smoke:package",
     "launcher:dev": "bun run --cwd launcher dev",

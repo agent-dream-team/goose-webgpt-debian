@@ -288,7 +288,6 @@ class RuntimeHost {
         + ` ${error instanceof Error ? error.message : String(error)}`,
       );
     }
-    const executable = this.resolveBrowserLoginExecutable();
     const parent = path.join(this.app.getPath("userData"), "browser-login");
     fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
     try { fs.chmodSync(parent, 0o700); } catch {}
@@ -301,14 +300,11 @@ class RuntimeHost {
         "browser-login",
         [
           "login",
-          "--launcher-control",
-          "--chrome",
-          executable,
           "--storage-state",
           storageStatePath,
         ],
         {
-          env: this.launcherControlEnvironment(),
+          env: { ...process.env, CODEX_CHATGPT_WEB_HOME: this.supervisor.coreHome },
           message: "Sign in to ChatGPT in the dedicated system Chrome/Chromium window; transfer continues automatically",
           successMessage: "Authenticated system-browser ChatGPT session captured",
         },

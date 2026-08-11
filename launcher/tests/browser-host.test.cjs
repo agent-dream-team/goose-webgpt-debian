@@ -33,32 +33,20 @@ const {
   CHATGPT_VIEWPORT_CSS,
   isChatGptCloudflareChallengeResponse,
   isTemporaryChatUrl,
-  initializationNavigationWasSuperseded,
   validateChatGptStorageState,
 } = require("../electron/browser-host.cjs");
 
-test("only a proven replacement navigation suppresses initial ERR_ABORTED noise", () => {
-  const aborted = Object.assign(new Error("ERR_ABORTED (-3) loading 'about:blank'"), { code: "ERR_ABORTED" });
-  assert.equal(initializationNavigationWasSuperseded(
-    aborted,
-    "about:blank#codex-web-gpt-browser-host",
-    "https://chatgpt.com/?temporary-chat=true",
-  ), true);
-  assert.equal(initializationNavigationWasSuperseded(
-    aborted,
-    "about:blank#codex-web-gpt-browser-host",
-    "about:blank#codex-web-gpt-browser-host",
-  ), false);
-  assert.equal(initializationNavigationWasSuperseded(
-    aborted,
-    "about:blank#codex-web-gpt-browser-host",
-    "about:blank",
-  ), false);
-  assert.equal(initializationNavigationWasSuperseded(
-    new Error("net::ERR_FAILED"),
-    "about:blank#codex-web-gpt-browser-host",
-    "https://chatgpt.com/?temporary-chat=true",
-  ), false);
+test("authentication routing is limited to explicit auth paths and known identity providers", () => {
+  assert.equal(allowedAuthUrl("https://chatgpt.com/?temporary-chat=true"), false);
+  assert.equal(allowedAuthUrl("https://chatgpt.com/"), false);
+  assert.equal(allowedAuthUrl("https://chatgpt.com/c/abc123"), false);
+  assert.equal(allowedAuthUrl("https://chatgpt.com/login"), true);
+  assert.equal(allowedAuthUrl("https://chatgpt.com/auth"), true);
+  assert.equal(allowedAuthUrl("https://chatgpt.com/auth/login"), true);
+  assert.equal(allowedAuthUrl("https://accounts.google.com/o/oauth2/v2/auth"), true);
+  assert.equal(allowedAuthUrl("https://login.microsoftonline.com/common/oauth2/v2.0/authorize"), true);
+  assert.equal(allowedAuthUrl("https://login.example.com"), false);
+  assert.equal(allowedAuthUrl("https://example.com/login"), false);
 });
 
 test("only an explicit Cloudflare challenge on a ChatGPT backend response triggers recovery", () => {
@@ -282,13 +270,31 @@ test("browser bounds are clipped to the launcher content area", () => {
 });
 
 test("authentication windows stay in the owned browser surface", () => {
-  assert.equal(allowedAuthUrl("https://accounts.google.com/o/oauth2/v2/auth"), true);
-  assert.equal(allowedAuthUrl("https://chatgpt.com/auth/login"), true);
-  assert.equal(allowedAuthUrl("https://example.com/login"), false);
   const source = require("node:fs").readFileSync(require.resolve("../electron/browser-host.cjs"), "utf8");
   assert.match(source, /routeAuthenticationToSystemBrowser\(url\)/);
   assert.match(source, /openLogin\(\{ force = false \} = {}\)/);
   assert.doesNotMatch(source, /createWindow:\s*\(options\)\s*=>\s*this\.createAuthView\(options\)/);
+});
+
+test("Temporary Chat navigation does not invoke system login", () => {
+  const calls = [];
+  const fixture = {
+    openLogin: async () => calls.push("login"),
+    logger: { error() {} },
+  };
+  assert.equal(BrowserHost.prototype.routeAuthenticationToSystemBrowser.call(fixture, "https://chatgpt.com/?temporary-chat=true"), false);
+  assert.deepEqual(calls, []);
+});
+
+test("session refresh auth redirects do not nest an interactive login", () => {
+  const calls = [];
+  const fixture = {
+    manualOperation: "session refresh",
+    openLogin: async () => calls.push("login"),
+    logger: { error() {} },
+  };
+  assert.equal(BrowserHost.prototype.routeAuthenticationToSystemBrowser.call(fixture, "https://chatgpt.com/login"), true);
+  assert.deepEqual(calls, []);
 });
 
 test("concurrent login requests share one authentication operation", async () => {
@@ -765,12 +771,52 @@ test("launcher session refresh resolves persisted authentication before setup ac
   ]);
 });
 
+test("launcher session refresh converts aborted auth redirects into signed-out state", async () => {
+  const calls = [];
+  const fixture = {
+    state: { authenticated: true },
+    snapshot: () => ({ authenticated: false, status: "signed-out" }),
+    setState: (patch) => calls.push(["state", patch]),
+    probeAuthentication: async () => {
+      calls.push(["probe"]);
+      return { authenticated: false, status: "signed-out" };
+    },
+    withManualOperation: async (name, action) => {
+      calls.push(["operation", name]);
+      return await action();
+    },
+    view: {
+      webContents: {
+        getURL: () => "about:blank#codex-web-gpt-browser-host",
+        loadURL: async () => {
+          calls.push(["load"]);
+          const error = new Error("navigation aborted");
+          error.code = "ERR_ABORTED";
+          throw error;
+        },
+      },
+    },
+  };
+
+  const state = await BrowserHost.prototype.refreshAuthentication.call(fixture);
+
+  assert.deepEqual(state, { authenticated: false, status: "signed-out" });
+  assert.deepEqual(calls, [
+    ["operation", "session refresh"],
+    ["state", { status: "loading", message: "Checking saved ChatGPT session" }],
+    ["load"],
+    ["state", { status: "signed-out", message: "Sign in to ChatGPT", authenticated: false }],
+    ["probe"],
+  ]);
+});
+
 test("manual browser operations disable background throttling until completion", async () => {
   const throttling = [];
   const surfaces = [];
   const fixture = {
     activeTraceId: null,
     manualOperation: null,
+    ready: async () => {},
     activateHomeSurface: () => surfaces.push("home"),
     setState() {},
     view: {
@@ -787,6 +833,105 @@ test("manual browser operations disable background throttling until completion",
   assert.deepEqual(surfaces, ["home"]);
   assert.deepEqual(throttling, [false, true]);
   assert.equal(fixture.manualOperation, null);
+});
+
+test("manual browser operations wait for BrowserHost readiness before starting", async () => {
+  const calls = [];
+  let releaseReady;
+  const fixture = {
+    activeTraceId: null,
+    manualOperation: null,
+    ready: () => new Promise((resolve) => {
+      releaseReady = resolve;
+    }),
+    activateHomeSurface: () => calls.push("home"),
+    setState() {},
+    view: {
+      webContents: {
+        isDestroyed: () => false,
+        setBackgroundThrottling: (enabled) => calls.push(["throttle", enabled]),
+      },
+    },
+  };
+  const operation = BrowserHost.prototype.withManualOperation.call(fixture, "hidden check", async () => {
+    calls.push("action");
+    return "ok";
+  });
+  await Promise.resolve();
+  assert.deepEqual(calls, []);
+  releaseReady();
+  assert.equal(await operation, "ok");
+  assert.deepEqual(calls, ["home", ["throttle", false], "action", ["throttle", true]]);
+});
+
+test("session inspection waits for the startup refresh rendezvous before taking manual ownership", async () => {
+  const calls = [];
+  let releaseRefresh;
+  const fixture = {
+    startupAuthenticationRefresh: new Promise((resolve) => {
+      releaseRefresh = resolve;
+    }),
+    state: { authenticated: true },
+    withManualOperation: async (name, action) => {
+      calls.push(["manual", name]);
+      return await action();
+    },
+    runSessionInspection: async (detectPro) => {
+      calls.push(["inspect", detectPro]);
+      return { authenticated: true, temporary: true, url: "https://chatgpt.com/?temporary-chat=true" };
+    },
+  };
+  const resultPromise = BrowserHost.prototype.inspectSession.call(fixture, true);
+  await Promise.resolve();
+  assert.deepEqual(calls, []);
+  releaseRefresh();
+  const result = await resultPromise;
+  assert.equal(result.authenticated, true);
+  assert.deepEqual(calls, [["manual", "session inspection"], ["inspect", true]]);
+});
+
+test("session inspection returns login-required when startup refresh proves the saved session is signed out", async () => {
+  const calls = [];
+  const fixture = {
+    startupAuthenticationRefresh: Promise.resolve({ authenticated: false }),
+    state: { authenticated: false },
+    withManualOperation: async () => {
+      calls.push("manual");
+      throw new Error("manual operation should not start");
+    },
+    runSessionInspection: async () => {
+      calls.push("inspect");
+      throw new Error("helper inspection should not run");
+    },
+  };
+
+  await assert.rejects(
+    BrowserHost.prototype.inspectSession.call(fixture, false),
+    /login-required: saved ChatGPT session is not authenticated/,
+  );
+  assert.deepEqual(calls, []);
+});
+
+test("session inspection returns login-required after a completed signed-out startup refresh", async () => {
+  const calls = [];
+  const fixture = {
+    startupAuthenticationRefresh: null,
+    state: { authenticated: false },
+    withManualOperation: async () => {
+      calls.push("manual");
+      throw new Error("manual operation should not start");
+    },
+    runSessionInspection: async () => {
+      calls.push("inspect");
+      throw new Error("helper inspection should not run");
+    },
+  };
+
+  await assert.rejects(
+    BrowserHost.prototype.inspectSession.call(fixture, false),
+    /login-required: saved ChatGPT session is not authenticated/,
+  );
+  assert.deepEqual(calls, []);
 });
 
 test("manual operations show the home surface without discarding retained task tabs", () => {

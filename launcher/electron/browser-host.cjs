@@ -86,13 +86,16 @@ function allowedAuthUrl(value) {
   } catch {
     return false;
   }
-  return parsed.protocol === "https:" && (
-    parsed.hostname === "chatgpt.com"
-    || parsed.hostname.endsWith(".openai.com")
-    || parsed.hostname === "accounts.google.com"
+  if (parsed.protocol !== "https:") return false;
+  if (parsed.hostname === "chatgpt.com") {
+    return parsed.pathname === "/login"
+      || parsed.pathname === "/auth"
+      || parsed.pathname.startsWith("/auth/");
+  }
+  return parsed.hostname === "accounts.google.com"
     || parsed.hostname === "login.microsoftonline.com"
     || parsed.hostname.endsWith(".apple.com")
-  );
+    || parsed.hostname.endsWith(".openai.com");
 }
 
 function isTemporaryChatUrl(value) {
@@ -107,12 +110,10 @@ function isTemporaryChatUrl(value) {
     && parsed.searchParams.get("temporary-chat") === "true";
 }
 
-function initializationNavigationWasSuperseded(error, expectedUrl, currentUrl) {
-  const code = error && typeof error === "object" ? error.code : undefined;
-  const message = error instanceof Error ? error.message : String(error);
-  return (code === "ERR_ABORTED" || /\bERR_ABORTED\s*\(-3\)/.test(message))
-    && currentUrl !== expectedUrl
-    && isTemporaryChatUrl(currentUrl);
+function isSessionRefreshRedirectAbort(error) {
+  if (!error || typeof error !== "object") return false;
+  const code = typeof error.code === "string" ? error.code : "";
+  return code === "ERR_ABORTED" || code === "ERR_FAILED";
 }
 
 function isChatGptBackendUrl(value) {
@@ -274,12 +275,25 @@ class BrowserHost {
     this.selectedTabId = "home";
     this.manualOperation = null;
     this.loginOperation = null;
+    this.startupAuthenticationRefresh = null;
     this.cloudflareChallengeRecovery = null;
     this.cloudflareChallengeRecoveryArmed = true;
     this.cloudflareChallengeRecoveryDelayMs = CLOUDFLARE_CHALLENGE_RECOVERY_DELAY_MS;
     this.cloudflareChallengeRecoverySettleMs = CLOUDFLARE_CHALLENGE_RECOVERY_SETTLE_MS;
     this.viewportCssKey = null;
     this.authView = null;
+    this.initializationReady = false;
+    this.initializationReadyPromise = new Promise((resolve, reject) => {
+      this.resolveInitializationReady = () => {
+        if (this.initializationReady) return;
+        this.initializationReady = true;
+        resolve();
+      };
+      this.rejectInitializationReady = (error) => {
+        if (this.initializationReady) return;
+        reject(error);
+      };
+    });
     this.turnLeaseSweep = setInterval(() => this.reapExpiredTurnTabs(), TURN_HEARTBEAT_SWEEP_MS);
     this.turnLeaseSweep.unref?.();
     this.boundsReady = false;
@@ -312,15 +326,10 @@ class BrowserHost {
     this.bindChatGptBackendRecovery();
     this.bindWebContents();
     void this.view.webContents.loadURL(IDLE_BROWSER_URL).catch((error) => {
-      const currentUrl = this.view.webContents.getURL();
-      if (initializationNavigationWasSuperseded(error, IDLE_BROWSER_URL, currentUrl)) {
-        this.logger.info("browser.initialization_superseded", { url: currentUrl });
-        return;
-      }
       this.logger.error("browser.initialization_failed", { message: error instanceof Error ? error.message : String(error) });
       this.setState({ status: "error", message: "Embedded browser failed to initialize" });
+      this.rejectInitializationReady(error);
     });
-    this.writeDescriptor();
   }
 
   currentOperation() {
@@ -503,12 +512,17 @@ class BrowserHost {
       this.setState({ url: contents.getURL(), loading: false });
       void this.applyViewportCss();
       void this.markOwnedSurface()
-        .then(() => this.probeAuthentication())
+        .then(async () => {
+          this.writeDescriptor();
+          await this.probeAuthentication();
+          this.resolveInitializationReady();
+        })
         .catch((error) => {
           this.logger.error("browser.surface_mark_failed", {
             message: error instanceof Error ? error.message : String(error),
           });
           this.setState({ status: "error", message: "Embedded browser ownership could not be established" });
+          this.rejectInitializationReady(error);
         });
     });
     contents.on("did-start-loading", () => this.setState({ loading: true }));
@@ -532,6 +546,9 @@ class BrowserHost {
 
   routeAuthenticationToSystemBrowser(url) {
     if (!allowedAuthUrl(url)) return false;
+    if (this.manualOperation === "session refresh") {
+      return true;
+    }
     void this.openLogin({ force: true }).catch((error) => {
       this.logger.error("browser.system_login_failed", {
         message: error instanceof Error ? error.message : String(error),
@@ -1240,8 +1257,14 @@ class BrowserHost {
   async refreshAuthentication() {
     return await this.withManualOperation("session refresh", async () => {
       this.setState({ status: "loading", message: "Checking saved ChatGPT session" });
-      if (!isTemporaryChatUrl(this.view.webContents.getURL())) {
-        await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
+      const contents = this.view.webContents;
+      if (!isTemporaryChatUrl(contents.getURL())) {
+        try {
+          await contents.loadURL(TEMPORARY_CHAT_URL);
+        } catch (error) {
+          if (!isSessionRefreshRedirectAbort(error)) throw error;
+          this.setState({ status: "signed-out", message: "Sign in to ChatGPT", authenticated: false });
+        }
       }
       return await this.probeAuthentication();
     });
@@ -1372,6 +1395,12 @@ class BrowserHost {
   }
 
   async inspectSession(detectPro = false) {
+    if (this.startupAuthenticationRefresh) {
+      await this.startupAuthenticationRefresh;
+    }
+    if (this.state.authenticated !== true) {
+      throw new Error("login-required: saved ChatGPT session is not authenticated");
+    }
     return await this.withManualOperation("session inspection", () => this.runSessionInspection(detectPro));
   }
 
@@ -1401,6 +1430,7 @@ class BrowserHost {
   }
 
   async withManualOperation(name, action) {
+    await this.ready();
     if (this.activeTraceId) {
       throw new Error(`ChatGPT browser is running Codex turn ${this.activeTraceId}`);
     }
@@ -1421,6 +1451,10 @@ class BrowserHost {
       if (contents && !contents.isDestroyed()) contents.setBackgroundThrottling(true);
       this.manualOperation = null;
     }
+  }
+
+  async ready() {
+    return await this.initializationReadyPromise;
   }
 
   writeDescriptor() {
@@ -1468,7 +1502,6 @@ module.exports = {
   BrowserHost,
   CHATGPT_VIEWPORT_CSS,
   IDLE_BROWSER_URL,
-  initializationNavigationWasSuperseded,
   isChatGptCloudflareChallengeResponse,
   isTemporaryChatUrl,
   TEMPORARY_CHAT_URL,

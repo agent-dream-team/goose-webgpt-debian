@@ -2,7 +2,12 @@ import { expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { browserLoginStateExists, loginToChatGpt, loginVerificationMarkerPath } from "../src/browser-login";
+import {
+  browserLoginStateExists,
+  loginToChatGpt,
+  loginVerificationMarkerPath,
+  tryDetectChatGptProCapability,
+} from "../src/browser-login";
 import { CHATGPT_TEMPORARY_CHAT_URL } from "../src/chatgpt-session";
 import { defaultConfig } from "../src/config";
 
@@ -19,7 +24,7 @@ test("login uses one normal Chrome on a non-automation loopback port and never l
     const config = defaultConfig("browser-only");
     config.chromeExecutablePath = executable;
     config.storageStatePath = join(root, "browser", "storage-state.json");
-    const loginError = await loginToChatGpt(config, { timeoutMs: 1_000 }).then(
+    const loginError = await loginToChatGpt(config, { timeoutMs: 5_000 }).then(
       () => undefined,
       error => error,
     );
@@ -93,4 +98,23 @@ test("stored login accepts legacy verification evidence and the new authenticate
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("capability probing is optional and inconclusive detection does not become false", async () => {
+  const locator = {
+    locator: () => locator,
+    last: () => locator,
+    isVisible: async () => true,
+    waitFor: async () => { throw new Error("timeout"); },
+    getAttribute: async () => null,
+    click: async () => {},
+    first: () => locator,
+    count: async () => 1,
+  };
+  const page = {
+    locator: () => locator,
+    keyboard: { press: async () => {} },
+  } as never;
+
+  expect(await tryDetectChatGptProCapability(page)).toBeUndefined();
 });

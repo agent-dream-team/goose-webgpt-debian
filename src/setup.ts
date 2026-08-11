@@ -37,6 +37,7 @@ export interface SetupOptions {
   standalone?: boolean;
   port?: number;
   chromeExecutablePath?: string;
+  storageStatePath?: string;
   browserHostDescriptorPath?: string;
   appName?: string;
   forceLogin?: boolean;
@@ -329,7 +330,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     if (beforeService.loaded && (loginRequired || capabilityProbeRequired) && existing) await assertServiceIdle(existing);
     if (loginRequired) {
       const login = await loginToChatGpt(config);
-      proAvailable = login.proAvailable;
+      proAvailable = login.proAvailable ?? proAvailable;
       loginCreated = true;
     } else if (capabilityProbeRequired) {
       proAvailable = (await inspectBrowserLoginCapabilities(config)).proAvailable;

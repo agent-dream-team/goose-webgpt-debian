@@ -64,6 +64,7 @@ const KEYS_URL = "https://platform.openai.com/settings/organization/api-keys";
 const ALLOWED_EXTERNAL_URLS = new Set([GITHUB_URL, X_URL, CONNECTORS_URL, TUNNELS_URL, KEYS_URL]);
 const PACKAGED_RENDERER_URL = pathToFileURL(path.join(__dirname, "..", "dist", "index.html")).href;
 const APP_ICON_PATH = path.join(__dirname, "..", "assets", "icon.png");
+const launcherBootstrapOnly = process.env.CODEX_WEB_GPT_LAUNCHER_BOOTSTRAP_ONLY === "1";
 
 app.setName("Codex Web GPT");
 if (process.platform === "win32") app.setAppUserModelId("dev.codexwebgpt.launcher");
@@ -717,6 +718,7 @@ async function start() {
     loginWithSystemBrowser: () => runtimeHost.captureSystemBrowserLogin(),
     publishState: (state) => send("launcher:browser-state", state),
   });
+  await browserHost.ready();
   const updaterRuntimeRoot = runtimeRootProvider();
   updateController = createUpdateController({
     currentVersion: app.getVersion(),
@@ -736,7 +738,10 @@ async function start() {
   if (startHidden && !trayAvailable) mainWindow.once("ready-to-show", () => showMainWindow());
   const launcherSmokeTest = process.argv.includes("--launcher-smoke-test");
   if (!launcherSmokeTest) {
-    void browserHost.refreshAuthentication().catch((error) => {
+    browserHost.startupAuthenticationRefresh = browserHost.refreshAuthentication().finally(() => {
+      browserHost.startupAuthenticationRefresh = null;
+    });
+    void browserHost.startupAuthenticationRefresh.catch((error) => {
       logger.warn("browser.session_refresh_failed", {
         message: error instanceof Error ? error.message : String(error),
       });
@@ -780,6 +785,10 @@ async function start() {
     await browserControl.close();
     mainWindow.destroy();
     app.quit();
+    return;
+  }
+  if (launcherBootstrapOnly) {
+    logger.info("launcher.bootstrap_only", { coreHome: CORE_HOME });
     return;
   }
   void (async () => {

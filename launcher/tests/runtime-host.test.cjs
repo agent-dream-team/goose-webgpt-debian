@@ -296,6 +296,46 @@ test("launcher-controlled CLI operations use the live descriptor token", () => {
   }
 });
 
+test("system-browser login uses the Goose transfer storage-state path", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-runtime-login-"));
+  const calls = [];
+  const host = new RuntimeHost({
+    app: { getPath: () => root },
+    logger: { info() {}, warn() {}, error() {} },
+    sourceRoot: "/source",
+    browserDescriptorPath: "/runtime/launcher-browser.json",
+    supervisor: {
+      coreHome: path.join(root, "goose-home"),
+      readConfig: () => ({ mode: "browser-only", browserHost: "managed-chrome" }),
+      readSetupConfig: () => ({ mode: "browser-only", browserHost: "managed-chrome" }),
+    },
+  });
+  host.run = async (_name, args, options) => {
+    calls.push({ args, env: options.env });
+    const storageStateIndex = args.indexOf("--storage-state");
+    const storageStatePath = args[storageStateIndex + 1];
+    fs.mkdirSync(path.dirname(storageStatePath), { recursive: true });
+    fs.writeFileSync(storageStatePath, "{}\n");
+    fs.writeFileSync(`${storageStatePath}.verified.json`, `${JSON.stringify({
+      version: 2,
+      authenticated: true,
+      source: "authenticated-system-browser",
+      capturedAt: new Date().toISOString(),
+    })}\n`);
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const transfer = await host.captureSystemBrowserLogin();
+  try {
+    assert.equal(calls[0].args[0], "login");
+    assert.equal(calls[0].args.includes("--launcher-control"), false);
+    assert.equal(calls[0].args.includes("--storage-state"), true);
+    assert.equal(calls[0].env.CODEX_CHATGPT_WEB_HOME, path.join(root, "goose-home"));
+  } finally {
+    await transfer.cleanup();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("failed first-time setup removes its route before restoring the unconfigured state", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-first-setup-rollback-"));
   const coreHome = path.join(root, "core");

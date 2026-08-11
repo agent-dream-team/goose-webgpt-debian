@@ -21,7 +21,7 @@ import {
 export interface BrowserLoginResult {
   storageStatePath: string;
   accountSurfaceUrl: string;
-  proAvailable: boolean;
+  proAvailable?: boolean;
 }
 
 interface LegacyLoginVerificationMarker {
@@ -264,25 +264,33 @@ export function loginVerificationMarkerPath(storageStatePath: string): string {
   return `${storageStatePath}.verified.json`;
 }
 
-function writeVerificationMarker(storageStatePath: string, proAvailable: boolean): void {
+function writeVerificationMarker(storageStatePath: string, proAvailable?: boolean): void {
   const marker: LegacyLoginVerificationMarker = {
     version: 1,
     authenticated: true,
     verifiedAt: new Date().toISOString(),
-    proAvailable,
+    ...(typeof proAvailable === "boolean" ? { proAvailable } : {}),
   };
   atomicWriteFile(loginVerificationMarkerPath(storageStatePath), `${JSON.stringify(marker)}\n`);
 }
 
-function writeLoginCaptureMarker(storageStatePath: string, proAvailable: boolean): void {
+function writeLoginCaptureMarker(storageStatePath: string, proAvailable?: boolean): void {
   const marker: LoginCaptureMarker = {
     version: 2,
     authenticated: true,
     source: "authenticated-system-browser",
     capturedAt: new Date().toISOString(),
-    proAvailable,
+    ...(typeof proAvailable === "boolean" ? { proAvailable } : {}),
   };
   atomicWriteFile(loginVerificationMarkerPath(storageStatePath), `${JSON.stringify(marker)}\n`);
+}
+
+export async function tryDetectChatGptProCapability(page: Page): Promise<boolean | undefined> {
+  try {
+    return await detectChatGptProCapability(page);
+  } catch {
+    return undefined;
+  }
 }
 
 async function verifyCapturedStateInOwnedBrowser(
@@ -350,7 +358,7 @@ export function storedBrowserLoginCapabilities(config: AppConfig): { proAvailabl
 
 export async function loginToChatGpt(
   config: AppConfig,
-  options: { timeoutMs?: number } = {},
+  options: { timeoutMs?: number; storageStatePath?: string } = {},
 ): Promise<BrowserLoginResult> {
   if (!existsSync(config.chromeExecutablePath)) {
     throw new Error(`Chrome/Chromium was not found at ${config.chromeExecutablePath}. Pass --chrome with its executable path.`);
@@ -358,6 +366,7 @@ export async function loginToChatGpt(
   const profileDir = join(dirname(config.storageStatePath), "login-profile");
   rmSync(profileDir, { recursive: true, force: true });
   mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+  const storageStatePath = options.storageStatePath ?? config.storageStatePath;
   // Chrome treats port 0 as an automation signal. Reserve a normal private loopback port so the
   // interactive sign-in remains on an ordinary system-browser surface while we attach same-process CDP.
   const devToolsPort = await reserveLoopbackPort();
@@ -407,7 +416,6 @@ export async function loginToChatGpt(
     }
     const context = contexts[0];
     const page = await waitForAuthenticatedTemporaryChat(context, browserExit, completionTimeoutMs);
-    const proAvailable = await detectChatGptProCapability(page);
     const state = await context.storageState();
     const accountSurfaceUrl = page.url();
     await verifyCapturedStateInOwnedBrowser(
@@ -416,17 +424,18 @@ export async function loginToChatGpt(
       state,
       Math.min(60_000, completionTimeoutMs),
     );
+    const proAvailable = await tryDetectChatGptProCapability(page);
 
     await closeOwnedLoginBrowser(browser, browserExit);
     browserProcessClosed = true;
     browser = undefined;
 
-    atomicWriteFile(config.storageStatePath, `${JSON.stringify(state)}\n`);
-    writeLoginCaptureMarker(config.storageStatePath, proAvailable);
+    atomicWriteFile(storageStatePath, `${JSON.stringify(state)}\n`);
+    writeLoginCaptureMarker(storageStatePath, proAvailable);
     result = {
-      storageStatePath: config.storageStatePath,
+      storageStatePath,
       accountSurfaceUrl,
-      proAvailable,
+      ...(typeof proAvailable === "boolean" ? { proAvailable } : {}),
     };
   } catch (error) {
     primaryError = error;

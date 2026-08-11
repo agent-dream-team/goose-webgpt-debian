@@ -129,9 +129,11 @@ async function setupCommand(args: string[]): Promise<void> {
   const tunnelId = takeOption(args, "--tunnel-id");
   const runtimeKeyFile = takeOption(args, "--runtime-key-file");
   const chrome = takeOption(args, "--chrome");
+  const storageStatePath = takeOption(args, "--storage-state");
   const browserHostDescriptorPath = takeOption(args, "--browser-host-descriptor");
   if (chrome && browserHostDescriptorPath) throw new Error("Choose either --chrome or --browser-host-descriptor, not both");
   if (chrome) options.chromeExecutablePath = chrome;
+  if (storageStatePath) options.storageStatePath = storageStatePath;
   if (browserHostDescriptorPath) options.browserHostDescriptorPath = browserHostDescriptorPath;
   if (appName) options.appName = appName;
   if (tunnelId) options.tunnelId = tunnelId;
@@ -339,12 +341,13 @@ async function main(): Promise<void> {
   if (command === "help") stdout.write(HELP);
   else if (command === "setup") await setupCommand(args);
   else if (command === "login") {
+    const storageStatePath = takeOption(args, "--storage-state");
     assertNoArgs(args);
     const config = loadConfig();
     if (config.browserHost === "launcher") {
       throw new Error("ChatGPT login is owned by the launcher; open Codex Web GPT and use its Sign in step");
     }
-    const result = await loginToChatGpt(config);
+    const result = await loginToChatGpt(config, storageStatePath ? { storageStatePath } : {});
     stdout.write(`ChatGPT login stored at ${result.storageStatePath}\n`);
   } else if (command === "doctor" || command === "status") await doctorCommand(args);
   else if (command === "route") await routeCommand(args);
