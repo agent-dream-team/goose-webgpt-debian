@@ -175,6 +175,74 @@ export async function selectLauncherPage(
   throw new Error("Launcher browser host did not expose its owned browser surface");
 }
 
+export interface LauncherViewportSize {
+  width: number;
+  height: number;
+}
+
+/**
+ * The Electron browser host sizes every ChatGPT surface from bounds the launcher UI measures for
+ * its browser panel, and a WebContentsView starts at a 1x1 placeholder until that measurement
+ * arrives. Standalone Goose drives turns without anyone opening that panel, so the measurement
+ * never happens, and Chromium does not propagate later bounds to a hidden view either. ChatGPT
+ * still renders — the composer and its effort pill exist and report as visible — but every control
+ * lays out beyond a 1x1 layout viewport, so Playwright rejects each click with
+ * "element is outside of the viewport". An automated turn must not depend on a human watching the
+ * panel, so any surface without a usable layout viewport gets a deterministic automation viewport.
+ * A surface the launcher UI did measure keeps its real geometry, so a revealed tab still renders
+ * exactly what the user sees.
+ *
+ * The automation viewport matches Playwright's own default, which is what the managed-Chrome host
+ * already gets implicitly from browser.newContext(), so both browser hosts drive ChatGPT at the
+ * same geometry instead of each picking its own size.
+ */
+export const LAUNCHER_MIN_LAYOUT_VIEWPORT: LauncherViewportSize = { width: 320, height: 240 };
+export const LAUNCHER_AUTOMATION_VIEWPORT: LauncherViewportSize = { width: 1280, height: 720 };
+
+export function launcherAutomationViewportRequired(
+  measured: Partial<LauncherViewportSize> | undefined,
+  minimum: LauncherViewportSize = LAUNCHER_MIN_LAYOUT_VIEWPORT,
+): boolean {
+  if (!measured || !Number.isFinite(measured.width) || !Number.isFinite(measured.height)) return true;
+  return measured.width! < minimum.width || measured.height! < minimum.height;
+}
+
+export async function ensureLauncherAutomationViewport(
+  page: Page,
+  viewport: LauncherViewportSize = LAUNCHER_AUTOMATION_VIEWPORT,
+): Promise<LauncherViewportSize | null> {
+  const layoutViewport = () => page
+    .evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }))
+    .catch(() => undefined);
+  const describe = (size: Partial<LauncherViewportSize> | undefined) => (
+    `${size?.width ?? "unknown"}x${size?.height ?? "unknown"}`
+  );
+  const measured = await layoutViewport();
+  if (!launcherAutomationViewportRequired(measured)) return null;
+  try {
+    await page.setViewportSize({ ...viewport });
+  } catch (error) {
+    throw new Error(
+      `Launcher browser surface has no usable layout viewport (${describe(measured)})`
+      + ` and could not be resized: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  // A resize the renderer never applied would otherwise resurface as an unexplained click timeout
+  // once an actionability check runs, so confirm the surface really carries the new geometry.
+  const applied = await layoutViewport();
+  if (launcherAutomationViewportRequired(applied)) {
+    throw new Error(
+      `Launcher browser surface kept an unusable layout viewport (${describe(applied)})`
+      + ` after a ${describe(viewport)} automation viewport was applied`,
+    );
+  }
+  console.info(
+    `[chatgpt-web] launcher browser surface measured ${describe(measured)};`
+    + ` applied ${describe(viewport)} automation viewport (layout viewport now ${describe(applied)})`,
+  );
+  return { ...applied } as LauncherViewportSize;
+}
+
 export async function connectLauncherBrowserHost(
   descriptorPath: string,
   timeoutMs = 20_000,
@@ -205,6 +273,7 @@ export async function connectLauncherBrowserHost(
       surfaceId,
       abortSignal,
     );
+    await ensureLauncherAutomationViewport(page);
     return { descriptor, browser, context, page };
   } catch (error) {
     await browser.close().catch(() => {});

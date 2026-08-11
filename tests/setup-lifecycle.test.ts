@@ -4,6 +4,8 @@ import {
   buildSetupConfig,
   installSetupCodexIntegration,
   launcherCapabilityProbeRequired,
+  launcherRuntimeOwnershipRequired,
+  nextControlToken,
   preflightSetupCodexIntegration,
   setupProxyIsReady,
 } from "../src/setup";
@@ -28,6 +30,19 @@ test("setup accepts only a matching daemon that is ready for new Codex turns", (
   expect(setupProxyIsReady({ ...ready, version: "0.1.16" }, config)).toBe(false);
 });
 
+test("launcher setup readiness still requires the daemon health contract, not just the restart request", () => {
+  const ready = {
+    service: "codex-chatgpt-web",
+    status: "ok",
+    mode: "full",
+    version: "0.2.0",
+    accepting_turns: true,
+  };
+
+  expect(setupProxyIsReady(ready, { mode: "full", releaseVersion: "0.2.0" })).toBe(true);
+  expect(setupProxyIsReady({ ...ready, accepting_turns: false }, { mode: "full", releaseVersion: "0.2.0" })).toBe(false);
+});
+
 test("repeat launcher setup reuses the previously verified Pro capability", () => {
   expect(launcherCapabilityProbeRequired(undefined)).toBe(true);
   expect(launcherCapabilityProbeRequired({
@@ -42,6 +57,47 @@ test("repeat launcher setup reuses the previously verified Pro capability", () =
     browserHost: "managed-chrome",
     proAvailable: true,
   } as never)).toBe(true);
+  expect(launcherCapabilityProbeRequired(undefined, true)).toBe(false);
+  expect(launcherCapabilityProbeRequired({
+    browserHost: "managed-chrome",
+    proAvailable: true,
+  } as never, true)).toBe(false);
+});
+
+test("goose standalone launcher setup keeps browser-host ownership separate from runtime ownership", () => {
+  const launcherBrowserHost = buildSetupConfig(undefined, {
+    mode: "full",
+    standalone: true,
+    browserHostDescriptorPath: "/tmp/launcher-browser.json",
+    acknowledgedUnofficial: true,
+    tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+    runtimeKeyFile: "/tmp/runtime.key",
+  });
+  const launcherRuntime = buildSetupConfig(undefined, {
+    mode: "full",
+    acknowledgedUnofficial: true,
+    browserHostDescriptorPath: "/tmp/launcher-browser.json",
+    tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+    runtimeKeyFile: "/tmp/runtime.key",
+  });
+
+  expect(launcherRuntimeOwnershipRequired(launcherBrowserHost, true)).toBe(false);
+  expect(launcherRuntimeOwnershipRequired(launcherRuntime, false)).toBe(true);
+  expect(launcherRuntimeOwnershipRequired({
+    ...launcherBrowserHost,
+    browserHost: "managed-chrome",
+  } as never, true)).toBe(false);
+});
+
+test("restart-only setup rotates only the new control token", () => {
+  const existing = buildSetupConfig(undefined, {
+    mode: "browser-only",
+    acknowledgedUnofficial: true,
+  });
+
+  expect(nextControlToken(existing, true, existing.controlToken, () => "rotated-token")).toBe("rotated-token");
+  expect(nextControlToken(existing, false, existing.controlToken, () => "rotated-token")).toBe(existing.controlToken);
+  expect(nextControlToken(undefined, true, "stable-token", () => "rotated-token")).toBe("stable-token");
 });
 
 test("standalone browser-only setup skips every Codex integration phase", () => {

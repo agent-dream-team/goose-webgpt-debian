@@ -9,8 +9,13 @@ import {
   LAUNCHER_TURN_HEARTBEAT_TIMEOUT_MS,
   LAUNCHER_TURN_START_TIMEOUT_MS,
   LAUNCHER_CAPABILITY_INSPECTION_TIMEOUT_MS,
+  LAUNCHER_AUTOMATION_VIEWPORT,
   LAUNCHER_BROWSER_HOST_KIND,
+  LAUNCHER_MIN_LAYOUT_VIEWPORT,
+  ensureLauncherAutomationViewport,
   inspectLauncherBrowserHost,
+  launcherAutomationViewportRequired,
+  type LauncherViewportSize,
   notifyLauncherTurn,
   readLauncherBrowserHostDescriptor,
   selectLauncherPage,
@@ -220,6 +225,66 @@ test("launcher page selection rejects duplicated ownership markers", async () =>
 
   expect(selectLauncherPage(browser, descriptor, 20)).rejects.toThrow(
     "2 surfaces with the same ownership id",
+  );
+});
+
+test("an unmeasured launcher surface needs an automation viewport, a measured one does not", () => {
+  expect(launcherAutomationViewportRequired({ width: 1, height: 1 })).toBe(true);
+  expect(launcherAutomationViewportRequired(undefined)).toBe(true);
+  expect(launcherAutomationViewportRequired({ width: Number.NaN, height: 800 })).toBe(true);
+  expect(launcherAutomationViewportRequired({
+    width: LAUNCHER_MIN_LAYOUT_VIEWPORT.width,
+    height: LAUNCHER_MIN_LAYOUT_VIEWPORT.height - 1,
+  })).toBe(true);
+  expect(launcherAutomationViewportRequired(LAUNCHER_MIN_LAYOUT_VIEWPORT)).toBe(false);
+  expect(launcherAutomationViewportRequired({ width: 900, height: 600 })).toBe(false);
+});
+
+test("a launcher surface left at the placeholder viewport is resized for automation", async () => {
+  const applied: LauncherViewportSize[] = [];
+  const page = {
+    evaluate: async () => applied.at(-1) ?? { width: 1, height: 1 },
+    setViewportSize: async (size: LauncherViewportSize) => { applied.push(size); },
+  } as unknown as Page;
+
+  expect(await ensureLauncherAutomationViewport(page)).toEqual(LAUNCHER_AUTOMATION_VIEWPORT);
+  expect(applied).toEqual([LAUNCHER_AUTOMATION_VIEWPORT]);
+});
+
+test("the launcher automation viewport matches the managed-Chrome Playwright default", () => {
+  expect(LAUNCHER_AUTOMATION_VIEWPORT).toEqual({ width: 1280, height: 720 });
+});
+
+test("a launcher surface that ignores the resize fails instead of reaching an actionability check", async () => {
+  const page = {
+    evaluate: async () => ({ width: 1, height: 1 }),
+    setViewportSize: async () => {},
+  } as unknown as Page;
+
+  expect(ensureLauncherAutomationViewport(page)).rejects.toThrow(
+    "kept an unusable layout viewport (1x1) after a 1280x720 automation viewport was applied",
+  );
+});
+
+test("a launcher surface the UI already measured keeps its real geometry", async () => {
+  const applied: unknown[] = [];
+  const page = {
+    evaluate: async () => ({ width: 900, height: 640 }),
+    setViewportSize: async (size: unknown) => { applied.push(size); },
+  } as unknown as Page;
+
+  expect(await ensureLauncherAutomationViewport(page)).toBeNull();
+  expect(applied).toEqual([]);
+});
+
+test("a launcher surface that cannot be resized fails with its measured geometry", async () => {
+  const page = {
+    evaluate: async () => ({ width: 1, height: 1 }),
+    setViewportSize: async () => { throw new Error("viewport emulation unavailable"); },
+  } as unknown as Page;
+
+  expect(ensureLauncherAutomationViewport(page)).rejects.toThrow(
+    "no usable layout viewport (1x1)",
   );
 });
 

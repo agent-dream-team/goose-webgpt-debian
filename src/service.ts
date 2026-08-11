@@ -221,10 +221,10 @@ export async function assertServiceIdle(config: AppConfig): Promise<void> {
   await lease.release();
 }
 
-export async function restartService(config: AppConfig): Promise<ServiceStatus> {
+export async function restartService(config: AppConfig, drainConfig: AppConfig = config): Promise<ServiceStatus> {
   assertMacOs();
   if (!getServiceStatus().loaded) return startService();
-  const lease = await acquireDrain(config);
+  const lease = await acquireDrain(drainConfig);
   try {
     runChecked("launchctl", ["bootout", serviceTarget()]);
     await waitForServiceUnloaded();

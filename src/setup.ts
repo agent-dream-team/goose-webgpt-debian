@@ -65,8 +65,22 @@ export interface ExistingFullSetupCredentials {
   runtimeKey: boolean;
 }
 
-export function launcherCapabilityProbeRequired(existing: AppConfig | undefined): boolean {
+export function launcherCapabilityProbeRequired(existing: AppConfig | undefined, standalone = false): boolean {
+  if (standalone) return false;
   return !(existing?.browserHost === "launcher" && typeof existing.proAvailable === "boolean");
+}
+
+export function launcherRuntimeOwnershipRequired(config: AppConfig, standalone = false): boolean {
+  return config.browserHost === "launcher" && !standalone;
+}
+
+export function nextControlToken(
+  existing: AppConfig | undefined,
+  restartService: boolean,
+  currentToken: string,
+  createToken: () => string = () => randomBytes(32).toString("base64url"),
+): string {
+  return existing && restartService ? createToken() : currentToken;
 }
 
 export function existingFullSetupCredentials(existing: AppConfig | undefined): ExistingFullSetupCredentials {
@@ -282,8 +296,10 @@ async function bootstrapTunnelProfile(config: AppConfig): Promise<void> {
 export async function setup(options: SetupOptions): Promise<SetupResult> {
   const existing = loadExistingConfig();
   const config = buildSetupConfig(existing, options);
-  const launcherOwned = config.browserHost === "launcher";
-  if (!launcherOwned && process.platform !== "darwin") {
+  const launcherBrowserHost = config.browserHost === "launcher";
+  const gooseStandaloneBrowserHost = launcherBrowserHost && options.standalone === true;
+  const launcherRuntimeOwned = launcherBrowserHost && !gooseStandaloneBrowserHost;
+  if (!launcherBrowserHost && process.platform !== "darwin") {
     throw new Error(
       "Terminal-only managed Chrome setup currently requires macOS. "
       + "Use the Codex Web GPT launcher on Windows or Linux.",
@@ -291,9 +307,9 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   }
   preflightSetupCodexIntegration(config, options);
   const refreshTunnelWorker = tunnelWorkerRuntimeChanged(existing, config);
-  if (existing && options.restartService) config.controlToken = randomBytes(32).toString("base64url");
+  const nextControlTokenValue = nextControlToken(existing, Boolean(options.restartService), config.controlToken);
   const beforeService = getServiceStatus();
-  if (launcherOwned && (beforeService.installed || beforeService.loaded)) {
+  if (launcherRuntimeOwned && (beforeService.installed || beforeService.loaded)) {
     if (!existing) {
       throw new Error("A legacy background service exists without a verifiable configuration; refusing automatic migration");
     }
@@ -312,7 +328,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   let proAvailable: boolean | undefined;
   if (config.browserHost === "launcher") {
     if (options.forceLogin) throw new Error("Launcher browser login is owned by the launcher UI; --login cannot replace it");
-    const detectPro = launcherCapabilityProbeRequired(existing);
+    const detectPro = launcherCapabilityProbeRequired(existing, options.standalone === true);
     const inspected = await inspectLauncherBrowserHost(config.browserHostDescriptorPath!, {
       detectPro,
     });
@@ -336,6 +352,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
       proAvailable = (await inspectBrowserLoginCapabilities(config)).proAvailable;
     }
   }
+  config.controlToken = nextControlTokenValue;
   config.proAvailable = proAvailable === true;
   const explicitTunnelChange = Boolean(options.tunnelId || options.runtimeKeyFile || options.runtimeKeyValue);
   const preliminaryChange = Boolean(existing && (meaningfulRuntimeChange(existing, config) || explicitTunnelChange || options.forceLogin));
@@ -358,10 +375,10 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   if (changedWhileLoaded && !preliminaryChange && existing) await assertServiceIdle(existing);
   if (!beforeService.loaded) await assertPortAvailable(config.host, config.port);
 
-  if (!launcherOwned) {
+  if (!launcherBrowserHost) {
     saveConfig(config);
     installService(config);
-    if (changedWhileLoaded && options.restartService && existing) await restartService(existing);
+    if (changedWhileLoaded && options.restartService && existing) await restartService(config, existing);
     await waitForProxy(config);
   }
 
@@ -373,22 +390,22 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   }
   if (config.mode === "full") {
     const profilePath = join(config.tunnel!.profileDir, `${config.tunnel!.profileName}.yaml`);
-    const tunnelService = getTunnelServiceStatus();
-    const needsProfile = !existsSync(profilePath);
-    if (launcherOwned) {
-      if (tunnelService.installed || tunnelService.loaded) await uninstallTunnelService();
-      if (needsProfile || refreshTunnelWorker || explicitTunnelChange) {
+      const tunnelService = getTunnelServiceStatus();
+      const needsProfile = !existsSync(profilePath);
+      if (launcherRuntimeOwned) {
+        if (tunnelService.installed || tunnelService.loaded) await uninstallTunnelService();
+        if (needsProfile || refreshTunnelWorker || explicitTunnelChange) {
         await bootstrapTunnelProfile(config);
       }
-    } else {
-      const needsOwnershipMigration = !tunnelService.installed || !tunnelService.loaded || !tunnelServiceDefinitionMatches(config);
-      if (needsOwnershipMigration || needsProfile) {
-        await assertServiceIdle(config);
+      } else {
+        const needsOwnershipMigration = !tunnelService.installed || !tunnelService.loaded || !tunnelServiceDefinitionMatches(config);
+        if (needsOwnershipMigration || needsProfile) {
+        await assertServiceIdle(existing ?? config);
         if (tunnelService.loaded) await stopTunnelService();
         await bootstrapTunnelProfile(config);
         installTunnelService(config);
       } else if (refreshTunnelWorker) {
-        await assertServiceIdle(config);
+        await assertServiceIdle(existing ?? config);
         await restartTunnelService();
       }
       const status = await waitForTunnelServiceReady(config);
@@ -396,14 +413,18 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
       tunnelReady = true;
     }
   }
-  if (launcherOwned && (beforeService.installed || beforeService.loaded)) {
+  if (launcherRuntimeOwned && (beforeService.installed || beforeService.loaded)) {
     await uninstallService(existing!);
   }
-  if (launcherOwned) saveConfig(config);
+  if (launcherBrowserHost) saveConfig(config);
+  if (gooseStandaloneBrowserHost) {
+    if (changedWhileLoaded && options.restartService && existing) await restartService(config, existing);
+    await waitForProxy(config, 30_000);
+  }
   // Keep the previous terminal runtime intact through the ownership handoff. A later launcher
   // setup removes it once the launcher-owned configuration is already the established baseline.
   const migratingTerminalRuntime = Boolean(
-    launcherOwned && existing && existing.browserHost !== "launcher",
+    launcherRuntimeOwned && existing && existing.browserHost !== "launcher",
   );
   if (!migratingTerminalRuntime) removeLegacyRuntimeArtifacts(config);
   installSetupCodexIntegration(config, options);
@@ -412,7 +433,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     mode: config.mode,
     configPath: getConfigPath(),
     loginCreated,
-    serviceLoaded: launcherOwned ? false : getServiceStatus().loaded,
+    serviceLoaded: launcherBrowserHost ? false : getServiceStatus().loaded,
     tunnelReady,
     codexRestartRequired: !options.standalone,
     connectorSetupRequired: config.mode === "full",
