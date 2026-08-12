@@ -5,7 +5,7 @@ import type { AppConfig } from "./config";
 import { assertDurableRuntimeCommand, atomicWriteFile, getConfigDir } from "./config";
 import { runCommand, runChecked } from "./process";
 
-const LABEL = "io.github.codex-chatgpt-web.daemon";
+export const SERVICE_LABEL = "io.github.codex-chatgpt-web.daemon";
 
 export interface ServiceStatus {
   supported: boolean;
@@ -24,8 +24,18 @@ function xml(value: string): string {
     .replaceAll("'", "&apos;");
 }
 
+export function legacyServiceLaunchAgentPath(home = homedir()): string {
+  return join(home, "Library", "LaunchAgents", `${SERVICE_LABEL}.plist`);
+}
+
+export function managedServiceDefinitionPath(configDir = getConfigDir()): string {
+  return join(configDir, "launchd", `${SERVICE_LABEL}.plist`);
+}
+
 function plistPath(): string {
-  return join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
+  const legacy = legacyServiceLaunchAgentPath();
+  const managed = managedServiceDefinitionPath();
+  return existsSync(legacy) || !existsSync(managed) ? legacy : managed;
 }
 
 function launchDomain(): string {
@@ -33,7 +43,7 @@ function launchDomain(): string {
 }
 
 function serviceTarget(): string {
-  return `${launchDomain()}/${LABEL}`;
+  return `${launchDomain()}/${SERVICE_LABEL}`;
 }
 
 async function bootstrapService(path: string, timeoutMs = 20_000): Promise<void> {
@@ -53,10 +63,10 @@ async function waitForServiceUnloaded(timeoutMs = 20_000): Promise<void> {
   while (getServiceStatus().loaded && Date.now() < deadline) {
     await new Promise(resolveWait => setTimeout(resolveWait, 50));
   }
-  if (getServiceStatus().loaded) throw new Error(`launchd did not unload ${LABEL} after ${timeoutMs}ms`);
+  if (getServiceStatus().loaded) throw new Error(`launchd did not unload ${SERVICE_LABEL} after ${timeoutMs}ms`);
 }
 
-function plist(config: AppConfig): string {
+export function serviceDefinition(config: AppConfig): string {
   const logDir = join(getConfigDir(), "logs");
   const args = [...config.runtimeCommand, "serve"];
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -64,7 +74,7 @@ function plist(config: AppConfig): string {
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${LABEL}</string>
+  <string>${SERVICE_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
 ${args.map(arg => `    <string>${xml(arg)}</string>`).join("\n")}
@@ -101,14 +111,14 @@ function assertMacOs(): void {
 }
 
 export function getServiceStatus(): ServiceStatus {
-  if (process.platform !== "darwin") return { supported: false, installed: false, loaded: false, label: LABEL };
+  if (process.platform !== "darwin") return { supported: false, installed: false, loaded: false, label: SERVICE_LABEL };
   const path = plistPath();
   const result = runCommand("launchctl", ["print", serviceTarget()]);
   return {
     supported: true,
     installed: existsSync(path),
     loaded: result.status === 0,
-    label: LABEL,
+    label: SERVICE_LABEL,
     definitionPath: path,
   };
 }
@@ -119,7 +129,7 @@ export function installService(config: AppConfig): ServiceStatus {
   const path = plistPath();
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   mkdirSync(join(getConfigDir(), "logs"), { recursive: true, mode: 0o700 });
-  const next = plist(config);
+  const next = serviceDefinition(config);
   if (!existsSync(path) || readFileSync(path, "utf8") !== next) atomicWriteFile(path, next);
   const status = getServiceStatus();
   if (!status.loaded) runChecked("launchctl", ["bootstrap", launchDomain(), path]);

@@ -388,7 +388,7 @@ function registerIpc({ logger, stateStore }) {
   handle("launcher:complete-onboarding", (_event, language) => {
     const current = stateStore.read();
     if (!current.githubOpened || !current.xOpened) throw new Error("Open the GitHub and X pages before continuing");
-    if (current.autoStart) setAutostart(app, true);
+    if (current.autoStart && !launcherBootstrapOnly) setAutostart(app, true);
     const next = stateStore.update({ language: validateLanguage(language), onboardingComplete: true });
     logger.info("launcher.onboarding_completed", { language: next.language });
     return next;
@@ -553,6 +553,7 @@ function registerIpc({ logger, stateStore }) {
   });
 
   handle("launcher:autostart", (_event, enabled) => {
+    if (launcherBootstrapOnly) throw new Error("Goose bootstrap-only autostart is owned by the canonical lifecycle");
     const desired = enabled === true;
     const autostart = setAutostart(app, desired);
     return {
@@ -667,7 +668,7 @@ async function start() {
       codexRestartRequired: false,
     });
   }
-  const autostart = getAutostart(app);
+  const autostart = launcherBootstrapOnly ? { supported: false, enabled: false } : getAutostart(app);
   if (stateStore.read().onboardingComplete && autostart.supported && stateStore.read().autoStart !== autostart.enabled) {
     setAutostart(app, stateStore.read().autoStart);
   }

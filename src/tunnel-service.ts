@@ -6,7 +6,7 @@ import { atomicWriteFile, getConfigDir } from "./config";
 import { runCommand, runChecked } from "./process";
 import type { TunnelRuntimeStatus } from "./tunnel";
 
-const LABEL = "io.github.codex-chatgpt-web.tunnel";
+export const TUNNEL_SERVICE_LABEL = "io.github.codex-chatgpt-web.tunnel";
 const TUNNEL_HEALTH_TIMEOUT_MS = 3_000;
 const TUNNEL_HEALTH_POLL_INTERVAL_MS = 1_000;
 
@@ -136,8 +136,18 @@ function xml(value: string): string {
     .replaceAll("'", "&apos;");
 }
 
+export function legacyTunnelLaunchAgentPath(home = homedir()): string {
+  return join(home, "Library", "LaunchAgents", `${TUNNEL_SERVICE_LABEL}.plist`);
+}
+
+export function managedTunnelDefinitionPath(configDir = getConfigDir()): string {
+  return join(configDir, "launchd", `${TUNNEL_SERVICE_LABEL}.plist`);
+}
+
 function plistPath(): string {
-  return join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
+  const legacy = legacyTunnelLaunchAgentPath();
+  const managed = managedTunnelDefinitionPath();
+  return existsSync(legacy) || !existsSync(managed) ? legacy : managed;
 }
 
 function launchDomain(): string {
@@ -145,7 +155,7 @@ function launchDomain(): string {
 }
 
 function serviceTarget(): string {
-  return `${launchDomain()}/${LABEL}`;
+  return `${launchDomain()}/${TUNNEL_SERVICE_LABEL}`;
 }
 
 function assertMacOs(): void {
@@ -163,7 +173,7 @@ export function tunnelServiceDefinition(config: AppConfig): string {
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${LABEL}</string>
+  <string>${TUNNEL_SERVICE_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
 ${args.map(arg => `    <string>${xml(arg)}</string>`).join("\n")}
@@ -192,7 +202,7 @@ ${args.map(arg => `    <string>${xml(arg)}</string>`).join("\n")}
 
 export function getTunnelServiceStatus(): TunnelServiceStatus {
   if (process.platform !== "darwin") {
-    return { supported: false, installed: false, loaded: false, running: false, label: LABEL };
+    return { supported: false, installed: false, loaded: false, running: false, label: TUNNEL_SERVICE_LABEL };
   }
   const path = plistPath();
   const result = runCommand("launchctl", ["print", serviceTarget()]);
@@ -201,7 +211,7 @@ export function getTunnelServiceStatus(): TunnelServiceStatus {
     installed: existsSync(path),
     loaded: result.status === 0,
     running: result.status === 0 && /^\s*state = running\s*$/m.test(result.stdout),
-    label: LABEL,
+    label: TUNNEL_SERVICE_LABEL,
     definitionPath: path,
   };
 }
@@ -241,7 +251,7 @@ async function waitForTunnelServiceUnloaded(timeoutMs = 20_000): Promise<void> {
   while (getTunnelServiceStatus().loaded && Date.now() < deadline) {
     await new Promise(resolveWait => setTimeout(resolveWait, 50));
   }
-  if (getTunnelServiceStatus().loaded) throw new Error(`launchd did not unload ${LABEL} after ${timeoutMs}ms`);
+  if (getTunnelServiceStatus().loaded) throw new Error(`launchd did not unload ${TUNNEL_SERVICE_LABEL} after ${timeoutMs}ms`);
 }
 
 export async function stopTunnelService(): Promise<TunnelServiceStatus> {

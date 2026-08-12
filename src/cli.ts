@@ -5,6 +5,7 @@ import { timingSafeEqual } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
 import { stdin, stdout } from "node:process";
 import { checkBrowserEngine, loginToChatGpt } from "./browser-login";
+import { disableAutostart, getAutostartStatus, installAutostart, triggerAutostart } from "./autostart";
 import { getConfigDir, getConfigPath, loadConfig, loadConfigForSetup } from "./config";
 import { inspectLauncherBrowserHost, readLauncherBrowserHostDescriptor } from "./launcher-browser-host";
 import {
@@ -36,6 +37,7 @@ Usage:
   codex-chatgpt-web route <status|connect|disconnect>
   codex-chatgpt-web browser check
   codex-chatgpt-web lifecycle <status|start|restart|stop>
+  codex-chatgpt-web autostart <status|install|trigger|disable>
   codex-chatgpt-web serve
   codex-chatgpt-web mcp [--broker-socket PATH]
   codex-chatgpt-web service <status|install|start|restart|stop|cancel-turns>
@@ -279,6 +281,18 @@ async function lifecycleCommand(args: string[]): Promise<void> {
   stdout.write(`${JSON.stringify(result, null, 2)}\n`);
 }
 
+async function autostartCommand(args: string[]): Promise<void> {
+  const action = args.shift() ?? "status";
+  assertNoArgs(args);
+  const status = action === "status" ? getAutostartStatus()
+    : action === "install" ? installAutostart(loadConfig())
+      : action === "trigger" ? triggerAutostart()
+        : action === "disable" ? disableAutostart()
+          : undefined;
+  if (!status) throw new Error(`Unknown autostart action: ${action}`);
+  stdout.write(`${JSON.stringify(status, null, 2)}\n`);
+}
+
 async function openCommand(args: string[]): Promise<void> {
   const target = args.shift();
   assertNoArgs(args);
@@ -329,6 +343,7 @@ async function uninstallCommand(args: string[]): Promise<void> {
     throw new Error("Service exists but configuration is missing; refusing an unverifiable uninstall");
   }
   const launcherRuntimeStopped = config?.browserHost === "launcher" && launcherControl;
+  if (process.platform === "darwin" && getAutostartStatus().installed) disableAutostart();
   if (config && process.platform === "darwin" && !launcherRuntimeStopped) await assertServiceIdle(config);
   if (config?.mode === "full" && !launcherRuntimeStopped) {
     if (process.platform === "darwin") await uninstallTunnelService();
@@ -388,6 +403,7 @@ async function main(): Promise<void> {
   else if (command === "service") await serviceCommand(args);
   else if (command === "tunnel") await tunnelCommand(args);
   else if (command === "lifecycle") await lifecycleCommand(args);
+  else if (command === "autostart") await autostartCommand(args);
   else if (command === "open") await openCommand(args);
   else if (command === "uninstall") await uninstallCommand(args);
   else throw new Error(`Unknown command: ${command}\n\n${HELP}`);
