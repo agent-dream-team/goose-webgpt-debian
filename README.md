@@ -1,238 +1,116 @@
-<h1 align="center">ChatGPT Web for Codex</h1>
+# goose-chatgpt-web
 
-<p align="center">
-  <strong>Use ChatGPT Web (including Pro) as native Codex models.</strong><br>
-  Change the model tier, save your workflow.
-</p>
+Use an authenticated ChatGPT Web session as a model/provider inside ordinary Goose while Goose remains the owner of the agent session and project execution.
 
-<p align="center">
-  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
-</p>
-
-<p align="center">
-  <a href="https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml"><img src="https://github.com/miuuyy/codex-chatgpt-web/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
-  <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20x64-black?logo=apple" alt="macOS arm64 and x64">
-  <img src="https://img.shields.io/badge/Windows-x64-0078d4?logo=windows11" alt="Windows x64">
-  <img src="https://img.shields.io/badge/Linux-x64-fcc624?logo=linux&logoColor=black" alt="Linux x64">
-  <img src="https://img.shields.io/badge/Free_AI-no_API_fees-10a37f" alt="Free AI with no API fees">
-</p>
-
-Pick **ChatGPT Web — Instant**, **Medium**, **High**, **Extra High**, or **Pro** in Codex's native
-model picker. The bridge sends the complete Codex task context to a fresh ChatGPT Temporary Chat,
-attaches images, and streams visible reasoning, tool activity, and Markdown back into the same
-Codex task.
-
-<p align="center">
-  <img src="assets/demo.gif" alt="ChatGPT Web running inside the native Codex harness" width="960">
-</p>
+## Current architecture
 
 ```text
-Codex task ──Responses + SSE──▶ codex-chatgpt-web ──embedded browser──▶ ChatGPT
-     ▲                                │                                      │
-     └──────── native UI, context, images, tracing, and tool lifecycle ──────┘
+Goose
+  │ custom ChatGPT-Web Responses provider
+  ▼
+independently supervised Responses daemon (loopback)
+  │ browser helper
+  ▼
+bootstrap-only Electron BrowserHost
+  ▼
+authenticated ChatGPT Temporary Chat
+
+Full-mode tool path:
+ChatGPT → Goose Native connector → Secure MCP Tunnel → active Goose tool contract
+                                                    → Goose executes/approves
 ```
 
-Codex keeps the native task, context lifecycle, UI, and tool harness. The local Responses bridge
-routes only the selected model turn through a fresh ChatGPT Temporary Chat; in full mode, MCP
-connects ChatGPT back to the tools of that same Codex task.
+Ownership is deliberate:
 
-## Highlights
+| Component | Current responsibility |
+| --- | --- |
+| **Goose** | logical conversation/session state, tools and approvals, delegation/subagents, recipes/extensions, project execution, compaction/context lifecycle |
+| **Responses daemon** | loopback Responses transport, bounded response replay state, capability broker, browser-helper lifecycle |
+| **Electron BrowserHost** | authenticated ChatGPT partition, task-bound browser surfaces, BrowserHost control endpoint, CDP endpoint |
+| **Secure MCP Tunnel** | independently supervised outbound connector/tool transport |
+| **ChatGPT Web** | model inference for the selected provider turn |
 
-- **A polished cross-platform launcher.** One command installs the native macOS, Windows, or Linux
-  app. It keeps sign-in, setup, smoke testing, MCP guidance, runtime health, and local logs in one
-  place, while the embedded browser lets you watch every ChatGPT turn as it happens. Up to five
-  task-bound browser tabs can run in parallel; the cap avoids excessive parallel account traffic.
-- **ChatGPT is the selected model.** It runs as a native Codex model, not as a tool called by
-  another host model. The original model picker, task lifecycle, streaming, tracing, and tool UI
-  remain intact.
-- **Local-first task sessions.** Codex remains the source of truth for task history on your
-  computer. Every browser turn starts in a fresh ChatGPT Temporary Chat and receives the complete
-  accumulated Codex context, so browser chats are not reused across tasks or added to normal
-  ChatGPT history.
-- **The full Codex harness over MCP.** In full mode, Instant through Extra High can use the active
-  Codex task's filesystem, shell, images, approvals, and configured tools/apps through MCP. Calls
-  and real results stay inside the same browser response—nothing is simulated as text.
-- **Pro stays useful.** Pro is the one exception: ChatGPT's current Pro mode does not expose the
-  custom MCP connector this bridge needs. Its native capabilities, including web search and
-  research, remain available. Gather local workspace context with Instant through Extra High,
-  switch to Pro, and Pro receives the complete accumulated Codex task for deeper analysis.
-- **Fail-closed and manually tested.** Model selection, long inline context, images, streaming,
-  visible trace, compaction, native tool rounds, cancellation, and Pro were exercised end-to-end on
-  macOS and Windows 11. UI drift and missing capabilities produce explicit errors rather than
-  silent fallbacks.
+Electron owns BrowserHost only. It does **not** own the Responses daemon or the tunnel. Do not restore standalone daemon/tunnel ownership to Electron `RuntimeSupervisor`.
 
-Temporary Chat is a ChatGPT privacy mode, not anonymity or local-only inference: prompts are still
-processed by OpenAI and are subject to the account's settings and OpenAI's
-[Temporary Chat policy](https://help.openai.com/en/articles/8914046-temporary-chat-faq). This project
-is unofficial; users remain responsible for complying with applicable OpenAI terms and workspace
-policies.
+## Qualified runtime checkpoint
 
-## Quick start
+Status as of 2026-08-12: **current/proven**, with one explicitly unrun autostart proof.
 
-Install or update the desktop launcher. To update or repair an existing installation, quit the
-launcher and run the same command again; it replaces the application and embedded runtime while
-preserving the ChatGPT profile and launcher configuration.
+The known-good Electron checkpoint is `c624274` (`Checkpoint proven Electron lifecycle and Goose inference`). Current `main` then adds `dd44b74` (`Add ordered macOS autostart coordinator`).
 
-**macOS or Linux**
+The canonical lifecycle is:
+
+```text
+start: tunnel ready → BrowserHost genuinely ready → Responses daemon ready
+stop:  Responses daemon → BrowserHost → tunnel
+```
+
+BrowserHost readiness is stronger than PID/descriptor/CDP existence. The authoritative readiness path leases one disposable BrowserHost surface and verifies it with the descriptor-provided browser helper running through Node/Electron Node semantics (`ELECTRON_RUN_AS_NODE=1`), then releases the lease. Bun-direct Playwright/CDP is not authoritative BrowserHost-health evidence.
+
+Ordinary Goose continuation is proven with a persisted named Goose session followed by a separate later `--resume`. A fresh ChatGPT Temporary Chat for a later Goose turn is expected and does not mean the Goose session failed to continue.
+
+The earlier failed in-task lifecycle/autostart proof was narrowed to **self-interference**: an active BrowserHost-backed turn was testing lifecycle behavior of the same runtime it depended on. It is not evidence of a general Electron regression.
+
+## Ordered macOS autostart
+
+Ordered autostart is implemented on current `main`:
+
+- one login-visible project coordinator LaunchAgent;
+- daemon/tunnel launchd definitions managed under the Goose runtime home rather than independently login-visible;
+- coordinator invokes canonical `lifecycle start`;
+- coordinator uses `KeepAlive=false`;
+- launchd remains the daemon/tunnel supervisor after canonical startup;
+- canonical lifecycle health, a fresh ordinary Goose turn, and a separate dependent `--resume` continuation have passed.
+
+**NOT RUN:** an actual Mac reboot/login reconstruction proof. Do not describe reboot/login recovery as validated until that exact proof is performed.
+
+Operator entry points remain the current legacy-named executable surface:
 
 ```bash
-curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.sh | sh
+codex-chatgpt-web lifecycle <status|start|restart|stop>
+codex-chatgpt-web autostart <status|install|trigger|disable>
 ```
 
-**Windows PowerShell**
+Those literal names are inherited implementation identifiers; they do not change the Goose-first ownership model above.
 
-```powershell
-irm https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/install-launcher.ps1 | iex
+## Next active milestone — Goose Control
+
+Goose Control is now the next active project milestone. It is a Planner-to-Goose management path and is separate from both Electron BrowserHost identity and Goose Native's per-turn `turn_token` authority.
+
+The settled backend is authenticated loopback `goose serve` ACP. The first practical Planner-facing proof is intentionally small:
+
+```text
+ChatGPT Planner
+  → private custom GPT in the existing web conversation
+  → GPT Action
+  → narrow authenticated HTTPS REST/OpenAPI Goose Control facade
+  → authenticated loopback Goose ACP
+  → one hard-approved persisted Goose session
 ```
 
-Then complete the three checks in the app:
+The first proof is continuation-only and synchronous/bounded: one idempotent `submit_turn` request with mandatory `request_id`, returning only the final user-visible Goose result. Async jobs, cancellation, multiple targets, fresh sessions, and Orchestrator/Palmate remain later phases.
 
-1. Sign in to ChatGPT in the embedded browser.
-2. Run the browser smoke test.
-3. Press **Install models**, restart Codex once, and select a **ChatGPT Web — …** model.
+See [`docs/goose-control-plan.md`](docs/goose-control-plan.md).
 
-Pro appears only when the signed-in account exposes it. The separate **MCP** page is optional and
-guides the full-harness setup without terminal commands.
+## Documentation
 
-A packaged browser-only install needs no Google Chrome, model API key, system Node/Bun, or separate
-browser download.
+Start with [`docs/README.md`](docs/README.md). It classifies current, active, deferred, and historical material.
 
-**Run from source**
-
-```bash
-git clone https://github.com/miuuyy/codex-chatgpt-web.git && \
-cd codex-chatgpt-web && \
-bun run app
-```
-
-This source path requires Bun 1.3.14. The command installs locked dependencies and opens the app.
-
-## Modes
-
-| Mode | Models | Local Codex tools | Extra setup |
-| --- | --- | --- | --- |
-| **Browser-only** | Plus: Instant–High; Pro: adds Extra High and Pro | No; Codex shows a warning | None |
-| **Full harness** | Plus: Instant–High; Pro: adds Extra High and Pro | Instant–Extra High: yes; Pro: read-only | OpenAI tunnel + ChatGPT connector |
-
-Every picker entry has one fixed ChatGPT mode. Codex still displays its built-in Effort and Speed
-rows, but changing them cannot silently change the selected browser model. Pro receives the full
-context already collected by Codex, but ChatGPT Pro cannot initiate local MCP/tool calls.
-
-## Full harness
-
-Full mode connects ChatGPT's tool calls back to the current Codex or Goose task through the
-official [OpenAI tunnel-client](https://github.com/openai/tunnel-client). The tunnel is outbound:
-it does not expose a public IP, open an inbound port, or require router forwarding.
-
-> [!WARNING]
-> Create a **new** connector named **Goose Native** and set its permissions to **Allow all
-> actions**. Do not rename, refresh, or reuse an older **Codex Native** connector: ChatGPT caches a
-> connector's public MCP contract (tool schema and granted action permission) by connector
-> identity, so reusing an old identity keeps enforcing its old, narrower permission grant instead
-> of the current tool set — this is what silently blocks calls like `codex_exec`,
-> `codex_tool_call`, or a Goose-owned tool such as `delegate` before they ever run. **Allow low-risk
-> actions** blocks command and tool calls before they reach this runtime; the outer harness (Codex
-> or Goose) still enforces its own sandbox and approvals independently.
-
-1. Finish the required launcher setup.
-2. Open **MCP** in the launcher. Create the Tunnel and a regular API key on the same OpenAI account
-   that will use the ChatGPT connector; creating the key is free and does not consume model API
-   credits.
-3. Paste the Tunnel ID and API key, then press **Connect harness**.
-4. Enable **Developer Mode** in ChatGPT settings. Create a **new** connector using **Tunnel**,
-   select that exact Tunnel, set **Authentication** to **None**, and name it exactly
-   `Goose Native`.
-5. Open **Permissions** and choose **Allow all actions**, then run **Verify runtime**. Verification
-   types and accepts the full `@Goose Native` mention, then confirms the connector pill.
-6. If an older `Codex Native` connector exists, leave it untouched. Do not rename or refresh it:
-   this release's local runtime rejects a legacy-only connector explicitly instead of silently
-   reusing its stale contract and permission grant.
-
-Write/modify actions require a ChatGPT workspace and admin policy that permit them. OpenAI
-currently documents those actions for Business and Enterprise/Edu workspaces; personal Pro is
-limited to read/fetch MCP permissions. See
-[developer mode and MCP apps](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt).
-Unexpected approval prompts fail closed unless `--auto-approve-tool-calls` is explicitly enabled;
-that option clicks **Allow once**, never a permanent grant.
-
-## Operations
-
-Use **Activity** for structured local logs and **Settings → Run doctor** for end-to-end health
-checks. Use **Settings → Cancel retained browser turn** if a stopped task leaves ChatGPT working,
-and **Settings → Remove Codex integration** before deleting the launcher so the previous Codex
-route is restored.
-
-For deterministic operator control, use `codex-chatgpt-web lifecycle <status|start|restart|stop>`.
-That command starts tunnel, bootstrap-only BrowserHost, and daemon in the proved order and reuses
-the same bootstrap-only launcher shutdown path on stop/restart. The BrowserHost readiness proof is
-helper-based: it acquires exactly one disposable lifecycle surface, verifies that leased surface
-through the Node-side launcher helper, releases the lease in `finally`, then confirms the host is
-idle again. Do not treat Bun-direct Playwright CDP as authoritative BrowserHost-health evidence.
-
-The currently proven live checkpoint, dated `2026-08-12`, is:
-
-1. `lifecycle stop`
-2. daemon unloaded
-3. BrowserHost descriptor missing
-4. tunnel unloaded
-5. `lifecycle start`
-6. tunnel ready
-7. bootstrap-only BrowserHost ready
-8. authenticated ChatGPT Temporary Chat ready
-9. one disposable lifecycle surface acquired and helper-verified
-10. surface released
-11. BrowserHost idle/usable
-12. daemon healthy and idle
-13. ordinary Goose named turn passed
-14. separate named `--resume` continuation passed
-
-Use the active runtime home `/Users/luke/.goose-chatgpt-web-dev` for this checkpoint. Goose owns
-conversation/session state, tools, delegation, approvals, recipes, and compaction. Electron owns
-BrowserHost only. Electron does not own daemon or tunnel.
-
-Do not regress:
-
-- do not recouple daemon/tunnel ownership to Electron RuntimeSupervisor;
-- do not use Bun-direct Playwright as BrowserHost-health authority;
-- do not use one compound retry loop spanning session inspection and leased-turn operations;
-- disposable leases must be released in `finally`;
-- do not overwrite original causal errors with later retry symptoms;
-- do not use stdin-interactive Goose as the continuation proof;
-- fresh ChatGPT Temporary Chat surfaces per Goose turn are expected and are not a continuation failure;
-- do not use raw `previous_response_id` as a substitute for Goose/native turn metadata.
-
-## Limitations and security
-
-- This is unofficial browser automation, not an OpenAI API. ChatGPT UI changes can break selectors;
-  drift fails explicitly instead of silently switching model or transport.
-- Browser state is a sensitive login artifact, and the loopback listener is reachable by processes
-  running as the same local user. Never share the launcher profile; use a trusted workstation.
-- Release packages currently target macOS 13+ (arm64/x64), Windows x64, and Linux x64. The browser
-  flow is manually exercised end-to-end on macOS and Windows 11; runtime, tests, and native
-  packaging are gated on all three operating systems in CI.
-- Until platform signing credentials are configured for a release, macOS Gatekeeper or Windows
-  SmartScreen may show an unknown-publisher warning. The one-command installers verify the
-  published SHA-256 manifest before installation.
-
-Read the complete [architecture](docs/architecture.md) and
-[security model](docs/security-model.md) before enabling full mode. Report vulnerabilities through
-[SECURITY.md](SECURITY.md).
+- [`docs/architecture.md`](docs/architecture.md) — current ownership and request/tool flow.
+- [`docs/runtime-lifecycle.md`](docs/runtime-lifecycle.md) — canonical lifecycle, BrowserHost readiness, autostart status, and proof boundaries.
+- [`docs/goose-control-plan.md`](docs/goose-control-plan.md) — next active Goose Control milestone.
+- [`docs/roadmap.md`](docs/roadmap.md) — current and next work only.
+- [`docs/security-model.md`](docs/security-model.md) — trust and capability boundaries.
+- [`AGENTS.md`](AGENTS.md) — mandatory rules for coding/automation agents.
 
 ## Development
 
+This repository currently uses Bun for the TypeScript/runtime toolchain and Electron/Node semantics for the BrowserHost helper. Before merging runtime changes, use the repository's normal verification suite:
+
 ```bash
-bun run app
+bun install --frozen-lockfile
+bun install --frozen-lockfile --cwd launcher
 bun run verify
-bun run app:package
 ```
 
-- [Architecture](docs/architecture.md)
-- [Security model](docs/security-model.md)
-- [Contributing](CONTRIBUTING.md)
-
-## Disclaimer
-
-This is independent software and is not affiliated with or endorsed by OpenAI. Use it only with
-your own account and in accordance with applicable [Terms of Use](https://openai.com/policies/terms-of-use/)
-and workspace policies; it does not bypass authentication or access controls.
+This project automates a user-authenticated ChatGPT web session; it is not a supported model API or a usage-limit bypass. Browser authentication state and tunnel/runtime credentials are sensitive local state. See [`SECURITY.md`](SECURITY.md) and [`docs/security-model.md`](docs/security-model.md).

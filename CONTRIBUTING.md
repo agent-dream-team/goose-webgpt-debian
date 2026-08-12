@@ -1,30 +1,39 @@
 # Contributing
 
-Keep the project narrow: ChatGPT web-backed Codex models only. Generic providers and unrelated
-OpenCodex product surfaces are out of scope.
+Keep the project narrow: ChatGPT Web is a model/provider inside ordinary Goose. Goose remains the outer harness and owns sessions, tools/approvals, delegation, recipes/extensions, project execution, and context lifecycle.
 
-Core invariants:
+## Core invariants
 
 - Model selection is explicit; never silently fall back to another model or reasoning level.
-- Full mode exposes local tools only through the active outer Codex registry and official MCP
-  tunnel.
-- Browser-only mode never creates a broker capability or attaches an MCP connector; Pro remains
-  read-only in every mode.
-- Browser state, API keys, tunnel IDs, cookies, Codex history, and absolute user paths never enter
-  the repository.
+- Full mode exposes local actions only through the active Goose tool contract and the `Goose Native` connector path.
+- Goose remains the executor/approval authority for local tools.
+- Electron BrowserHost owns browser state/surfaces only; it must not adopt the standalone Responses daemon or Secure MCP Tunnel.
+- The daemon and tunnel remain independently supervised.
+- Browser-only mode never creates a local-tool capability.
+- Browser authentication state, runtime/tunnel credentials, Goose history, and private absolute user paths never enter the repository.
+- UI drift and runtime-readiness failures fail closed rather than selecting another provider/transport or claiming success.
 
-Before opening a pull request:
+## Architecture and lifecycle changes
 
-1. Run `bun install --frozen-lockfile`, `bun install --frozen-lockfile` in `launcher/`, and
-   `bun run verify`.
-2. Add a focused regression test for protocol, compaction, MCP, browser parsing, or installer changes.
-3. Do not commit cookies, browser state, tunnel ids, API keys, local absolute paths, or generated logs.
-4. Preserve fail-closed behavior. A UI selector failure must not pick another model or claim success.
-5. Keep Terms/trademark claims factual and never market the project as quota or rate-limit bypass.
+Read `docs/README.md`, `docs/architecture.md`, and `docs/runtime-lifecycle.md` first.
 
-Browser UI changes should include the exact observed DOM evidence and a reproducible test fixture.
-Do not broaden selectors speculatively.
+Before changing lifecycle behavior:
 
-Launcher changes must preserve native packaging on macOS, Windows, and Linux. Each package embeds a
-platform-matched Bun runtime, so build it on the matching OS rather than cross-packaging. CI runs
-the full verification and native package job on all three operating systems.
+1. establish which component owns the process;
+2. preserve the canonical dependency order unless a focused qualification deliberately changes it;
+3. verify BrowserHost readiness with the descriptor-provided Node/Electron Node helper path, not Bun-direct Playwright/CDP;
+4. do not run a disruptive lifecycle proof from the Goose/BrowserHost turn whose runtime is being disrupted;
+5. never restart the Goose host carrying your own session.
+
+## Goose Control changes
+
+Read `docs/goose-control-plan.md` first. Keep the ACP core independent of the Planner-facing transport. Do not couple Goose Control to Electron/BrowserHost identity, Goose Native turn tokens, or Orchestrator/Palmate.
+
+## Before opening a pull request
+
+1. Run the focused tests for the changed area and the repository verification suite appropriate to the change.
+2. Add focused regression coverage for protocol, compaction, MCP, browser parsing/lifecycle, installer, or supervision changes.
+3. Do not commit cookies, browser state, tunnel IDs/keys, local absolute paths, generated descriptors, or logs.
+4. Preserve fail-closed behavior.
+5. For browser UI changes, record exact observed evidence and add a reproducible fixture/test where practical.
+6. Keep claims factual; this project is browser automation and is not a usage-limit bypass.
