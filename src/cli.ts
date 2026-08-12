@@ -14,6 +14,7 @@ import {
   uninstallCodexIntegration,
 } from "./codex-integration";
 import { formatDoctorReport, runDoctor } from "./doctor";
+import { getLifecycleStatus, restartLifecycle, startLifecycle, stopLifecycle } from "./lifecycle";
 import { runChatGptMcpMain } from "./adapters/chatgpt-web/mcp-main";
 import { runCommand } from "./process";
 import { startServer } from "./server";
@@ -34,6 +35,7 @@ Usage:
   codex-chatgpt-web doctor [--json]
   codex-chatgpt-web route <status|connect|disconnect>
   codex-chatgpt-web browser check
+  codex-chatgpt-web lifecycle <status|start|restart|stop>
   codex-chatgpt-web serve
   codex-chatgpt-web mcp [--broker-socket PATH]
   codex-chatgpt-web service <status|install|start|restart|stop|cancel-turns>
@@ -264,6 +266,19 @@ async function tunnelCommand(args: string[]): Promise<void> {
   if (action !== "stop" && (!service.running || !status.ok)) process.exitCode = 1;
 }
 
+async function lifecycleCommand(args: string[]): Promise<void> {
+  const action = args.shift() ?? "status";
+  assertNoArgs(args);
+  const result = action === "status"
+    ? await getLifecycleStatus()
+    : action === "start" ? await startLifecycle()
+      : action === "restart" ? await restartLifecycle()
+        : action === "stop" ? await stopLifecycle()
+          : undefined;
+  if (!result) throw new Error(`Unknown lifecycle action: ${action}`);
+  stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+}
+
 async function openCommand(args: string[]): Promise<void> {
   const target = args.shift();
   assertNoArgs(args);
@@ -372,6 +387,7 @@ async function main(): Promise<void> {
   } else if (command === "mcp") await runChatGptMcpMain(args);
   else if (command === "service") await serviceCommand(args);
   else if (command === "tunnel") await tunnelCommand(args);
+  else if (command === "lifecycle") await lifecycleCommand(args);
   else if (command === "open") await openCommand(args);
   else if (command === "uninstall") await uninstallCommand(args);
   else throw new Error(`Unknown command: ${command}\n\n${HELP}`);

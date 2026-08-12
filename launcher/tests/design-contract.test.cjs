@@ -211,6 +211,20 @@ test("launcher bootstrap-only mode skips runtime migration startup while preserv
   assert.match(electronMain, /if \(launcherBootstrapOnly\) \{\s*logger\.info\("launcher\.bootstrap_only"/s);
 });
 
+test("bootstrap-only shutdown releases the browser host without stopping the external runtime", () => {
+  const start = electronMain.indexOf("if (launcherBootstrapOnly) {");
+  const bootstrapOnly = electronMain.slice(start, electronMain.indexOf("\n  }", start));
+  assert.match(bootstrapOnly, /process\.once\("SIGTERM", \(\) => \{ void releaseBrowserHost\(\); \}\)/);
+  assert.match(bootstrapOnly, /process\.once\("SIGINT", \(\) => \{ void releaseBrowserHost\(\); \}\)/);
+  assert.match(bootstrapOnly, /app\.on\("before-quit"[\s\S]*?void releaseBrowserHost\(\)/);
+  assert.match(bootstrapOnly, /await browserHost\?\.persistSession\(\)/);
+  assert.match(bootstrapOnly, /browserHost\?\.destroy\(\)/);
+  assert.match(bootstrapOnly, /await browserControl\?\.close\(\)/);
+  // Standalone Goose owns the daemon and tunnel; adopting them here would recouple that ownership.
+  const executable = bootstrapOnly.replace(/^\s*\/\/.*$/gm, "");
+  assert.doesNotMatch(executable, /runtimeSupervisor|requestQuit/);
+});
+
 test("launcher reminds authenticated users to refresh the private ChatGPT session every 48 hours", () => {
   assert.match(electronMain, /sessionRefreshReminderAt:\s*nextSessionRefreshReminderAt\(\)/);
   assert.match(electronMain, /launcher:session-reminder-dismiss/);

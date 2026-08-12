@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import type { Page } from "playwright-core";
-import { CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_PROMPT_INSERT_CHUNK_CHARS, ChatGptBrowserWorker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_TABS, assertChatGptWebInputWithinContextWindow, browserDiagnosticCheckpoint, captureChatGptBrowserDiagnosticScreenshot, chatGptPromptChunkEnd, chatGptSubmissionEvidence, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_PROMPT_INSERT_CHUNK_CHARS, ChatGptBrowserWorker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_TABS, assertChatGptWebInputWithinContextWindow, browserDiagnosticCheckpoint, captureChatGptBrowserDiagnosticScreenshot, chatGptGenerationRunningLabelMatches, chatGptPromptChunkEnd, chatGptSubmissionEvidence, chatGptSubmissionEvidenceAfterSend, isChatGptGenerationRunning, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert } from "../src/adapters/chatgpt-web/browser-worker";
 import { CHATGPT_CONNECTOR_NAME, defaultChromeExecutable } from "../src/config";
 
 test("Codex context uses the owned CDP composer transport, never the operating-system clipboard", () => {
@@ -17,6 +17,12 @@ test("completed prompts activate the scoped semantic send control", () => {
   expect(workerSource).toContain('.getByTestId("send-button")');
   expect(workerSource).toContain('await sendButton.press("Enter")');
   expect(workerSource).not.toContain('getByTestId("send-button").dispatchEvent("click")');
+});
+
+test("send-stage generation detection treats a visible stop control as live generation", () => {
+  expect(chatGptGenerationRunningLabelMatches("Stop generating")).toBeTrue();
+  expect(chatGptGenerationRunningLabelMatches("Cancel generating")).toBeTrue();
+  expect(chatGptGenerationRunningLabelMatches("Continue")).toBeFalse();
 });
 
 test("browser turns run concurrently up to the five-tab limit", async () => {
@@ -1189,6 +1195,7 @@ test("submission acceptance stops when its stage is aborted", async () => {
       responseTurn: unknown,
       initialUserTurnCount: number,
       initialResponseTurnCount: number,
+      initialGenerationRunning: boolean,
       signal: AbortSignal,
     ): Promise<unknown>;
   }).waitForSubmissionAccepted;
@@ -1203,6 +1210,7 @@ test("submission acceptance stops when its stage is aborted", async () => {
     {},
     0,
     0,
+    false,
     controller.signal,
   )).rejects.toMatchObject({ name: "AbortError" });
 });
@@ -1216,6 +1224,7 @@ test("a rate-limit dialog during the send/acknowledgement wait surfaces as an ex
       responseTurn: unknown,
       initialUserTurnCount: number,
       initialResponseTurnCount: number,
+      initialGenerationRunning: boolean,
       signal?: AbortSignal,
     ): Promise<unknown>;
   }).waitForSubmissionAccepted;
@@ -1246,6 +1255,7 @@ test("a rate-limit dialog during the send/acknowledgement wait surfaces as an ex
     responseTurn,
     0,
     0,
+    false,
   )).rejects.toMatchObject({
     name: "ChatGptWebAdapterError",
     status: 429,
@@ -1627,6 +1637,25 @@ test("browser DOM health fails closed on a vanished or empty ChatGPT response", 
   expect(missingCompletionAction.update(completedWithoutMarker, 1_000)).toBeUndefined();
   expect(missingCompletionAction.update(completedWithoutMarker, 1_749)).toBeUndefined();
   expect(missingCompletionAction.update(completedWithoutMarker, 1_750)).toContain("DOM may have changed");
+
+  const remount = new ChatGptTurnDomHealthTracker(1_000, 500, 750);
+  const visibleRunning = {
+    responsePresent: true,
+    running: true,
+    currentText: "",
+    completionActionVisible: false,
+  };
+  expect(remount.update(visibleRunning, 1_000)).toBeUndefined();
+  expect(remount.update({ ...visibleRunning, responsePresent: false }, 61_000)).toBeUndefined();
+  expect(remount.update({ ...visibleRunning, responsePresent: true }, 61_250)).toBeUndefined();
+  const visibleCompleted = {
+    responsePresent: true,
+    running: false,
+    currentText: "complete answer",
+    completionActionVisible: true,
+  };
+  expect(remount.update(visibleCompleted, 62_000)).toBeUndefined();
+  expect(remount.update(visibleCompleted, 64_000)).toBeUndefined();
 });
 
 test("stalled-turn diagnostics record DOM metrics without response or overlay content", () => {
@@ -1661,6 +1690,10 @@ test("browser send accepts only conclusive ChatGPT submission evidence", () => {
   expect(chatGptSubmissionEvidence({ ...idle, userTurnCount: 2 })).toBe("user_turn");
   expect(chatGptSubmissionEvidence({ ...idle, assistantTurnCount: 3 })).toBe("assistant_turn");
   expect(chatGptSubmissionEvidence({ ...idle, generationRunning: true })).toBe("generation_running");
+  expect(chatGptSubmissionEvidenceAfterSend({ ...idle, initialGenerationRunning: false, generationRunning: true }))
+    .toBe("generation_running");
+  expect(chatGptSubmissionEvidenceAfterSend({ ...idle, initialGenerationRunning: true, generationRunning: true }))
+    .toBeUndefined();
   expect(workerSource).toContain("waitForSubmissionAccepted");
   expect(workerSource).not.toContain("userTurns.nth(initialUserTurnCount).waitFor");
 });

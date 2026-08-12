@@ -281,6 +281,36 @@ export function chatGptTurnIsComplete(state: {
 
 export type ChatGptSubmissionEvidence = "user_turn" | "assistant_turn" | "generation_running";
 
+export function chatGptGenerationRunningLabelMatches(text: string): boolean {
+  const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
+  return /\bstop\b/.test(normalized) || /\bcancel\b/.test(normalized);
+}
+
+export async function isChatGptGenerationRunning(page: Page): Promise<boolean> {
+  return page.evaluate(() => {
+    const visible = (element: Element): boolean => {
+      const candidate = element as HTMLElement;
+      const style = getComputedStyle(candidate);
+      const rect = candidate.getBoundingClientRect();
+      return style.display !== "none"
+        && style.visibility !== "hidden"
+        && style.opacity !== "0"
+        && rect.width > 0
+        && rect.height > 0;
+    };
+    const labels = (candidate: HTMLElement): string[] => [
+      candidate.getAttribute("aria-label") ?? "",
+      candidate.getAttribute("title") ?? "",
+      candidate.innerText ?? "",
+    ]
+      .map(text => text.replace(/\s+/g, " ").trim().toLowerCase())
+      .filter(Boolean);
+    return [...document.querySelectorAll("button")]
+      .filter(visible)
+      .some(candidate => labels(candidate).some(chatGptGenerationRunningLabelMatches));
+  }).catch(() => false);
+}
+
 export function chatGptSubmissionEvidence(state: {
   initialUserTurnCount: number;
   userTurnCount: number;
@@ -292,6 +322,19 @@ export function chatGptSubmissionEvidence(state: {
   if (state.assistantTurnCount > state.initialAssistantTurnCount) return "assistant_turn";
   if (state.generationRunning) return "generation_running";
   return undefined;
+}
+
+export function chatGptSubmissionEvidenceAfterSend(state: {
+  initialUserTurnCount: number;
+  userTurnCount: number;
+  initialAssistantTurnCount: number;
+  assistantTurnCount: number;
+  generationRunning: boolean;
+  initialGenerationRunning: boolean;
+}): ChatGptSubmissionEvidence | undefined {
+  const evidence = chatGptSubmissionEvidence(state);
+  if (evidence !== "generation_running") return evidence;
+  return state.initialGenerationRunning ? undefined : evidence;
 }
 
 export class ChatGptCompletionTracker {
@@ -335,11 +378,12 @@ export class ChatGptTurnDomHealthTracker {
       this.sawResponse = true;
       this.missingResponseSince = undefined;
     } else {
+      if (this.sawResponse) {
+        return undefined;
+      }
       this.missingResponseSince ??= now;
       if (now - this.missingResponseSince >= this.missingResponseMs) {
-        return this.sawResponse
-          ? "ChatGPT response DOM disappeared while the browser turn was active"
-          : "ChatGPT did not create a response DOM after the message was sent";
+        return "ChatGPT did not create a response DOM after the message was sent";
       }
     }
 
@@ -1095,6 +1139,7 @@ export class ChatGptBrowserWorker {
     responseTurn: Locator,
     initialUserTurnCount: number,
     initialResponseTurnCount: number,
+    initialGenerationRunning: boolean,
     signal?: AbortSignal,
   ): Promise<ChatGptSubmissionEvidence> {
     if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
@@ -1111,12 +1156,13 @@ export class ChatGptBrowserWorker {
         responseTurns.count(),
         visibleStopButtons.count(),
       ]);
-      const evidence = chatGptSubmissionEvidence({
+      const evidence = chatGptSubmissionEvidenceAfterSend({
         initialUserTurnCount,
         userTurnCount,
         initialAssistantTurnCount: initialResponseTurnCount,
         assistantTurnCount,
-        generationRunning: visibleStopButtonCount > 0,
+        generationRunning: visibleStopButtonCount > 0 || await isChatGptGenerationRunning(page),
+        initialGenerationRunning,
       });
       if (evidence) return evidence;
       await new Promise(resolveSleep => setTimeout(resolveSleep, 50));
@@ -1926,6 +1972,7 @@ export class ChatGptBrowserWorker {
         }
         await settleChatGptUi();
         await throwIfChatGptSessionFailureAlert(page);
+        const initialGenerationRunning = await isChatGptGenerationRunning(page);
         await sendButton.press("Enter");
         const evidence = await this.waitForSubmissionAccepted(
           page,
@@ -1934,6 +1981,7 @@ export class ChatGptBrowserWorker {
           responseTurn,
           initialUserTurnCount,
           initialResponseTurnCount,
+          initialGenerationRunning,
           stageSignal,
         );
         console.info(`[chatgpt-web] browser turn ${turn.traceId} submission accepted evidence=${evidence}`);
@@ -1974,7 +2022,6 @@ export class ChatGptBrowserWorker {
               turn.onHeartbeat?.();
               lastHeartbeat = Date.now();
             }
-
             await throwIfChatGptSessionFailureAlert(page);
             await throwIfChatGptTerminalErrorAlert(responseTurn);
 

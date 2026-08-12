@@ -326,6 +326,14 @@ export async function inspectLauncherBrowserHost(
   }
 }
 
+export async function probeLauncherBrowserHost(
+  descriptorPath: string,
+  options: { timeoutMs?: number } = {},
+): Promise<void> {
+  const descriptor = readLauncherBrowserHostDescriptor(descriptorPath);
+  await assertCdpReady(descriptor, options.timeoutMs ?? LAUNCHER_SESSION_INSPECTION_TIMEOUT_MS);
+}
+
 export const LAUNCHER_SESSION_INSPECTION_TIMEOUT_MS = 30_000;
 export const LAUNCHER_CAPABILITY_INSPECTION_TIMEOUT_MS = 120_000;
 

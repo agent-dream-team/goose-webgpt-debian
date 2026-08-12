@@ -15,6 +15,7 @@ import {
   ensureLauncherAutomationViewport,
   inspectLauncherBrowserHost,
   launcherAutomationViewportRequired,
+  probeLauncherBrowserHost,
   type LauncherViewportSize,
   notifyLauncherTurn,
   readLauncherBrowserHostDescriptor,
@@ -28,7 +29,10 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-function descriptorFile(controlEndpoint = "http://127.0.0.1:39111"): string {
+function descriptorFile(
+  endpoint = "http://127.0.0.1:39110",
+  controlEndpoint = "http://127.0.0.1:39111",
+): string {
   const root = mkdtempSync(join(tmpdir(), "codex-launcher-descriptor-"));
   roots.push(root);
   const path = join(root, "launcher-browser.json");
@@ -36,7 +40,7 @@ function descriptorFile(controlEndpoint = "http://127.0.0.1:39111"): string {
     version: 1,
     kind: LAUNCHER_BROWSER_HOST_KIND,
     pid: process.pid,
-    endpoint: "http://127.0.0.1:39110",
+    endpoint,
     control: {
       endpoint: controlEndpoint,
       token: "launcher-control-token-0123456789abcdefghijklmnop",
@@ -92,7 +96,7 @@ test("launcher turn control sends authenticated lifecycle events", async () => {
   try {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("test server has no port");
-    const path = descriptorFile(`http://127.0.0.1:${address.port}`);
+    const path = descriptorFile("http://127.0.0.1:39110", `http://127.0.0.1:${address.port}`);
     await expect(notifyLauncherTurn(path, {
       phase: "start",
       traceId: "abc123def456",
@@ -146,7 +150,7 @@ test("launcher session verification uses the authenticated control channel inste
   try {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("test server has no port");
-    const path = descriptorFile(`http://127.0.0.1:${address.port}`);
+    const path = descriptorFile("http://127.0.0.1:39110", `http://127.0.0.1:${address.port}`);
     expect(await inspectLauncherBrowserHost(path, { detectPro: true })).toEqual({
       proAvailable: true,
       url: "https://chatgpt.com/?temporary-chat=true",
@@ -172,9 +176,35 @@ test("launcher session verification reports its own deadline instead of a generi
   try {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("test server has no port");
-    const path = descriptorFile(`http://127.0.0.1:${address.port}`);
+    const path = descriptorFile("http://127.0.0.1:39110", `http://127.0.0.1:${address.port}`);
     await expect(inspectLauncherBrowserHost(path, { detectPro: true, timeoutMs: 5 }))
       .rejects.toThrow("session inspection timed out after 5ms");
+  } finally {
+    await new Promise<void>(resolveClose => server.close(() => resolveClose()));
+  }
+});
+
+test("launcher status probe uses only read-only CDP health and rejects stale descriptors", async () => {
+  const server = createServer(async (request, response) => {
+    expect(request.url).toBe("/json/version");
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({ webSocketDebuggerUrl: "ws://127.0.0.1:39110/devtools/browser/test" }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const path = descriptorFile(`http://127.0.0.1:${address.port}`);
+    await expect(probeLauncherBrowserHost(path, { timeoutMs: 100 })).resolves.toBeUndefined();
+    const stale = readLauncherBrowserHostDescriptor(path);
+    const value = JSON.parse(readFileSync(path, "utf8"));
+    value.pid = process.pid + 1_000_000;
+    writeFileSync(path, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+    expect(() => readLauncherBrowserHostDescriptor(path)).toThrow("process is not running");
+    expect(stale.pid).toBe(process.pid);
   } finally {
     await new Promise<void>(resolveClose => server.close(() => resolveClose()));
   }

@@ -74,7 +74,7 @@ checkpoint marker is translated into a visible Codex trace item; tool-capable tu
 same capability after that checkpoint. Visible ChatGPT status rows become reasoning summaries,
 while stable prose between rows becomes native Codex commentary.
 
-## Installation and service lifecycle
+## Installation and lifecycle
 
 Each native desktop package contains Electron, a platform-matched pinned Bun executable, the
 Responses bridge, Playwright client code, MCP server, setup, doctor, and the browser helper.
@@ -87,13 +87,44 @@ versioned directory under the application home. Daemon and MCP commands use that
 which is required because Linux AppImage mount paths are temporary and must never be persisted in
 Codex or tunnel configuration.
 
-The launcher is the sole process supervisor on macOS, Windows, and Linux. It starts the optional
-tunnel first, waits for healthy/ready evidence, starts the Responses daemon, and then waits for its
-versioned health payload. Native login items or an owner-local XDG autostart file launch the app
-hidden after sign-in. A marker containing only launcher-owned PIDs lets doctor distinguish the
-launcher runtime from a stale or external process. Legacy macOS launchd services are drained and
-removed during an explicit launcher migration; launchd remains only for the advanced terminal-only
-mode.
+The canonical operator-facing lifecycle is `codex-chatgpt-web lifecycle <status|start|restart|stop>`.
+It reuses the project-owned tunnel and daemon lifecycle implementations and the bootstrap-only
+Electron launcher path, in the proved order:
+
+1. tunnel ready;
+2. bootstrap-only Electron BrowserHost genuinely ready;
+3. BrowserHost authenticated and session-ready;
+4. exactly one disposable `lifecycle_*` surface acquired through the launcher control channel;
+5. that leased surface verified through the Node-side launcher helper using `ELECTRON_RUN_AS_NODE=1`;
+6. the disposable lease released in `finally`;
+7. BrowserHost proven idle/usable again;
+8. daemon healthy and accepting turns.
+
+The launcher remains BrowserHost-only. It does not own the tunnel or daemon, and its bootstrap-only
+shutdown path only releases browser-host state. `scripts/start-goose-launcher.ts` remains an
+implementation entrypoint for the launcher process, not the agent-facing lifecycle interface.
+Legacy launcher-supervisor ownership notes are historical; do not reintroduce them as the current
+operating model.
+
+The lifecycle coordinator deliberately does not use Bun-direct `chromium.connectOverCDP()` as
+authoritative BrowserHost health evidence. That path was observed to hang or time out under Bun
+even while the same BrowserHost remained healthy. The working readiness proof uses the descriptor's
+helper executable/script contract and the Node-side browser-helper maintenance path instead.
+
+Status is observational only: `codex-chatgpt-web lifecycle status` uses a read-only CDP health
+signal and does not create or inspect a turn. It must not fail merely because Goose is actively
+using ChatGPT Web.
+
+2026-08-12 proof checkpoint:
+
+- canonical manual cold lifecycle: passed;
+- ordinary Goose named turn: passed;
+- separate named `--resume` continuation: passed;
+- active runtime home: `/Users/luke/.goose-chatgpt-web-dev`.
+
+Native login items or an owner-local XDG autostart file launch the app hidden after sign-in. A
+marker containing only launcher-owned PIDs lets doctor distinguish the launcher runtime from a stale
+or external process.
 
 Setup keeps Codex's built-in `openai` provider and switches only `openai_base_url`. The daemon
 forwards the authenticated official model catalog and appends only the routed models owned by the

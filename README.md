@@ -163,6 +163,45 @@ checks. Use **Settings → Cancel retained browser turn** if a stopped task leav
 and **Settings → Remove Codex integration** before deleting the launcher so the previous Codex
 route is restored.
 
+For deterministic operator control, use `codex-chatgpt-web lifecycle <status|start|restart|stop>`.
+That command starts tunnel, bootstrap-only BrowserHost, and daemon in the proved order and reuses
+the same bootstrap-only launcher shutdown path on stop/restart. The BrowserHost readiness proof is
+helper-based: it acquires exactly one disposable lifecycle surface, verifies that leased surface
+through the Node-side launcher helper, releases the lease in `finally`, then confirms the host is
+idle again. Do not treat Bun-direct Playwright CDP as authoritative BrowserHost-health evidence.
+
+The currently proven live checkpoint, dated `2026-08-12`, is:
+
+1. `lifecycle stop`
+2. daemon unloaded
+3. BrowserHost descriptor missing
+4. tunnel unloaded
+5. `lifecycle start`
+6. tunnel ready
+7. bootstrap-only BrowserHost ready
+8. authenticated ChatGPT Temporary Chat ready
+9. one disposable lifecycle surface acquired and helper-verified
+10. surface released
+11. BrowserHost idle/usable
+12. daemon healthy and idle
+13. ordinary Goose named turn passed
+14. separate named `--resume` continuation passed
+
+Use the active runtime home `/Users/luke/.goose-chatgpt-web-dev` for this checkpoint. Goose owns
+conversation/session state, tools, delegation, approvals, recipes, and compaction. Electron owns
+BrowserHost only. Electron does not own daemon or tunnel.
+
+Do not regress:
+
+- do not recouple daemon/tunnel ownership to Electron RuntimeSupervisor;
+- do not use Bun-direct Playwright as BrowserHost-health authority;
+- do not use one compound retry loop spanning session inspection and leased-turn operations;
+- disposable leases must be released in `finally`;
+- do not overwrite original causal errors with later retry symptoms;
+- do not use stdin-interactive Goose as the continuation proof;
+- fresh ChatGPT Temporary Chat surfaces per Goose turn are expected and are not a continuation failure;
+- do not use raw `previous_response_id` as a substitute for Goose/native turn metadata.
+
 ## Limitations and security
 
 - This is unofficial browser automation, not an OpenAI API. ChatGPT UI changes can break selectors;

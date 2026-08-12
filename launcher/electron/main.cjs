@@ -789,6 +789,33 @@ async function start() {
   }
   if (launcherBootstrapOnly) {
     logger.info("launcher.bootstrap_only", { coreHome: CORE_HOME });
+    // Standalone Goose supervises the daemon and tunnel itself, so this launcher owns the browser
+    // host alone. requestQuit() adopts and stops the configured runtime, which would recouple that
+    // ownership, so bootstrap-only shutdown releases browser-host state only. Without these
+    // handlers the process was killed with no cleanup at all: the ChatGPT session was never
+    // flushed, and the descriptor kept advertising a dead pid, which makes a later failure look
+    // like a live host that stopped serving turns.
+    const releaseBrowserHost = async () => {
+      if (exitCommitted) return;
+      exitCommitted = true;
+      try {
+        await browserHost?.persistSession();
+      } catch (error) {
+        logger.warn("browser.session_persist_failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+      browserHost?.destroy();
+      await browserControl?.close().catch(() => {});
+      app.exit(0);
+    };
+    app.on("before-quit", (event) => {
+      if (exitCommitted) return;
+      event.preventDefault();
+      void releaseBrowserHost();
+    });
+    process.once("SIGINT", () => { void releaseBrowserHost(); });
+    process.once("SIGTERM", () => { void releaseBrowserHost(); });
     return;
   }
   void (async () => {
