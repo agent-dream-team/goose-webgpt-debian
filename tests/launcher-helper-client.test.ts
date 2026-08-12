@@ -326,6 +326,85 @@ test("a live-but-silent helper is terminated and the next turn respawns a fresh 
   }
 });
 
+test("helper heartbeat expiry releases the launcher turn before respawn", async () => {
+  const root = mkdtempSync(join(tmpdir(), "goose-launcher-helper-heartbeat-release-"));
+  roots.push(root);
+  const helper = join(root, "helper.cjs");
+  writeFileSync(helper, `
+    const readline = require("node:readline").createInterface({ input: process.stdin });
+    const send = value => process.stdout.write(JSON.stringify(value) + "\\n");
+    send({ type: "ready" });
+    readline.on("line", line => {
+      const message = JSON.parse(line);
+      if (message.type === "shutdown") process.exit(0);
+    });
+  `, { mode: 0o700 });
+  const controlRequests: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const control = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    async fetch(request) {
+      controlRequests.push({
+        path: new URL(request.url).pathname,
+        body: await request.json() as Record<string, unknown>,
+      });
+      return Response.json({ ok: true });
+    },
+  });
+  const descriptorPath = join(root, "launcher.json");
+  writeFileSync(descriptorPath, `${JSON.stringify({
+    version: 1,
+    kind: LAUNCHER_BROWSER_HOST_KIND,
+    pid: process.pid,
+    endpoint: "http://127.0.0.1:39001",
+    control: {
+      endpoint: `http://127.0.0.1:${control.port}`,
+      token: "launcher-control-token-0123456789abcdefghijklmnop",
+    },
+    helper: { executable: process.execPath, script: helper },
+    partition: "persist:codex-web-gpt-chatgpt",
+    idleUrl: "about:blank#codex-web-gpt-browser-host",
+    surfaceId: "launcher_surface_id_0123456789AB",
+    createdAt: new Date().toISOString(),
+  })}\n`, { mode: 0o600 });
+  const client = new LauncherBrowserHelperClient({
+    appName: "Goose Native",
+    browserHost: "launcher",
+    browserHostDescriptorPath: descriptorPath,
+    storageStatePath: join(root, "unused-state.json"),
+    chromeExecutablePath: join(root, "unused-chrome"),
+    turnTimeoutMs: 60_000,
+    headed: true,
+    autoApproveToolCalls: false,
+  }, { heartbeatTimeoutMs: 100 });
+  try {
+    await expect(client.run({
+      traceId: "heartbeat-release-1",
+      modelId: "gpt-5.6-sol",
+      reasoning: "high",
+      capabilities: { localToolsEnabled: false, proAvailable: false },
+      prepare: async () => ({ text: "inspect", images: [], release() {} }),
+      onTextDelta() {},
+    })).rejects.toThrow("heartbeat expired after 100ms");
+    for (let attempt = 0; attempt < 50 && controlRequests.length === 0; attempt += 1) {
+      await Bun.sleep(10);
+    }
+    expect(controlRequests).toHaveLength(1);
+    expect(controlRequests[0]).toMatchObject({
+      path: "/v1/turn/end",
+      body: {
+        phase: "end",
+        traceId: "heartbeat-release-1",
+        status: "failed",
+      },
+    });
+    expect(controlRequests[0]!.body.helperPid).toEqual(expect.any(Number));
+  } finally {
+    await client.close();
+    control.stop(true);
+  }
+});
+
 test("structured helper errors preserve the ChatGPT adapter failure contract", async () => {
   const client = new LauncherBrowserHelperClient({
     appName: "Codex Native",

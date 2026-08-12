@@ -344,10 +344,22 @@ export class LauncherBrowserHelperClient {
     pending.heartbeatTimer = setTimeout(() => {
       if (this.child !== child || !this.pending.has(id)) return;
       const error = new Error(`Launcher browser helper heartbeat expired after ${this.heartbeatTimeoutMs}ms`);
-      this.child = undefined;
-      this.ready = undefined;
-      this.readyResolve = undefined;
+      void notifyLauncherTurn(this.config.browserHostDescriptorPath!, {
+        phase: "end",
+        traceId: id,
+        helperPid: child.pid!,
+        status: "failed",
+        message: "Launcher browser helper heartbeat expired before completing the turn",
+      }).catch(controlError => {
+        console.error(
+          `[chatgpt-web-helper] failed to release launcher turn ${id}: ${controlError instanceof Error ? controlError.message : String(controlError)}`,
+        );
+      });
+      this.readyReject?.(error);
       this.readyReject = undefined;
+      this.readyResolve = undefined;
+      this.ready = undefined;
+      this.child = undefined;
       this.finishWithError(id, error);
       if (Number.isInteger(child.pid) && child.exitCode === null && child.signalCode === null) {
         void this.terminateChild(child, 0).catch(cleanupError => {
