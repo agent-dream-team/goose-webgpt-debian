@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import type { Page } from "playwright-core";
-import { CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_PROMPT_INSERT_CHUNK_CHARS, ChatGptBrowserWorker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_TABS, assertChatGptWebInputWithinContextWindow, browserDiagnosticCheckpoint, captureChatGptBrowserDiagnosticScreenshot, chatGptGenerationRunningLabelMatches, chatGptPromptChunkEnd, chatGptSubmissionEvidence, chatGptSubmissionEvidenceAfterSend, isChatGptGenerationRunning, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_PROMPT_INSERT_CHUNK_CHARS, ChatGptBrowserWorker, ChatGptCompletionTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_TABS, assertChatGptWebInputWithinContextWindow, browserDiagnosticCheckpoint, captureChatGptBrowserDiagnosticScreenshot, chatGptGenerationRunningLabelMatches, chatGptPromptChunkEnd, chatGptSubmissionEvidence, chatGptSubmissionEvidenceAfterSend, chatGptTurnProgressSignature, isChatGptGenerationRunning, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert } from "../src/adapters/chatgpt-web/browser-worker";
 import { CHATGPT_CONNECTOR_NAME, defaultChromeExecutable } from "../src/config";
 
 test("Codex context uses the owned CDP composer transport, never the operating-system clipboard", () => {
@@ -1156,7 +1156,11 @@ test("the known terminal ChatGPT error alert returns a structured retryable fail
     "Something went wrong. If this issue persists please contact us through our help center at help.openai.com.",
   );
 
-  await expect(throwIfChatGptTerminalErrorAlert(fixture.page)).rejects.toMatchObject({
+  await expect(throwIfChatGptTerminalErrorAlert(fixture.page, {
+    visibleText: "Something went wrong. If this issue persists please contact us through our help center at help.openai.com.",
+    running: false,
+    completionActionVisible: false,
+  })).rejects.toMatchObject({
     name: "ChatGptWebAdapterError",
     status: 502,
     errorType: "server_error",
@@ -1164,6 +1168,48 @@ test("the known terminal ChatGPT error alert returns a structured retryable fail
     retryable: true,
   });
   expect(fixture.pressed).toEqual([]);
+});
+
+test("the current processing-request error banner returns the retryable upstream failure", async () => {
+  const text = "Something went wrong while processing your request. Please try again.";
+  const fixture = dialogPage(text);
+
+  await expect(throwIfChatGptTerminalErrorAlert(fixture.page, {
+    visibleText: text,
+    running: false,
+    completionActionVisible: false,
+  })).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError",
+    status: 502,
+    errorType: "server_error",
+    code: "upstream_server_error",
+    retryable: true,
+  });
+});
+
+test("ordinary assistant prose quoting the current error wording is not terminal", async () => {
+  const text = "The banner said: Something went wrong while processing your request. Please try again.";
+  const fixture = dialogPage(text);
+
+  await throwIfChatGptTerminalErrorAlert(fixture.page, {
+    visibleText: text,
+    running: false,
+    completionActionVisible: false,
+  });
+  await throwIfChatGptTerminalErrorAlert(dialogPage(
+    "Something went wrong while processing your request. Please try again.",
+  ).page, {
+    visibleText: "Something went wrong while processing your request. Please try again.",
+    running: true,
+    completionActionVisible: false,
+  });
+  await throwIfChatGptTerminalErrorAlert(dialogPage(
+    "Something went wrong while processing your request. Please try again.",
+  ).page, {
+    visibleText: "Something went wrong while processing your request. Please try again.",
+    running: false,
+    completionActionVisible: true,
+  });
 });
 
 test("a failed subscription fetch is retryable and does not falsely invalidate ChatGPT login", async () => {
@@ -1182,7 +1228,7 @@ test("a failed subscription fetch is retryable and does not falsely invalidate C
 
 test("terminal model errors are scoped to the new assistant turn instead of global page alerts", () => {
   const workerSource = readFileSync(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url), "utf8");
-  expect(workerSource).toContain("throwIfChatGptTerminalErrorAlert(responseTurn)");
+  expect(workerSource).toContain("throwIfChatGptTerminalErrorAlert(responseTurn, {");
   expect(workerSource).not.toContain("throwIfChatGptTerminalErrorAlert(page)");
 });
 
@@ -1268,7 +1314,11 @@ test("a rate-limit dialog during the send/acknowledgement wait surfaces as an ex
 test("unrelated ChatGPT alerts are not terminal", async () => {
   const fixture = dialogPage("Your file was uploaded successfully");
 
-  await throwIfChatGptTerminalErrorAlert(fixture.page);
+  await throwIfChatGptTerminalErrorAlert(fixture.page, {
+    visibleText: "Your file was uploaded successfully",
+    running: false,
+    completionActionVisible: false,
+  });
   expect(fixture.pressed).toEqual([]);
 });
 
@@ -1656,6 +1706,105 @@ test("browser DOM health fails closed on a vanished or empty ChatGPT response", 
   };
   expect(remount.update(visibleCompleted, 62_000)).toBeUndefined();
   expect(remount.update(visibleCompleted, 64_000)).toBeUndefined();
+});
+
+test("turn progress signature tracks observable advance beyond the visible answer text", () => {
+  const base = {
+    visibleText: "partial answer",
+    fullHtml: "<div>partial answer</div>",
+    markdownSegmentCount: 1,
+    traceBlockCount: 2,
+    running: false,
+    completionActionVisible: false,
+  };
+  const idle = chatGptTurnProgressSignature(base);
+  expect(chatGptTurnProgressSignature(base)).toBe(idle);
+  // A tool-heavy round advances trace/commentary and raw HTML while the answer text is untouched.
+  expect(chatGptTurnProgressSignature({ ...base, traceBlockCount: 3 })).not.toBe(idle);
+  expect(chatGptTurnProgressSignature({ ...base, fullHtml: `${base.fullHtml}<span>tool</span>` })).not.toBe(idle);
+  expect(chatGptTurnProgressSignature({ ...base, markdownSegmentCount: 2 })).not.toBe(idle);
+  expect(chatGptTurnProgressSignature({ ...base, running: true })).not.toBe(idle);
+  expect(chatGptTurnProgressSignature({ ...base, completionActionVisible: true })).not.toBe(idle);
+});
+
+test("completed-turn-action watchdog does not accumulate while a tool-heavy turn keeps advancing", () => {
+  const health = new ChatGptTurnDomHealthTracker(1_000, 500, 750);
+  // The shape a tool-heavy turn parks in between rounds: stop button hidden, answer text frozen,
+  // no completion action yet — but trace/HTML activity continues underneath.
+  const toolRound = (traceBlockCount: number) => ({
+    responsePresent: true,
+    running: false,
+    currentText: "partial answer",
+    completionActionVisible: false,
+    progressSignature: chatGptTurnProgressSignature({
+      visibleText: "partial answer",
+      fullHtml: "<div>partial answer</div>",
+      markdownSegmentCount: 1,
+      traceBlockCount,
+      running: false,
+      completionActionVisible: false,
+    }),
+  });
+
+  // Far beyond the grace period, with the visible answer text never once changing.
+  expect(health.update(toolRound(1), 1_000)).toBeUndefined();
+  expect(health.update(toolRound(2), 2_000)).toBeUndefined();
+  expect(health.update(toolRound(3), 10_000)).toBeUndefined();
+  expect(health.update(toolRound(4), 60_000)).toBeUndefined();
+  expect(health.update(toolRound(5), 120_000)).toBeUndefined();
+
+  // Once observable activity genuinely stops, the terminal is still reached on the same bound,
+  // measured from the last observed change (120_000) rather than from an arbitrary later poll.
+  const settled = toolRound(5);
+  expect(health.update(settled, 120_749)).toBeUndefined();
+  expect(health.update(settled, 120_750)).toContain("DOM may have changed");
+});
+
+test("completed-turn-action watchdog still terminals on a genuinely settled turn and spares a completed one", () => {
+  const stalled = new ChatGptTurnDomHealthTracker(1_000, 500, 750);
+  const frozen = {
+    responsePresent: true,
+    running: false,
+    currentText: "complete answer",
+    completionActionVisible: false,
+    progressSignature: chatGptTurnProgressSignature({
+      visibleText: "complete answer",
+      fullHtml: "<div>complete answer</div>",
+      markdownSegmentCount: 1,
+      traceBlockCount: 1,
+      running: false,
+      completionActionVisible: false,
+    }),
+  };
+  expect(stalled.update(frozen, 1_000)).toBeUndefined();
+  expect(stalled.update(frozen, 1_749)).toBeUndefined();
+  expect(stalled.update(frozen, 1_750)).toContain("DOM may have changed");
+
+  // A turn that exposed its completion action is never a candidate, however long it is observed.
+  const completed = new ChatGptTurnDomHealthTracker(1_000, 500, 750);
+  const done = { ...frozen, completionActionVisible: true };
+  expect(completed.update(done, 1_000)).toBeUndefined();
+  expect(completed.update(done, 500_000)).toBeUndefined();
+
+  // Exactly-once completion is unaffected: the completion tracker still settles on the same state.
+  const completion = new ChatGptCompletionTracker(2_000);
+  expect(completion.update({ ...done, currentHtml: "<div>complete answer</div>" }, 1_000)).toBe(false);
+  expect(completion.update({ ...done, currentHtml: "<div>complete answer</div>" }, 2_999)).toBe(false);
+  expect(completion.update({ ...done, currentHtml: "<div>complete answer</div>" }, 3_000)).toBe(true);
+});
+
+test("completed-turn-action watchdog falls back to visible text when no progress signature is supplied", () => {
+  const health = new ChatGptTurnDomHealthTracker(1_000, 500, 750);
+  const withoutSignature = {
+    responsePresent: true,
+    running: false,
+    currentText: "first",
+    completionActionVisible: false,
+  };
+  expect(health.update(withoutSignature, 1_000)).toBeUndefined();
+  expect(health.update({ ...withoutSignature, currentText: "first and more" }, 1_700)).toBeUndefined();
+  expect(health.update({ ...withoutSignature, currentText: "first and more" }, 2_449)).toBeUndefined();
+  expect(health.update({ ...withoutSignature, currentText: "first and more" }, 2_450)).toContain("DOM may have changed");
 });
 
 test("stalled-turn diagnostics record DOM metrics without response or overlay content", () => {

@@ -40,11 +40,13 @@ export function startPostSendBrowserControlLiveness(
     intervalMs?: number;
     probeTimeoutMs?: number;
     maxConsecutiveFailures?: number;
+    isProgressing?: () => boolean;
   } = {},
 ): PostSendBrowserControlLivenessWatch {
   const intervalMs = options.intervalMs ?? CHATGPT_POST_SEND_CONTROL_PROBE_INTERVAL_MS;
   const probeTimeoutMs = options.probeTimeoutMs ?? CHATGPT_POST_SEND_CONTROL_PROBE_TIMEOUT_MS;
   const maxConsecutiveFailures = options.maxConsecutiveFailures ?? CHATGPT_POST_SEND_CONTROL_MAX_CONSECUTIVE_FAILURES;
+  const isProgressing = options.isProgressing ?? (() => false);
   if (intervalMs <= 0 || probeTimeoutMs <= 0 || maxConsecutiveFailures <= 0) {
     throw new Error("ChatGPT browser-control liveness bounds must be positive");
   }
@@ -75,6 +77,11 @@ export function startPostSendBrowserControlLiveness(
     if (live) {
       consecutiveFailures = 0;
     } else {
+      if (isProgressing()) {
+        consecutiveFailures = 0;
+        schedule();
+        return;
+      }
       consecutiveFailures += 1;
       if (consecutiveFailures >= maxConsecutiveFailures) {
         stopped = true;

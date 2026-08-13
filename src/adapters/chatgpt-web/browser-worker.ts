@@ -124,6 +124,12 @@ export async function throwIfChatGptRateLimitDialog(page: Page): Promise<void> {
 
 type ChatGptTextScope = Pick<Locator, "getByText">;
 
+interface ChatGptTerminalErrorState {
+  visibleText: string;
+  running: boolean;
+  completionActionVisible: boolean;
+}
+
 const chatGptSessionFailureAlert = (page: Page): Locator => page
   .locator('[role="alert"]')
   .filter({ hasText: /Failed to load subscription/i })
@@ -137,12 +143,22 @@ export async function throwIfChatGptSessionFailureAlert(page: Page): Promise<voi
   );
 }
 
-const chatGptTerminalErrorAlert = (scope: ChatGptTextScope): Locator => scope
-  .getByText(/Something went wrong[\s\S]*help\.openai\.com/i)
+const chatGptTerminalErrorTextMatches = (text: string): boolean => {
+  const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
+  return normalized === "something went wrong while processing your request. please try again."
+    || (normalized.startsWith("something went wrong") && normalized.includes("help.openai.com"));
+};
+
+const chatGptTerminalErrorAlert = (scope: ChatGptTextScope, text: string): Locator => scope
+  .getByText(text, { exact: true })
   .last();
 
-export async function throwIfChatGptTerminalErrorAlert(scope: ChatGptTextScope): Promise<void> {
-  if (!await chatGptTerminalErrorAlert(scope).isVisible().catch(() => false)) return;
+export async function throwIfChatGptTerminalErrorAlert(
+  scope: ChatGptTextScope,
+  state: ChatGptTerminalErrorState,
+): Promise<void> {
+  if (state.running || state.completionActionVisible || !chatGptTerminalErrorTextMatches(state.visibleText)) return;
+  if (!await chatGptTerminalErrorAlert(scope, state.visibleText).isVisible().catch(() => false)) return;
   throw new ChatGptWebAdapterError(
     "ChatGPT ended the turn with 'Something went wrong'. Retry the turn.",
     { status: 502, errorType: "server_error", code: "upstream_server_error", retryable: true },
@@ -279,6 +295,35 @@ export function chatGptTurnIsComplete(state: {
     && state.completionActionVisible;
 }
 
+/**
+ * Broad observable state of the assistant turn. Any renderer-visible advance — streamed answer text,
+ * raw turn HTML, trace/commentary blocks, markdown structure, or the running/completion controls —
+ * changes this value.
+ *
+ * Both post-send false-terminal detectors read the same representation, for opposite reasons: the
+ * browser-control liveness watch treats a change as evidence that the control path still works, and
+ * the completed-turn-action watchdog treats a change as evidence that the turn has not actually
+ * settled. They remain independent detectors; only the notion of "something observably changed" is
+ * shared, so neither can be defeated by activity the other already considers progress.
+ */
+export function chatGptTurnProgressSignature(state: {
+  visibleText: string;
+  fullHtml: string;
+  markdownSegmentCount: number;
+  traceBlockCount: number;
+  running: boolean;
+  completionActionVisible: boolean;
+}): string {
+  return [
+    state.visibleText.length,
+    state.fullHtml.length,
+    state.completionActionVisible ? "1" : "0",
+    state.markdownSegmentCount,
+    state.traceBlockCount,
+    state.running ? "r" : "q",
+  ].join(":");
+}
+
 export type ChatGptSubmissionEvidence = "user_turn" | "assistant_turn" | "generation_running";
 
 export function chatGptGenerationRunningLabelMatches(text: string): boolean {
@@ -360,7 +405,7 @@ export class ChatGptTurnDomHealthTracker {
   private sawResponse = false;
   private missingResponseSince?: number;
   private emptyCompletionSince?: number;
-  private missingCompletionAction?: { text: string; since: number };
+  private missingCompletionAction?: { stability: string; since: number };
 
   constructor(
     private readonly missingResponseMs = CHATGPT_RESPONSE_DOM_GRACE_MS,
@@ -373,6 +418,8 @@ export class ChatGptTurnDomHealthTracker {
     running: boolean;
     currentText: string;
     completionActionVisible: boolean;
+    /** Broad observable turn state; falls back to visible text when the caller has none. */
+    progressSignature?: string;
   }, now = Date.now()): string | undefined {
     if (state.responsePresent) {
       this.sawResponse = true;
@@ -400,14 +447,20 @@ export class ChatGptTurnDomHealthTracker {
       }
     }
 
+    // A tool-heavy turn parks in exactly this shape between rounds: the stop button is hidden while
+    // a tool call is outstanding, so `running` is false and the answer text stops changing even
+    // though the turn is very much alive. Stability is therefore judged on the broad observable
+    // signature when the caller supplies one — trace/commentary/markdown/HTML activity keeps the
+    // grace period from accumulating — and only a genuinely settled turn reaches the terminal.
     const missingCompletionAction = state.responsePresent
       && !state.running
       && state.currentText.length > 0
       && !state.completionActionVisible;
+    const stability = state.progressSignature ?? state.currentText;
     if (!missingCompletionAction) {
       this.missingCompletionAction = undefined;
-    } else if (this.missingCompletionAction?.text !== state.currentText) {
-      this.missingCompletionAction = { text: state.currentText, since: now };
+    } else if (this.missingCompletionAction?.stability !== stability) {
+      this.missingCompletionAction = { stability, since: now };
     } else if (now - this.missingCompletionAction.since >= this.missingCompletionActionMs) {
       return "ChatGPT stopped generating but did not expose its completed-turn action; the ChatGPT DOM may have changed";
     }
@@ -1147,7 +1200,6 @@ export class ChatGptBrowserWorker {
     for (;;) {
       if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       await throwIfChatGptSessionFailureAlert(page);
-      await throwIfChatGptTerminalErrorAlert(responseTurn);
       // A confirmed 429 during the send/acknowledgement wait must surface as an explicit
       // rate-limit error, not degrade into a generic "send" stage timeout.
       await throwIfChatGptRateLimitDialog(page);
@@ -1986,12 +2038,15 @@ export class ChatGptBrowserWorker {
         );
         console.info(`[chatgpt-web] browser turn ${turn.traceId} submission accepted evidence=${evidence}`);
       });
+      let lastProgressAt = Date.now();
+      let lastProgressSignature = "";
       const controlLiveness = startPostSendBrowserControlLiveness(
         () => page.evaluate(() => document.readyState),
         {
           intervalMs: CHATGPT_POST_SEND_CONTROL_PROBE_INTERVAL_MS,
           probeTimeoutMs: CHATGPT_POST_SEND_CONTROL_PROBE_TIMEOUT_MS,
           maxConsecutiveFailures: CHATGPT_POST_SEND_CONTROL_MAX_CONSECUTIVE_FAILURES,
+          isProgressing: () => Date.now() - lastProgressAt < 15_000,
         },
       );
       try {
@@ -2023,7 +2078,6 @@ export class ChatGptBrowserWorker {
               lastHeartbeat = Date.now();
             }
             await throwIfChatGptSessionFailureAlert(page);
-            await throwIfChatGptTerminalErrorAlert(responseTurn);
 
             if (mode.localTools && await resolveChatGptToolConfirmation(
               page,
@@ -2041,22 +2095,44 @@ export class ChatGptBrowserWorker {
             const stop = page.locator(CHATGPT_STOP_BUTTON_SELECTOR).last();
             const running = await stop.isVisible().catch(() => false);
             if (running) sawRunning = true;
+            await throwIfChatGptTerminalErrorAlert(responseTurn, {
+              visibleText: snapshot.visibleText,
+              running,
+              completionActionVisible: snapshot.completionActionVisible,
+            });
             if (snapshot.responsePresent) {
               if (!capturedResponse) {
                 capturedResponse = true;
                 await diagnostics.capture(page, "response-visible");
               }
               const textDelta = markdownBuffer.observe(snapshot.markdownSegments);
+              const progressSignature = chatGptTurnProgressSignature({
+                visibleText: snapshot.visibleText,
+                fullHtml: snapshot.fullHtml,
+                markdownSegmentCount: snapshot.markdownSegments.length,
+                traceBlockCount: snapshot.traceBlocks.length,
+                running,
+                completionActionVisible: snapshot.completionActionVisible,
+              });
+              if (progressSignature !== lastProgressSignature) {
+                lastProgressSignature = progressSignature;
+                lastProgressAt = Date.now();
+              }
               for (const trace of visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionVisible)) {
                 if (trace.kind === "commentary") turn.onCommentary?.(trace.text, trace.continuation === true);
                 else turn.onReasoningSummary?.(trace.text, trace.continuation === true);
+                lastProgressAt = Date.now();
               }
-              if (textDelta) turn.onTextDelta(textDelta);
+              if (textDelta) {
+                turn.onTextDelta(textDelta);
+                lastProgressAt = Date.now();
+              }
               const domError = domHealthTracker.update({
                 responsePresent: snapshot.responsePresent,
                 running,
                 currentText: snapshot.visibleText,
                 completionActionVisible: snapshot.completionActionVisible,
+                progressSignature,
               });
               if (domError) throw new Error(domError);
               if (completionTracker.update({

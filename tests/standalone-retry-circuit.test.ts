@@ -2,7 +2,8 @@ import { expect, test } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
-import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
+import { startPostSendBrowserControlLiveness } from "../src/adapters/chatgpt-web/control-liveness";
+import { ChatGptBrowserWorker, chatGptTurnProgressSignature, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
 import { createChatGptWebAdapter } from "../src/adapters/chatgpt-web/index";
 import { StandaloneRetryCircuit, standaloneRetryCircuit, standaloneRetrySnapshot } from "../src/adapters/chatgpt-web/retry-circuit";
 import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
@@ -128,6 +129,130 @@ test("retryable browser failure permits exactly one bounded fresh-browser recove
   expectCircuitOpen(start);
 
   expect(browserStarts).toBe(2);
+});
+
+test("post-send liveness tolerates transient control failures while the turn is still progressing", async () => {
+  const outcomes = [false, false, false];
+  let probes = 0;
+  let progressing = true;
+  const watch = startPostSendBrowserControlLiveness(
+    async () => {
+      probes += 1;
+      if (outcomes.shift() === false) throw new Error("synthetic CDP timeout");
+      return true;
+    },
+    {
+      intervalMs: 2,
+      probeTimeoutMs: 10,
+      maxConsecutiveFailures: 2,
+      isProgressing: () => progressing,
+    },
+  );
+
+  try {
+    const result = await Promise.race([
+      watch.failure.then(() => "failed", () => "failed"),
+      Bun.sleep(20).then(() => "still-waiting"),
+    ]);
+    expect(result).toBe("still-waiting");
+    expect(probes).toBeGreaterThanOrEqual(2);
+  } finally {
+    progressing = false;
+    watch.stop();
+  }
+});
+
+test("post-send liveness still fails once progress stops and probe failures continue", async () => {
+  let probes = 0;
+  let progressing = true;
+  const watch = startPostSendBrowserControlLiveness(
+    async () => {
+      probes += 1;
+      if (progressing) {
+        if (probes <= 3) throw new Error("synthetic CDP timeout");
+        return true;
+      }
+      throw new Error("synthetic CDP timeout");
+    },
+    {
+      intervalMs: 2,
+      probeTimeoutMs: 10,
+      maxConsecutiveFailures: 2,
+      isProgressing: () => progressing,
+    },
+  );
+
+  try {
+    const first = await Promise.race([
+      watch.failure.then(() => "failed", () => "failed"),
+      Bun.sleep(12).then(() => "still-waiting"),
+    ]);
+    expect(first).toBe("still-waiting");
+    progressing = false;
+    const second = await Promise.race([
+      watch.failure.then(() => "failed", () => "failed"),
+      Bun.sleep(100).then(() => "still-waiting"),
+    ]);
+    expect(second).toBe("failed");
+    await expect(watch.failure).rejects.toMatchObject({
+      code: "chatgpt_browser_control_unresponsive",
+      retryable: true,
+    });
+    expect(probes).toBeGreaterThanOrEqual(2);
+  } finally {
+    watch.stop();
+  }
+});
+
+test("post-send liveness survives probe failure while only trace/HTML activity advances", async () => {
+  // The A1 gate reads the same broad signature the completed-turn-action watchdog uses, so a
+  // tool-heavy round whose visible answer text never changes still counts as observable progress.
+  let traceBlockCount = 1;
+  const signatureOf = () => chatGptTurnProgressSignature({
+    visibleText: "partial answer",
+    fullHtml: `<div>partial answer</div>${"<span>tool</span>".repeat(traceBlockCount)}`,
+    markdownSegmentCount: 1,
+    traceBlockCount,
+    running: false,
+    completionActionVisible: false,
+  });
+  let lastSignature = signatureOf();
+  let advancing = true;
+
+  const watch = startPostSendBrowserControlLiveness(
+    async () => { throw new Error("synthetic CDP timeout"); },
+    {
+      intervalMs: 2,
+      probeTimeoutMs: 10,
+      maxConsecutiveFailures: 2,
+      isProgressing: () => {
+        if (advancing) traceBlockCount += 1;
+        const signature = signatureOf();
+        const progressed = signature !== lastSignature;
+        lastSignature = signature;
+        return progressed;
+      },
+    },
+  );
+
+  try {
+    // Every probe fails, yet the turn is never terminated while the signature keeps advancing.
+    const first = await Promise.race([
+      watch.failure.then(() => "failed", () => "failed"),
+      Bun.sleep(40).then(() => "still-waiting"),
+    ]);
+    expect(first).toBe("still-waiting");
+    expect(traceBlockCount).toBeGreaterThan(1);
+
+    // Freeze observable state: the same failing probes now reach the causal terminal.
+    advancing = false;
+    await expect(watch.failure).rejects.toMatchObject({
+      code: "chatgpt_browser_control_unresponsive",
+      retryable: true,
+    });
+  } finally {
+    watch.stop();
+  }
 });
 
 test("failure-history resubmission reaches containment and cannot create further browser runtimes", () => {
