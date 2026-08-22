@@ -288,3 +288,100 @@ Port the smallest possible daemon/tunnel startup alternative behind the existing
 preserves canonical order and readiness proofs), then re-run the component checks and
 attempt blocker items 1–3 at an operator-controlled boundary. Keep user-level systemd
 out until that manual path has proven one live turn.
+
+## Standalone Goose provider qualification on DreamBook (2026-08-22, post-login)
+
+Continues from the manual login-completion checkpoint (`84a41eb`). Luke authenticated
+through the launcher UI; browser smoke passed (14-step flight log under
+`~/.goose-chatgpt-web-dev/diagnostics/browser-turns/smoke_…-418815de`). He then
+accidentally clicked **Install models** in the upstream Codex-oriented Setup UI; this
+section records the audit, the Codex-only undo, and the standalone provider bring-up.
+
+### What "Install models" (launcher `setup-core`) changed
+
+| Artifact | Change | Disposition |
+| --- | --- | --- |
+| `~/.codex/config.toml` | Managed insertions: top-level `openai_base_url = "http://127.0.0.1:17841/v1"` plus `[features] {remote_compaction_v2=false, multi_agent=true, multi_agent_v2=false}`, all stamped `# Managed by codex-chatgpt-web…` | Removed via native journal-driven `uninstallCodexIntegration()`; verified byte-exact — only managed lines removed, all historical/non-managed content untouched |
+| `<home>/codex/integration-journal.json` | Journal v6, `active:true`, recording installed route + previous-absent snapshots | Removed by the same uninstall (empty `codex/` dir deleted) |
+| `~/.config/goose/custom_providers/custom_chatgpt_web__local_1.json` | Goose custom-provider registration (engine `openai`, base_url `http://127.0.0.1:17841`, base_path `v1/responses`) | Also removed by uninstall (journal-coupled), then restored verbatim from snapshot: it is the Goose-side standalone registration this architecture needs, not Codex-specific |
+| `<launcher userData>/launcher-state.json` | `coreSetupComplete/bridgeEnabled/codexRestartRequired → true`; `codexCatalogVerified:false`; MCP flags stayed false | Corrected to `false/false/false`; smoke + onboarding + session-refresh fields untouched |
+| Embedded runtime | Launcher-owned `cli.ts serve` child on `127.0.0.1:17841` | Stopped (see swap below); ownership moved to standalone daemon |
+
+Not touched: authenticated partition `Partitions/codex-web-gpt-chatgpt`, stable login
+profile, descriptor, `~/.config/goose/config.yaml` (Luke's personal route), all
+non-managed `~/.codex` history.
+
+### Launcher-owned → standalone daemon swap (deterministic sequence)
+
+The launcher supervisor auto-restarts unexpected daemon exits (`scheduleRecovery`),
+and its recovery no-ops when configuration is unreadable (`recover()` returns when
+`readConfig()` yields nothing). Used as the sanctioned seam:
+
+1. Temporarily rename `config.json` aside.
+2. `SIGTERM` the launcher-owned serve child → clean exit(0), no respawn (verified).
+3. Restore `config.json`.
+4. `setup --browser-only --standalone --browser-host-descriptor … --acknowledge-unofficial`
+   — writes `standalone:true` (merging over existing config: `controlToken`, storage
+   state path, descriptor path preserved). Note: for `gooseStandaloneBrowserHost` the
+   command ends with `waitForProxy`, so it errors if the daemon is not yet up even
+   though configuration was written correctly.
+5. `lifecycle start` — canonical order: session-ready wait → helper surface proof →
+   read-only probe → Linux child-process daemon start with `/healthz` readiness.
+
+Resulting daemon: detached child (PPID 1), pid file `<home>/run/daemon.pid`,
+persistent logs `<home>/logs/daemon.{stdout,stderr}.log`, `/healthz` reports
+`accepting_turns:true`. Safety property confirmed by reading
+`RuntimeSupervisor.stopStaleOwnedRuntime`: a foreign (standalone) daemon on the port
+does not match the launcher marker and is refused rather than killed ("The process on
+the Responses port does not match the stale launcher marker"), so launcher restarts
+report external ownership instead of disturbing it.
+
+### Lifecycle fix: session-ready wait vs serialized inspection latency
+
+Live finding: BrowserHost control-plane `/v1/session/inspect` answers in ~5.5s on this
+host (serialized inside the launcher; two concurrent attempts get
+`browser.control_rejected: ChatGPT browser is already busy with session inspection`).
+`waitForLauncherBrowserHostSessionReady` hard-coded `timeoutMs: 5_000` per attempt, so
+the 180s ready-wait could never succeed regardless of deadline. Fix: each attempt now
+uses `LAUNCHER_SESSION_INSPECTION_TIMEOUT_MS` (30s module default); overall 180s
+deadline unchanged. Regression tests added (behavioral local-server test + scoped
+source-contract assertion). Suites after change: root 398/398, launcher 168/168,
+`tsc --noEmit` ×2 clean.
+
+### First ordinary Goose CLI turn through the standalone provider (PASS)
+
+Chain proven end-to-end: `goose` 1.47 CLI → env-selected custom provider
+(`GOOSE_PROVIDER=custom_chatgpt_web__local_1 GOOSE_MODEL=chatgpt-web/high`,
+no changes to Luke's `~/.config/goose/config.yaml`) → `POST http://127.0.0.1:17841/v1/responses`
+→ standalone daemon → synthetic `standalone_*` identity tagging
+(`prepareStandaloneTextRequest`) → authenticated BrowserHost → ChatGPT Temporary Chat.
+Prompt "Reply with exactly this single word…" returned exactly `PONG-DREAMBOOK`;
+full 14-step diagnostic trace written; `/healthz` showed zero stuck turns afterward;
+session persisted by goose as `20260822_30`.
+
+Contract notes for unattended operation:
+
+* The standalone text path is **text-only**: requests bearing `tools`/`tool_choice`
+  intentionally fall through to the native-Codex identity path and fail closed
+  ("ChatGPT web requires native Codex turn_id metadata for browser-session replay").
+  Ordinary goose runs therefore need a tool-less invocation (`--no-profile` or an
+  extension-free profile) until/unless a tool-bearing standalone contract exists.
+* Identity is deterministic (sha256 of input prefix, volatile `<turn-context>` stripped):
+  identical retries collapse onto one execution key instead of opening duplicate tabs.
+* Doctor's codex/service/proxy checks assume the Codex route / launcher-owned markers:
+  on a deliberate standalone install they report the route missing (correct) and
+  cannot verify proxy ownership via launcher markers (cosmetic false alarm here);
+  authoritative health is `/healthz` + lifecycle status.
+* Second persisted-session turn readiness: session `20260822_30` exists in
+  `~/.local/share/goose/sessions/sessions.db`; `goose run --resume --session-id 20260822_30`
+  is the ready-to-qualify continuation step (server explicitly accepts Goose-style
+  resent assistant history with derived replay identity).
+
+### Live state at checkpoint
+
+Xvfb `:99` (pid 414948), bootstrap launcher chain (bun 421363 → dev.cjs 421375 →
+vite 421392 → Electron main 421415, DISPLAY=:99), descriptor
+`<home>/runtime/launcher-browser.json` (pid 421415 alive), inspect returns
+`{"authenticated":true,"temporary":true,"url":"https://chatgpt.com/?temporary-chat=true"}`
+(`proAvailable:false`), standalone daemon pid from `<home>/run/daemon.pid` healthy on
+`127.0.0.1:17841`.

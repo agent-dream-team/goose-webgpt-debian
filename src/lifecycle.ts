@@ -5,6 +5,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import {
   inspectLauncherBrowserHost,
+  LAUNCHER_SESSION_INSPECTION_TIMEOUT_MS,
   notifyLauncherTurn,
   probeLauncherBrowserHost,
   readLauncherBrowserHostDescriptor,
@@ -59,7 +60,13 @@ export async function waitForLauncherBrowserHostSessionReady(descriptorPath: str
   let lastError = "launcher browser host did not become session-ready";
   while (Date.now() < deadline) {
     try {
-      await inspectLauncherBrowserHost(descriptorPath, { timeoutMs: 5_000, detectPro: false });
+      // Session inspection is serialized inside the launcher and can legitimately take
+      // longer than 5s (observed ~5.5s on DreamBook), so each attempt uses the module's
+      // full session-inspection timeout instead of a shorter hard-coded poll timeout.
+      await inspectLauncherBrowserHost(descriptorPath, {
+        timeoutMs: LAUNCHER_SESSION_INSPECTION_TIMEOUT_MS,
+        detectPro: false,
+      });
       return;
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
