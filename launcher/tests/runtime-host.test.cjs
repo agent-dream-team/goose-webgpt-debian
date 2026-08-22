@@ -333,6 +333,9 @@ test("system-browser login uses the Goose transfer storage-state path", async ()
     const chromeIndex = calls[0].args.indexOf("--chrome");
     assert.equal(calls[0].args[chromeIndex + 1], process.execPath);
     assert.equal(calls[0].args.includes("--launcher-owned"), true);
+    assert.equal(calls[0].args.includes("--login-profile"), true);
+    const profileIndex = calls[0].args.indexOf("--login-profile");
+    assert.equal(calls[0].args[profileIndex + 1], path.join(root, "browser-login", "login-profile"));
     assert.equal(calls[0].env.CODEX_CHATGPT_WEB_HOME, path.join(root, "goose-home"));
   } finally {
     await transfer.cleanup();

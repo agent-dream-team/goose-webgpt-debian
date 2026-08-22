@@ -293,6 +293,10 @@ class RuntimeHost {
     try { fs.chmodSync(parent, 0o700); } catch {}
     const transferRoot = fs.mkdtempSync(path.join(parent, "transfer-"));
     try { fs.chmodSync(transferRoot, 0o700); } catch {}
+    // The login profile is stable across attempts so a retried sign-in resumes the same browser
+    // session instead of starting over; only the per-attempt state transfer is disposable.
+    const loginProfileDir = path.join(parent, "login-profile");
+    try { fs.mkdirSync(loginProfileDir, { recursive: true, mode: 0o700 }); } catch {}
     const storageStatePath = path.join(transferRoot, "storage-state.json");
     const cleanup = async () => fs.rmSync(transferRoot, { recursive: true, force: true });
     try {
@@ -307,11 +311,13 @@ class RuntimeHost {
           // resolved here so the core never needs configuration for a launcher-owned login.
           "--chrome",
           this.resolveBrowserLoginExecutable(),
+          "--login-profile",
+          loginProfileDir,
           "--launcher-owned",
         ],
         {
           env: { ...process.env, CODEX_CHATGPT_WEB_HOME: this.supervisor.coreHome },
-          message: "Sign in to ChatGPT in the dedicated system Chrome/Chromium window; transfer continues automatically",
+          message: "Sign in to ChatGPT in the dedicated system Chrome/Chromium window, then quit that window; capture continues automatically",
           successMessage: "Authenticated system-browser ChatGPT session captured",
         },
       );

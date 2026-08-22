@@ -222,6 +222,24 @@ Regression coverage: fresh-profile CLI test (root suite) and launcher arg-plumbi
 assertions. Live-verified only to the real ChatGPT page loading in system Chromium
 on the Xvfb display; authentication itself remains manual.
 
+### Manual login-completion contract restored (2026-08-22)
+
+The first authenticated attempt exposed a parity gap with the established MBP
+behavior: `loginToChatGpt` attached same-process CDP and auto-polled for an
+authenticated Temporary Chat composer (10-minute deadline), then captured and
+closed the login browser itself. Automatic detection raced the human and could
+close the login browser prematurely; the upstream contract is manual completion.
+Restored here at the owning layer: the login browser is spawned **without any
+automation port**, quitting the dedicated window is the explicit completion
+signal, and only then is the persisted profile relaunched, verified (Temporary
+Chat composer + authenticated page), captured, marker-stamped, and cleaned up.
+The login profile is now stable across attempts (`--login-profile` from the
+launcher) so an abandoned sign-in resumes the same session instead of starting
+over. The 394f5f0 clean-profile bootstrap path is unchanged. Live note: the
+attempt that motivated this fix was lost before the restored flow could capture
+it (frozen auto-poller held the CDP socket; the launcher's transfer cleanup
+removed the profile when the CLI died), so one manual re-login is required.
+
 ## Groundwork changes in this checkpoint
 
 - Fixed pre-existing version-sync breakage so verification runs again on any host:

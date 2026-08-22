@@ -33,7 +33,7 @@ Usage:
   codex-chatgpt-web setup --browser-only [--standalone] [options]
   codex-chatgpt-web setup --full --tunnel-id ID --runtime-key-file PATH [options]
   codex-chatgpt-web login
-  codex-chatgpt-web login --launcher-owned --chrome PATH --storage-state PATH
+  codex-chatgpt-web login --launcher-owned --chrome PATH --storage-state PATH [--login-profile PATH]
   codex-chatgpt-web doctor [--json]
   codex-chatgpt-web route <status|connect|disconnect>
   codex-chatgpt-web browser check
@@ -374,6 +374,7 @@ async function main(): Promise<void> {
   else if (command === "login") {
     const storageStatePath = takeOption(args, "--storage-state");
     const chrome = takeOption(args, "--chrome");
+    const loginProfile = takeOption(args, "--login-profile");
     const launcherOwned = takeFlag(args, "--launcher-owned");
     assertNoArgs(args);
     if (launcherOwned) {
@@ -382,7 +383,9 @@ async function main(): Promise<void> {
       // ordinary (non-launcher-owned) logins keep requiring full configuration below.
       if (!storageStatePath) throw new Error("--launcher-owned login requires an explicit --storage-state path");
       if (!chrome) throw new Error("--launcher-owned login requires an explicit --chrome executable path");
-      const result = await loginToChatGpt({ chromeExecutablePath: chrome, storageStatePath });
+      const result = await loginToChatGpt({ chromeExecutablePath: chrome, storageStatePath }, {
+        ...(loginProfile ? { profileDir: loginProfile } : {}),
+      });
       stdout.write(`ChatGPT login stored at ${result.storageStatePath}\n`);
       return;
     }
