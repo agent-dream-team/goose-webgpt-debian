@@ -302,6 +302,12 @@ class RuntimeHost {
           "login",
           "--storage-state",
           storageStatePath,
+          // The launcher owns this login, including on a fresh profile where config.json does
+          // not exist yet (setup is gated on an authenticated BrowserHost). The executable is
+          // resolved here so the core never needs configuration for a launcher-owned login.
+          "--chrome",
+          this.resolveBrowserLoginExecutable(),
+          "--launcher-owned",
         ],
         {
           env: { ...process.env, CODEX_CHATGPT_WEB_HOME: this.supervisor.coreHome },

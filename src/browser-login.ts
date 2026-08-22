@@ -357,7 +357,7 @@ export function storedBrowserLoginCapabilities(config: AppConfig): { proAvailabl
 }
 
 export async function loginToChatGpt(
-  config: AppConfig,
+  config: Pick<AppConfig, "chromeExecutablePath" | "storageStatePath">,
   options: { timeoutMs?: number; storageStatePath?: string } = {},
 ): Promise<BrowserLoginResult> {
   if (!existsSync(config.chromeExecutablePath)) {

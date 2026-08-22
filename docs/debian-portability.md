@@ -208,6 +208,20 @@ Operational notes:
 **Not yet qualified:** manual ChatGPT login, post-login setup/config issuance,
 authenticated session-ready lifecycle start, any live ChatGPT-Web turn.
 
+### Clean-profile sign-in deadlock fix (2026-08-22)
+
+First manual-login attempt exposed a circular dependency on a fresh profile:
+launcher `Open sign in` → `browser-login login` → `loadConfig()` failed because
+config.json does not exist until setup completes, and setup is gated on an
+authenticated BrowserHost. Fix at the owning layer (CLI `login` command): a new
+explicitly-scoped `--launcher-owned` mode requires explicit `--chrome` and
+`--storage-state` from the launching launcher and never reads config.json;
+ordinary logins keep requiring full configuration unchanged. The launcher now
+resolves the executable via its existing browser discovery and passes those flags.
+Regression coverage: fresh-profile CLI test (root suite) and launcher arg-plumbing
+assertions. Live-verified only to the real ChatGPT page loading in system Chromium
+on the Xvfb display; authentication itself remains manual.
+
 ## Groundwork changes in this checkpoint
 
 - Fixed pre-existing version-sync breakage so verification runs again on any host:
