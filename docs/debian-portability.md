@@ -174,6 +174,40 @@ missing-tunnel failures, group-kill without orphans (see `tests/linux-lifecycle.
 10 tests). **Not yet qualified:** launcher BrowserHost construction, authenticated
 ChatGPT login, any live model turn, full-mode tunnel against the real tunnel service.
 
+## BrowserHost live qualification on Debian (2026-08-22)
+
+First live Electron BrowserHost qualification on this host, stopping exactly at the
+manual ChatGPT authentication boundary. Branch tip `e5d2943`; **no production source
+changes were required** — all steps used the existing architecture and helpers.
+
+| Check | Result |
+| --- | --- |
+| Chromium 151 installed (`/usr/bin/chromium`) | PASS (apt `chromium`, ordinary Debian package) |
+| dreamteam-owned virtual display | PASS (`Xvfb :99 -screen 0 1440x900x24 -nolisten tcp`, user-owned; the console graphical seat belongs to another account and was not touched) |
+| Launcher build viability (dev path: vite + electron, helper built to `.launcher-runtime/browser-helper.cjs`) | PASS |
+| Bootstrap-only BrowserHost construction under DISPLAY=:99 | PASS (`scripts/start-goose-launcher.ts`, Electron 41.7.1) |
+| Descriptor issuance | PASS: `<home>/runtime/launcher-browser.json` written 0o600 with pid/CDP/control/helper/partition/surfaceId |
+| CDP + control endpoints loopback-listening | PASS (`127.0.0.1:<ephemeral>` both) |
+| Descriptor-helper readiness through canonical path | PASS: control-plane surface lease → helper spawned as Electron-with-`ELECTRON_RUN_AS_NODE=1` → exact-surface verification → lease released in `finally` |
+| Authentication boundary reached | PASS: `/v1/session/inspect` returns `login-required: saved ChatGPT session is not authenticated`; nothing past that point was automated |
+| Clean shutdown | PASS: SIGTERM → session flush/persist → descriptor removed → CDP/control sockets down → zero orphaned owned processes; `persist:codex-web-gpt-chatgpt` profile data retained for the later manual login |
+
+Operational notes:
+
+- The launcher's Linux browser discovery already covers `/usr/bin/chromium`
+  (`launcher/electron/runtime.cjs`); BrowserHost itself runs on the launcher's
+  Electron binary resolved via `require("electron")`. No executable-path workaround
+  was needed.
+- `codex-chatgpt-web setup --browser-host-descriptor …` intentionally refuses until a
+  live *authenticated* BrowserHost exists (capability probe); config.json therefore
+  does not exist yet. This is by design, not a defect.
+- Detached/nohup launch layers do not forward SIGTERM to the dev supervisor; send
+  SIGTERM to the `dev.cjs` bun process or to the Electron main process directly. This
+  is a shell-invocation artifact, not a product signal-handling defect.
+
+**Not yet qualified:** manual ChatGPT login, post-login setup/config issuance,
+authenticated session-ready lifecycle start, any live ChatGPT-Web turn.
+
 ## Groundwork changes in this checkpoint
 
 - Fixed pre-existing version-sync breakage so verification runs again on any host:
@@ -205,12 +239,11 @@ no Electron rewrite.
 
 ## Exact blockers before first live ChatGPT-Web qualification
 
-1. A Chromium/Chrome binary installed and reachable (apt chromium vs Google Chrome .deb
-   decision), recorded as `chromeExecutablePath` in config.
-2. A real display session for the runtime user (graphical login preferred; `xvfb`
-   installed only if a headless experiment is explicitly chosen — noting upstream
-   warns that Bun-direct CDP probes are not authoritative readiness evidence, so
-   readiness must go through the descriptor-provided helper either way).
+1. ~~A Chromium/Chrome binary installed~~ — done 2026-08-22: `/usr/bin/chromium`
+   (apt `chromium`); launcher discovery already lists it.
+2. ~~A real display session for the runtime user~~ — done 2026-08-22 as a bounded
+   headless experiment: dreamteam-owned `Xvfb :99`. A real console graphical login for
+   `dreamteam` remains unavailable while another account owns the seat.
 3. Manual launcher BrowserHost login completed once (interactive, authenticated;
    cannot be automated safely at this stage).
 4. First ordinary Goose turn + separate persisted-session `--resume` continuation,
