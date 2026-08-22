@@ -221,7 +221,7 @@ export async function startLifecycle(): Promise<LifecycleStatus> {
   let startedLauncherBootstrap = false;
   try {
     if (config.mode === "full") {
-      if (!getTunnelServiceStatus().loaded) startTunnelService();
+      if (!getTunnelServiceStatus().loaded) await startTunnelService();
       const tunnel = await waitForTunnelServiceReady(config);
       if (!tunnel.ok) throw new Error(`Tunnel runtime did not become ready: ${tunnel.detail}`);
     }
@@ -244,9 +244,9 @@ export async function startLifecycle(): Promise<LifecycleStatus> {
       await probeLauncherBrowserHost(descriptorPath, { timeoutMs: 5_000 });
     }
     if (config.mode === "browser-only") {
-      if (!getServiceStatus().loaded) startService();
+      if (!getServiceStatus().loaded) await startService();
     } else {
-      if (!getServiceStatus().loaded) startService();
+      if (!getServiceStatus().loaded) await startService();
       const tunnel = await waitForTunnelServiceReady(config);
       if (!tunnel.ok) throw new Error(`Tunnel runtime did not become ready: ${tunnel.detail}`);
     }

@@ -3,9 +3,61 @@ import { homedir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import type { AppConfig } from "./config";
 import { assertDurableRuntimeCommand, atomicWriteFile, getConfigDir } from "./config";
-import { runCommand, runChecked } from "./process";
+import {
+  liveChildServicePid,
+  startChildService,
+  stopChildService,
+  tailChildServiceLog,
+} from "./child-process-service";
+import { loadConfig } from "./config";
+import { processRunning, runCommand, runChecked } from "./process";
 
 export const SERVICE_LABEL = "io.github.codex-chatgpt-web.daemon";
+
+/** Runtime-home pidfile name for the direct child-process daemon used off macOS. */
+export const DAEMON_CHILD_SERVICE_NAME = "daemon";
+
+const DAEMON_READY_TIMEOUT_MS = 20_000;
+const DAEMON_READY_POLL_MS = 200;
+
+export interface WaitForDaemonHttpReadyOptions {
+  timeoutMs?: number;
+  pollMs?: number;
+  fetchImpl?: typeof fetch;
+}
+
+/**
+ * Meaningful daemon readiness evidence for the direct child-process path: the owned
+ * child is still alive AND the loopback /healthz endpoint answers OK. Deterministically
+ * preserves startup failures (early exit surfaces the stderr log tail).
+ */
+export async function waitForDaemonHttpReady(
+  config: Pick<AppConfig, "host" | "port">,
+  childPid: number | undefined,
+  { timeoutMs = DAEMON_READY_TIMEOUT_MS, pollMs = DAEMON_READY_POLL_MS, fetchImpl = fetch }: WaitForDaemonHttpReadyOptions = {},
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastDetail = "daemon never answered /healthz";
+  while (Date.now() < deadline) {
+    if (childPid !== undefined && !processRunning(childPid)) {
+      const tail = tailChildServiceLog(DAEMON_CHILD_SERVICE_NAME);
+      throw new Error(`daemon process exited during startup${tail ? `: ${tail}` : ""}`);
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.min(1_000, pollMs * 5));
+    try {
+      const response = await fetchImpl(`http://${config.host}:${config.port}/healthz`, { signal: controller.signal });
+      if (response.ok) return;
+      lastDetail = `/healthz responded HTTP ${response.status}`;
+    } catch (error) {
+      lastDetail = error instanceof Error ? error.message : String(error);
+    } finally {
+      clearTimeout(timer);
+    }
+    await new Promise(resolveWait => setTimeout(resolveWait, pollMs));
+  }
+  throw new Error(`daemon /healthz was not ready within ${timeoutMs}ms: ${lastDetail}`);
+}
 
 export interface ServiceStatus {
   supported: boolean;
@@ -111,6 +163,10 @@ function assertMacOs(): void {
 }
 
 export function getServiceStatus(): ServiceStatus {
+  if (process.platform === "linux") {
+    const loaded = liveChildServicePid(DAEMON_CHILD_SERVICE_NAME) !== undefined;
+    return { supported: true, installed: loaded, loaded, label: SERVICE_LABEL };
+  }
   if (process.platform !== "darwin") return { supported: false, installed: false, loaded: false, label: SERVICE_LABEL };
   const path = plistPath();
   const result = runCommand("launchctl", ["print", serviceTarget()]);
@@ -136,7 +192,42 @@ export function installService(config: AppConfig): ServiceStatus {
   return getServiceStatus();
 }
 
-export function startService(): ServiceStatus {
+/**
+ * Direct child-process daemon start for platforms without launchd (Linux). Spawns the
+ * exact same runtime entry point the launchd definition encodes
+ * (`[...runtimeCommand, "serve"]` with CODEX_CHATGPT_WEB_HOME), then waits for real
+ * readiness (/healthz OK) so startup failures propagate deterministically.
+ */
+async function startDaemonChildProcess(): Promise<ServiceStatus> {
+  const status = getServiceStatus();
+  if (status.loaded) return status;
+  const config = loadConfig();
+  assertDurableRuntimeCommand(config.runtimeCommand);
+  const pid = startChildService({
+    name: DAEMON_CHILD_SERVICE_NAME,
+    command: config.runtimeCommand[0],
+    args: [...config.runtimeCommand.slice(1), "serve"],
+    env: { ...process.env, CODEX_CHATGPT_WEB_HOME: getConfigDir() },
+  });
+  try {
+    await waitForDaemonHttpReady(config, pid);
+  } catch (error) {
+    // Preserve the original causal error; cleanup failures are appended, never replace it.
+    try {
+      await stopChildService(DAEMON_CHILD_SERVICE_NAME);
+    } catch (cleanupError) {
+      const primary = error instanceof Error ? error.message : String(error);
+      throw new Error(`${primary}; daemon cleanup after failed startup also failed: ${
+        cleanupError instanceof Error ? cleanupError.message : String(cleanupError)
+      }`);
+    }
+    throw error;
+  }
+  return getServiceStatus();
+}
+
+export async function startService(): Promise<ServiceStatus> {
+  if (process.platform === "linux") return startDaemonChildProcess();
   assertMacOs();
   const path = plistPath();
   if (!existsSync(path)) throw new Error(`Service is not installed: ${path}`);
@@ -256,6 +347,18 @@ export function removeLegacyRuntimeArtifacts(config: AppConfig): void {
 }
 
 export async function stopService(config: AppConfig): Promise<ServiceStatus> {
+  if (process.platform === "linux") {
+    if (!getServiceStatus().loaded) return getServiceStatus();
+    // Same idleness contract as macOS: drain before termination, and a failed drain
+    // or failed termination keeps the causal error while noting compensation failures.
+    const lease = await acquireDrain(config);
+    try {
+      await stopChildService(DAEMON_CHILD_SERVICE_NAME);
+    } catch (error) {
+      return releaseDrainAfterFailure(lease, error);
+    }
+    return getServiceStatus();
+  }
   assertMacOs();
   if (getServiceStatus().loaded) {
     const lease = await acquireDrain(config);

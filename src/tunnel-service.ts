@@ -2,11 +2,19 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import type { AppConfig } from "./config";
-import { atomicWriteFile, getConfigDir } from "./config";
+import { atomicWriteFile, getConfigDir, loadConfig } from "./config";
+import {
+  liveChildServicePid,
+  startChildService,
+  stopChildService,
+} from "./child-process-service";
 import { runCommand, runChecked } from "./process";
 import type { TunnelRuntimeStatus } from "./tunnel";
 
 export const TUNNEL_SERVICE_LABEL = "io.github.codex-chatgpt-web.tunnel";
+
+/** Runtime-home pidfile name for the direct child-process tunnel used off macOS. */
+export const TUNNEL_CHILD_SERVICE_NAME = "tunnel";
 const TUNNEL_HEALTH_TIMEOUT_MS = 3_000;
 const TUNNEL_HEALTH_POLL_INTERVAL_MS = 1_000;
 
@@ -201,6 +209,10 @@ ${args.map(arg => `    <string>${xml(arg)}</string>`).join("\n")}
 }
 
 export function getTunnelServiceStatus(): TunnelServiceStatus {
+  if (process.platform === "linux") {
+    const running = liveChildServicePid(TUNNEL_CHILD_SERVICE_NAME) !== undefined;
+    return { supported: true, installed: running, loaded: running, running, label: TUNNEL_SERVICE_LABEL };
+  }
   if (process.platform !== "darwin") {
     return { supported: false, installed: false, loaded: false, running: false, label: TUNNEL_SERVICE_LABEL };
   }
@@ -239,7 +251,30 @@ export function installTunnelService(config: AppConfig): TunnelServiceStatus {
   return getTunnelServiceStatus();
 }
 
-export function startTunnelService(): TunnelServiceStatus {
+/**
+ * Direct child-process tunnel start for platforms without launchd (Linux). Requires the
+ * same binary/profile preconditions as launchd installation and spawns the exact same
+ * `tunnel-client run` arguments; readiness is proven by waitForTunnelServiceReady.
+ */
+async function startTunnelChildProcess(): Promise<TunnelServiceStatus> {
+  const current = getTunnelServiceStatus();
+  if (current.running) return current;
+  const config = loadConfig();
+  const tunnel = tunnelSettings(config);
+  if (!existsSync(tunnel.binaryPath)) throw new Error(`Tunnel client is missing: ${tunnel.binaryPath}`);
+  const profile = join(tunnel.profileDir, `${tunnel.profileName}.yaml`);
+  if (!existsSync(profile)) throw new Error(`Tunnel profile is missing: ${profile}`);
+  startChildService({
+    name: TUNNEL_CHILD_SERVICE_NAME,
+    command: tunnel.binaryPath,
+    args: ["run", "--profile-dir", tunnel.profileDir, "--profile", tunnel.profileName],
+    env: { ...process.env, CODEX_CHATGPT_WEB_HOME: getConfigDir() },
+  });
+  return getTunnelServiceStatus();
+}
+
+export async function startTunnelService(): Promise<TunnelServiceStatus> {
+  if (process.platform === "linux") return startTunnelChildProcess();
   assertMacOs();
   if (!existsSync(plistPath())) throw new Error("Tunnel service is not installed; rerun full setup");
   if (!getTunnelServiceStatus().loaded) runChecked("launchctl", ["bootstrap", launchDomain(), plistPath()]);
@@ -255,6 +290,10 @@ async function waitForTunnelServiceUnloaded(timeoutMs = 20_000): Promise<void> {
 }
 
 export async function stopTunnelService(): Promise<TunnelServiceStatus> {
+  if (process.platform === "linux") {
+    if (getTunnelServiceStatus().running) await stopChildService(TUNNEL_CHILD_SERVICE_NAME);
+    return getTunnelServiceStatus();
+  }
   assertMacOs();
   if (getTunnelServiceStatus().loaded) {
     runChecked("launchctl", ["bootout", serviceTarget()]);

@@ -228,7 +228,7 @@ async function serviceCommand(args: string[]): Promise<void> {
   }
   const status = action === "status" ? getServiceStatus()
     : action === "install" ? installService(config!)
-      : action === "start" ? startService()
+      : action === "start" ? await startService()
         : action === "restart" ? await restartService(config!)
           : action === "stop" ? await stopService(config!)
             : undefined;
@@ -247,7 +247,7 @@ async function tunnelCommand(args: string[]): Promise<void> {
     return;
   }
   const config = loadConfig();
-  if (action === "start") startTunnelService();
+  if (action === "start") await startTunnelService();
   else if (action === "restart") {
     await assertServiceIdle(config);
     await restartTunnelService();

@@ -70,11 +70,10 @@ Evidence-based inventory (file:line verified on branch tip `a3785fa`). Git archa
 
 ### Linux adaptation required
 
-- **Daemon/tunnel service start on Linux**: `startLifecycle()` calls
-  `startService()`/`startTunnelService()` which hard-fail off-macOS
-  (`src/service.ts:104-108`, `src/tunnel-service.ts:161-165`). On Debian these must be
-  run manually first (see execution path below); user-level systemd units are later
-  work, only after the manual runtime is proven.
+- **Daemon/tunnel service start on Linux** — *implemented 2026-08-22, see "Linux
+  daemon/tunnel lifecycle implementation" below.* `startService()`/
+  `startTunnelService()` now have direct child-process branches behind the existing
+  platform gates; launchd remains authoritative on Darwin.
 - Terminal-only managed-Chrome setup gate (`src/setup.ts:302-306`): Linux intentionally
   requires launcher-BrowserHost mode today.
 - Default browser discovery lists `/usr/bin/google-chrome` etc. but Debian's apt package
@@ -132,16 +131,48 @@ Manual-first; no launchd port, no systemd, no autostart. Each step is operator-r
    `scripts/install-launcher.sh` AppImage flow) and complete ChatGPT authentication
    inside its BrowserHost window. This produces config.json with
    `browserHost: "launcher"` plus the BrowserHost descriptor.
-4. Start the Responses daemon manually (equivalent of what the launchd plist runs):
-   `CODEX_CHATGPT_WEB_HOME=~/.codex-chatgpt-web bun run src/cli.ts serve`.
-5. Full mode additionally starts the tunnel client manually with the same profile args
-   the tunnel plist encodes (`tunnel-client run --profile-dir … --profile …`).
-6. Point Goose at the loopback Responses endpoint via the existing custom-provider
+4. Daemon startup is now available on Linux via the same operator commands as macOS:
+   `codex-chatgpt-web service start|stop|status` or `codex-chatgpt-web lifecycle
+   status/start/stop`. The Linux path spawns the identical runtime entry point
+   (`[...runtimeCommand, "serve"]`) directly, records ownership under
+   `<runtime home>/run/*.pid`, waits for real `/healthz` readiness, drains before
+   termination (same idleness contract), kills the whole process group on stop, and
+   propagates startup failures deterministically. Full mode additionally starts the
+   tunnel client (`tunnel-client run --profile-dir … --profile …`, same args as the
+   launchd definition); its readiness evidence remains `waitForTunnelServiceReady`.
+5. Point Goose at the loopback Responses endpoint via the existing custom-provider
    integration, then attempt one ordinary Goose turn (first live qualification).
 
-Note: `codex-chatgpt-web lifecycle status/start` cannot work on Linux until daemon/
-tunnel startup gains a non-launchd path; that adaptation is deliberately deferred past
-the first manual proof.
+## Linux daemon/tunnel lifecycle implementation (2026-08-22)
+
+Implemented behind the existing platform gates; Darwin behavior unchanged:
+
+- New `src/child-process-service.ts`: detached process-group service children with
+  pidfiles under `<runtime home>/run/<name>.pid` (0o700 dir / 0o600 file), per-service
+  logs under `<runtime home>/logs/`, stale-pidfile cleanup, SIGTERM→SIGKILL group
+  escalation, bounded shutdown that refuses to leave surviving groups, and log-tail
+  extraction for failure messages. Ownership is guaranteed by construction: an
+  exclusive per-service start lock serializes check-spawn-record sequences (concurrent
+  starts fail fast instead of creating an unowned second daemon), a failed pidfile
+  write kills the just-spawned group, and stale records are removed only while they
+  still name the observed dead PID.
+- `src/service.ts`: `getServiceStatus()` reports real daemon liveness on Linux;
+  `startService()` spawns the exact launchd-equivalent command and additionally waits
+  for meaningful readiness (`GET /healthz` OK while the owned child is alive — early
+  exits surface the stderr tail); `stopService()` keeps the macOS drain contract
+  (drain → terminate → causal-error-preserving compensation).
+- `src/tunnel-service.ts`: Linux branches for status/start/stop with the same binary/
+  profile preconditions as launchd installation; readiness still proven by the shared
+  `waitForTunnelServiceReady` healthz/readyz probes.
+- `src/lifecycle.ts`/`src/cli.ts`: starts are now awaited so failures propagate
+  deterministically through `lifecycle start`; canonical order and all readiness proofs
+  unchanged.
+
+Component-qualified on Debian without GUI: real daemon boot to `/healthz`-ready,
+drain+stop with no orphaned processes, deterministic daemon-exit/port-unreachable/
+missing-tunnel failures, group-kill without orphans (see `tests/linux-lifecycle.test.ts`,
+10 tests). **Not yet qualified:** launcher BrowserHost construction, authenticated
+ChatGPT login, any live model turn, full-mode tunnel against the real tunnel service.
 
 ## Groundwork changes in this checkpoint
 
@@ -167,6 +198,8 @@ no Electron rewrite.
 | `launcher:build` (vite production build) | PASS |
 | `build-runtime-bundle` to temp dir | Builds full runtime layout on Linux |
 | `check-version` | PASS after README sync fix |
+| Linux daemon/tunnel lifecycle (`tests/linux-lifecycle.test.ts`) | 10/10 PASS: real daemon boot to `/healthz`-ready, drain+stop without orphans, deterministic failure propagation (exit/port/missing-tunnel), group kill, stale pidfiles, darwin contracts pinned |
+| CLI-level qualification on Debian (`service start/status/stop` + `lifecycle status`) | PASS: real daemon served `/healthz` JSON; stop left zero owned processes |
 | Full `bun run verify` | NOT RUN end-to-end (last step `smoke-release.ts` is macOS-gated; see adaptations) |
 | Live ChatGPT-Web turn on Linux | NOT RUN (blocked; see below) |
 
@@ -180,8 +213,7 @@ no Electron rewrite.
    readiness must go through the descriptor-provided helper either way).
 3. Manual launcher BrowserHost login completed once (interactive, authenticated;
    cannot be automated safely at this stage).
-4. Daemon/tunnel started by hand per the path above (no service manager yet).
-5. First ordinary Goose turn + separate persisted-session `--resume` continuation,
+4. First ordinary Goose turn + separate persisted-session `--resume` continuation,
    observed live, before anything here may be called qualified.
 
 ## Recommended next slice
