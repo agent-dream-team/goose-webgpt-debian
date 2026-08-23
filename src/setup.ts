@@ -26,10 +26,11 @@ import {
   installService,
   removeLegacyRuntimeArtifacts,
   restartService,
+  startService,
   uninstallService,
 } from "./service";
 import { connectTunnel, createTunnelConfig, installRuntimeKey, installRuntimeKeyBytes, installTunnelClient, managedRuntimeKeyPath, stopTunnel } from "./tunnel";
-import { getTunnelServiceStatus, installTunnelService, restartTunnelService, stopTunnelService, tunnelServiceDefinitionMatches, uninstallTunnelService, waitForTunnelServiceReady } from "./tunnel-service";
+import { getTunnelServiceStatus, installTunnelService, restartTunnelService, startTunnelService, stopTunnelService, tunnelServiceDefinitionMatches, uninstallTunnelService, waitForTunnelServiceReady } from "./tunnel-service";
 import { VERSION } from "./version";
 
 export interface SetupOptions {
@@ -403,7 +404,15 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
         await assertServiceIdle(existing ?? config);
         if (tunnelService.loaded) await stopTunnelService();
         await bootstrapTunnelProfile(config);
-        installTunnelService(config);
+        if (process.platform === "darwin") {
+          installTunnelService(config);
+        } else {
+          // No launchd on Linux: start the managed child-process tunnel directly from the
+          // freshly bootstrapped profile so the readiness wait below sees a real runtime.
+          // The in-memory config is required here: setup activates the tunnel before it
+          // commits the new full-mode configuration to disk.
+          await startTunnelService(config);
+        }
       } else if (refreshTunnelWorker) {
         await assertServiceIdle(existing ?? config);
         await restartTunnelService();
@@ -419,6 +428,10 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   if (launcherBrowserHost) saveConfig(config);
   if (gooseStandaloneBrowserHost) {
     if (changedWhileLoaded && options.restartService && existing) await restartService(config, existing);
+    else if (process.platform === "linux" && !getServiceStatus().loaded) await startService();
+    // Linux terminal-managed daemons have no supervisor to auto-start them after a standalone
+    // launcher setup, so bring the freshly configured daemon up before waiting for the proxy
+    // contract; macOS keeps its existing ownership/coordinator flow untouched.
     await waitForProxy(config, 30_000);
   }
   // Keep the previous terminal runtime intact through the ownership handoff. A later launcher

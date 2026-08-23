@@ -233,3 +233,21 @@ describe("tunnel launchd ownership", () => {
     }
   });
 });
+
+test("Linux child-process tunnel start honors an explicit config override instead of disk state", async () => {
+  if (process.platform !== "linux") return;
+  const { startTunnelService } = await import("../src/tunnel-service");
+  // A full-mode override whose binary is deliberately absent proves the override (not the
+  // on-disk config, which may not even be in full mode yet — e.g. mid-setup) drives the
+  // start preconditions. Ignoring the override would fail with "Tunnel service requires
+  // full mode" against a browser-only disk config instead.
+  const override = {
+    ...defaultConfig("full"),
+    tunnel: createTunnelConfig({
+      binaryPath: "/nonexistent/codex-chatgpt-web-tunnel-client",
+      tunnelId: "tunnel_" + "0".repeat(32),
+      runtimeKeyFile: "/nonexistent/runtime.key",
+    }),
+  };
+  expect(startTunnelService(override)).rejects.toThrow("Tunnel client is missing");
+});

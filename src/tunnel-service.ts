@@ -256,10 +256,10 @@ export function installTunnelService(config: AppConfig): TunnelServiceStatus {
  * same binary/profile preconditions as launchd installation and spawns the exact same
  * `tunnel-client run` arguments; readiness is proven by waitForTunnelServiceReady.
  */
-async function startTunnelChildProcess(): Promise<TunnelServiceStatus> {
+async function startTunnelChildProcess(configOverride?: AppConfig): Promise<TunnelServiceStatus> {
   const current = getTunnelServiceStatus();
   if (current.running) return current;
-  const config = loadConfig();
+  const config = configOverride ?? loadConfig();
   const tunnel = tunnelSettings(config);
   if (!existsSync(tunnel.binaryPath)) throw new Error(`Tunnel client is missing: ${tunnel.binaryPath}`);
   const profile = join(tunnel.profileDir, `${tunnel.profileName}.yaml`);
@@ -273,8 +273,8 @@ async function startTunnelChildProcess(): Promise<TunnelServiceStatus> {
   return getTunnelServiceStatus();
 }
 
-export async function startTunnelService(): Promise<TunnelServiceStatus> {
-  if (process.platform === "linux") return startTunnelChildProcess();
+export async function startTunnelService(config?: AppConfig): Promise<TunnelServiceStatus> {
+  if (process.platform === "linux") return startTunnelChildProcess(config);
   assertMacOs();
   if (!existsSync(plistPath())) throw new Error("Tunnel service is not installed; rerun full setup");
   if (!getTunnelServiceStatus().loaded) runChecked("launchctl", ["bootstrap", launchDomain(), plistPath()]);
