@@ -322,7 +322,50 @@ export async function assertServiceIdle(config: AppConfig): Promise<void> {
   await lease.release();
 }
 
+/**
+ * The Linux restart contract, expressed against injected managed-service operations so
+ * regression tests can prove ordering/credential/fail-closed semantics without touching
+ * the process-global module registry. The production wrapper below wires the real
+ * managed child-process lifecycle (`stopService`/`startService` primitives).
+ */
+export async function restartLinuxService(
+  config: AppConfig,
+  drainConfig: AppConfig,
+  ops: {
+    loaded: () => boolean;
+    drain: (cfg: AppConfig) => Promise<DrainLease>;
+    stop: () => Promise<void>;
+    start: () => Promise<ServiceStatus>;
+    status: () => ServiceStatus;
+  },
+): Promise<ServiceStatus> {
+  if (!ops.loaded()) return ops.start();
+  // Same idleness contract as macOS: drain against the credentials the RUNNING daemon
+  // still accepts (`drainConfig`), while the fresh child loads the committed on-disk
+  // configuration (`config`) — so a control-token rotation in `config` takes effect
+  // atomically with the restart instead of leaving daemon and configuration
+  // asymmetrically authenticated. A failure between stop and start keeps the causal
+  // error while attempting a compensating resume; recovery is a plain `service start`.
+  const lease = await ops.drain(drainConfig);
+  try {
+    await ops.stop();
+    await ops.start();
+  } catch (error) {
+    return releaseDrainAfterFailure(lease, error);
+  }
+  return ops.status();
+}
+
 export async function restartService(config: AppConfig, drainConfig: AppConfig = config): Promise<ServiceStatus> {
+  if (process.platform === "linux") {
+    return restartLinuxService(config, drainConfig, {
+      loaded: () => getServiceStatus().loaded,
+      drain: acquireDrain,
+      stop: () => stopChildService(DAEMON_CHILD_SERVICE_NAME),
+      start: startDaemonChildProcess,
+      status: getServiceStatus,
+    });
+  }
   assertMacOs();
   if (!getServiceStatus().loaded) return startService();
   const lease = await acquireDrain(drainConfig);
