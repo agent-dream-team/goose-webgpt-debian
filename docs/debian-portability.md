@@ -1,11 +1,18 @@
 # Debian/Linux portability groundwork
 
-Status: **groundwork / evidence-based** (2026-08-22). Branch: `groundwork/debian-provider`.
+Status: **phase closed 2026-08-24** — implemented and live-qualified on this host
+(see the [Phase closure](#phase-closure-debian-groundwork-complete-2026-08-24)
+section at the end). Originally: **groundwork / evidence-based** (2026-08-22).
+Branch: `groundwork/debian-provider`.
 Host audited: Debian 12 (bookworm), kernel 6.1.0-43-amd64, glibc 2.36, x86_64.
 
-This document preserves the architectural and platform findings needed before any real
-Debian ChatGPT-Web runtime work. It does **not** claim Linux ChatGPT-Web qualification:
-no authenticated browser turn has been run on this host yet.
+This document preserves the architectural and platform findings made before any real
+Debian ChatGPT-Web runtime work existed. Its original caveat — that it did **not**
+claim Linux ChatGPT-Web qualification because no authenticated browser turn had been
+run on this host yet — was true when written and is now **superseded**: see the
+**Phase closure** section at the end for what is implemented and live-qualified.
+Checkpoint sections below are retained as dated history; each checkpoint's "Not yet
+qualified" list describes that checkpoint only, not the current state.
 
 ## Scope boundary
 
@@ -98,8 +105,11 @@ Evidence-based inventory (file:line verified on branch tip `a3785fa`). Git archa
 
 - Entire launchd triple: `src/service.ts`, `src/tunnel-service.ts`, `src/autostart.ts`
   (plists, `launchctl bootstrap/bootout/print/kickstart`, `~/Library/LaunchAgents`,
-  managed launchd dir). All fail closed on non-darwin; status functions report
-  `supported:false`.
+  managed launchd dir). The launchd-specific operations themselves still fail closed on
+  non-darwin, and their status functions report `supported:false`. *(Superseded detail:
+  since `251ef6b`/`527bb00` these modules additionally carry Linux child-process
+  lifecycle branches — daemon, tunnel, and `restartService()` no longer fail closed on
+  Linux; see Phase closure.)*
 - Launcher darwin-only bits: `.app` bundle resolution and ditto-based mac
   extract/copy/relaunch (`update.cjs`, `update-worker.cjs` mac paths), external-launchd
   rollback snapshot guard (`runtime.cjs:413-415`), mac terminal repair refusal
@@ -173,6 +183,8 @@ drain+stop with no orphaned processes, deterministic daemon-exit/port-unreachabl
 missing-tunnel failures, group-kill without orphans (see `tests/linux-lifecycle.test.ts`,
 10 tests). **Not yet qualified:** launcher BrowserHost construction, authenticated
 ChatGPT login, any live model turn, full-mode tunnel against the real tunnel service.
+*(Checkpoint note: all four were subsequently qualified on this host; see Phase
+closure.)*
 
 ## BrowserHost live qualification on Debian (2026-08-22)
 
@@ -207,6 +219,7 @@ Operational notes:
 
 **Not yet qualified:** manual ChatGPT login, post-login setup/config issuance,
 authenticated session-ready lifecycle start, any live ChatGPT-Web turn.
+*(Checkpoint note: all four were subsequently qualified; see Phase closure.)*
 
 ### Clean-profile sign-in deadlock fix (2026-08-22)
 
@@ -276,12 +289,17 @@ no Electron rewrite.
 2. ~~A real display session for the runtime user~~ — done 2026-08-22 as a bounded
    headless experiment: dreamteam-owned `Xvfb :99`. A real console graphical login for
    `dreamteam` remains unavailable while another account owns the seat.
-3. Manual launcher BrowserHost login completed once (interactive, authenticated;
-   cannot be automated safely at this stage).
-4. First ordinary Goose turn + separate persisted-session `--resume` continuation,
-   observed live, before anything here may be called qualified.
+3. ~~Manual launcher BrowserHost login completed once~~ — done 2026-08-22 (operator
+   login through the launcher UI; the authenticated profile has been reused since).
+4. ~~First ordinary Goose turn + separate persisted-session `--resume`
+   continuation~~ — done: text path first (`PONG-DREAMBOOK`, session `20260822_30`),
+   then the full/tool-capable path (see Phase closure).
 
 ## Recommended next slice
+
+*(Superseded 2026-08-22…24: done via the Linux child-process lifecycle branches and the
+subsequent full-mode and restart fixes — commits `251ef6b`, `527bb00`. User-level
+systemd remains deliberately out; see Phase closure.)*
 
 Port the smallest possible daemon/tunnel startup alternative behind the existing gates
 (e.g., a direct child-process `lifecycle start --foreground` variant for Linux that
@@ -361,11 +379,17 @@ session persisted by goose as `20260822_30`.
 
 Contract notes for unattended operation:
 
-* The standalone text path is **text-only**: requests bearing `tools`/`tool_choice`
-  intentionally fall through to the native-Codex identity path and fail closed
-  ("ChatGPT web requires native Codex turn_id metadata for browser-session replay").
-  Ordinary goose runs therefore need a tool-less invocation (`--no-profile` or an
-  extension-free profile) until/unless a tool-bearing standalone contract exists.
+* *(Superseded 2026-08-23: the full/tool-capable mode inherited from the proven macOS
+  implementation is now deployed and live-qualified on this host — real structured tool
+  calls execute through the `Goose Native 2nd Shift` connector and the dedicated tunnel,
+  exactly-once, with Goose approving/executing; see Phase closure. The note below
+  records the browser-only checkpoint contract.)*
+* At this checkpoint the standalone text path was **text-only**: requests bearing
+  `tools`/`tool_choice` intentionally fell through to the native-Codex identity path and
+  failed closed ("ChatGPT web requires native Codex turn_id metadata for browser-session
+  replay"). Ordinary goose runs therefore needed a tool-less invocation (`--no-profile`
+  or an extension-free profile) until the tool-bearing standalone contract landed (see
+  Phase closure).
 * Identity is deterministic (sha256 of input prefix, volatile `<turn-context>` stripped):
   identical retries collapse onto one execution key instead of opening duplicate tabs.
 * Doctor's codex/service/proxy checks assume the Codex route / launcher-owned markers:
@@ -375,7 +399,8 @@ Contract notes for unattended operation:
 * Second persisted-session turn readiness: session `20260822_30` exists in
   `~/.local/share/goose/sessions/sessions.db`; `goose run --resume --session-id 20260822_30`
   is the ready-to-qualify continuation step (server explicitly accepts Goose-style
-  resent assistant history with derived replay identity).
+  resent assistant history with derived replay identity). *(Done: persisted `--resume`
+  continuation and daemon-restart continuity are both qualified; see Phase closure.)*
 
 ### Live state at checkpoint
 
@@ -385,3 +410,66 @@ vite 421392 → Electron main 421415, DISPLAY=:99), descriptor
 `{"authenticated":true,"temporary":true,"url":"https://chatgpt.com/?temporary-chat=true"}`
 (`proAvailable:false`), standalone daemon pid from `<home>/run/daemon.pid` healthy on
 `127.0.0.1:17841`.
+
+---
+
+## Phase closure: Debian groundwork complete (2026-08-24)
+
+Head `527bb00` closes the `groundwork/debian-provider` phase. **No known Linux
+lifecycle blocker remains.** This section supersedes any stale claim elsewhere in this
+document.
+
+### Implemented and live-qualified on this host
+
+- **Debian BrowserHost launch/persistence** via the launcher, including the manual
+  ChatGPT login completed once by the operator and authenticated profile reuse
+  (`Partitions/codex-web-gpt-chatgpt`) ever since.
+- **Standalone browser-only text provider**: first ordinary Goose turn through the
+  loopback Responses endpoint answered exactly `PONG-DREAMBOOK` with a full diagnostic
+  browser-turn trace (persisted session `20260822_30`).
+- **Persisted-session continuation**: a named Goose session continued through a
+  separate later `goose run --resume`.
+- **Continuity across standalone daemon restart** (session `20260823_3`).
+- **Local handling of Goose session-name auxiliary requests** in standalone text mode
+  (`5edf513`).
+- **Full/tool-capable mode**, inherited directly from the proven macOS implementation
+  (`luke-m-selway/goose-chatgpt-web`): real structured `function_call`s advertised
+  through the connector → Secure MCP Tunnel → TurnBroker path, executed **exactly
+  once** by Goose (owner of the tool registry/approvals), returning same-identity
+  results and resuming the same logical browser turn (session `20260823_4`; artifact
+  verified byte-exact at 16 bytes).
+- **Natural multi-step coding-agent qualification**: given only a natural instruction
+  in a disposable seeded repository (seed commit `ddb3c0a`, bug undisclosed to the
+  agent), Goose inspected the project with real tools, ran the failing tests, diagnosed
+  the root cause before editing, applied the smallest correct one-character fix to the
+  implementation file only (tests untouched), reran the suite to green, and summarized
+  accurately — every action arrived as a structured Goose tool call, all within one
+  logical browser turn (session `20260823_5`).
+- **Dedicated deployment identity**: connector **`Goose Native 2nd Shift`** on the
+  dedicated tunnel `tunnel_6a8af3b9f8c88191b97280dc8ffa71e3`. The connector names the
+  persistent logical second-shift service, not hardware: DreamBook is the current host
+  machine only, not part of the architectural identity.
+- **Linux portability fixes**: full-mode tunnel/service activation behind the existing
+  platform gates (`251ef6b`), and `restartService()` portability (`527bb00`) — Linux
+  restart now cycles drain (using the credentials the running daemon still accepts) →
+  managed child-process stop → fresh child loading the committed configuration, making
+  control-token rotation atomic with restart; failures stay causal and recoverable via
+  plain `service start`. Regression coverage in `tests/service-restart.test.ts` uses a
+  dependency-injection seam (no process-global module mocking).
+
+**Test status at closure:** root suite **410/410** (including
+`tests/linux-lifecycle.test.ts` 10/10 and `tests/service-restart.test.ts` 3/3),
+TypeScript checks clean.
+
+### Deliberately still future work
+
+- user-level systemd/autostart supervision on Linux — the operator-run canonical
+  lifecycle remains the qualified surface;
+- a packaged-release Linux smoke equivalent (`scripts/smoke-release.ts` is still
+  macOS-gated) and the arm64 installer case;
+- broader autonomous production coding beyond qualification tasks, and multi-session
+  concurrency on the shared BrowserHost;
+- Goose Control, GitHub MCP deployment, and remote Planner — separate milestones
+  ([`goose-control-plan.md`](goose-control-plan.md));
+- merging this branch to `main` (draft PR #1; intentionally left unmerged at phase
+  closure).

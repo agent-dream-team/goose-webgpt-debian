@@ -27,7 +27,7 @@ The qualified runtime base is the Electron checkpoint `c624274` plus current-mai
 
 ## Debian/Linux port groundwork
 
-- [`debian-portability.md`](debian-portability.md) — evidence-based Debian 12 host findings, platform inventory/portability map, smallest manual execution path, and blockers before any live Linux ChatGPT-Web qualification. Groundwork only; no launchd porting, no systemd/autostart, no qualification claims.
+- [`debian-portability.md`](debian-portability.md) — Debian 12 host findings, platform inventory/portability map, and the chronological qualification record through **phase closure (2026-08-24)**: the Debian ChatGPT-Web runtime — browser-only text path and the full/tool-capable mode — is implemented and live-qualified on this host as the `Goose Native 2nd Shift` deployment. Still deliberately out of scope on this branch: systemd/autostart supervision and merge to `main`.
 
 ## Provisional / not yet proven
 

@@ -2,6 +2,19 @@
 
 Use an authenticated ChatGPT Web session as a model/provider inside ordinary Goose while Goose remains the owner of the agent session and project execution.
 
+## Debian / Second Shift deployment status (this branch)
+
+Branch `groundwork/debian-provider` closes the Debian portability phase: bootstrap
+Electron BrowserHost with authenticated profile reuse, the standalone browser-only text
+provider, persisted-session continuation, continuity across daemon restart, and the
+full/tool-capable mode inherited from the proven macOS implementation are implemented
+and live-qualified on Debian 12. The deployed connector is the logical service identity
+**`Goose Native 2nd Shift`** on a dedicated Secure MCP Tunnel — the connector names the
+persistent second-shift service, not the hardware; DreamBook is only the current host.
+See [`docs/debian-portability.md`](docs/debian-portability.md) (Phase closure) for the
+qualification record. Still deliberately future work: Linux systemd/autostart
+supervision, the packaged-release Linux smoke equivalent, and merge to `main`.
+
 ## Current architecture
 
 ```text
@@ -100,6 +113,7 @@ Start with [`docs/README.md`](docs/README.md). It classifies current, active, de
 - [`docs/runtime-lifecycle.md`](docs/runtime-lifecycle.md) — canonical lifecycle, BrowserHost readiness, autostart status, and proof boundaries.
 - [`docs/goose-control-plan.md`](docs/goose-control-plan.md) — next active Goose Control milestone.
 - [`docs/roadmap.md`](docs/roadmap.md) — current and next work only.
+- [`docs/debian-portability.md`](docs/debian-portability.md) — Debian/Linux qualification record and phase closure for this branch.
 - [`docs/security-model.md`](docs/security-model.md) — trust and capability boundaries.
 - [`AGENTS.md`](AGENTS.md) — mandatory rules for coding/automation agents.
 

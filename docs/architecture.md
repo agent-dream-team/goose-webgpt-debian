@@ -21,7 +21,7 @@ Responses daemon (independently supervised, loopback)
   ChatGPT Temporary Chat
 
 Full-mode tool path:
-ChatGPT → Goose Native → Secure MCP Tunnel → active Goose tool contract
+ChatGPT → Goose Native 2nd Shift → Secure MCP Tunnel → active Goose tool contract
        ← same browser response ← tool result ← Goose execution/approval
 ```
 
@@ -58,7 +58,7 @@ In standalone Goose bootstrap-only mode, Electron must not adopt, restart, drain
 
 ### Secure MCP Tunnel
 
-The tunnel is independently supervised below the connector/tool path. In full mode it carries `Goose Native` connector calls back to the active Goose turn. Restarting the daemon alone is not equivalent to restarting a tunnel-owned connector child after a public tool-contract change.
+The tunnel is independently supervised below the connector/tool path. In full mode it carries `Goose Native 2nd Shift` connector calls back to the active Goose turn. The connector name is a logical service identity; it does not change with the host machine that currently runs the service. Restarting the daemon alone is not equivalent to restarting a tunnel-owned connector child after a public tool-contract change.
 
 ## Browser-turn contract
 
@@ -67,12 +67,18 @@ Each logical Goose user turn may use a fresh ChatGPT Temporary Chat. Goose sends
 For a tool-capable turn:
 
 1. the daemon creates a bounded browser-turn capability;
-2. ChatGPT requests an action through `Goose Native`;
+2. ChatGPT requests an action through the `Goose Native 2nd Shift` connector;
 3. the bridge returns a normal provider tool call to Goose;
 4. Goose executes/approves the tool;
 5. the matching tool result returns with the same logical provider-turn identity;
 6. the browser helper resumes the same active ChatGPT response;
 7. completion revokes the capability and releases the BrowserHost surface.
+
+This tool-capable path is implemented and live-qualified end-to-end on the current
+deployment (branch `groundwork/debian-provider`, connector `Goose Native 2nd Shift`,
+Debian 12 host), including exactly-once tool/result behavior and a natural multi-step
+agent task; see [`debian-portability.md`](debian-portability.md) for the evidence
+record.
 
 Goose continuation has been proven with a persisted named Goose session and a separate later `--resume`. A raw `previous_response_id` request is not a substitute for native Goose continuation metadata.
 
