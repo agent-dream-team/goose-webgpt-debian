@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { createServer } from "node:http";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig, saveConfig } from "../src/config";
@@ -108,4 +108,49 @@ test("launcher status uses a read-only CDP health probe instead of exclusive ses
   } finally {
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
+});
+
+test("launcher session-ready wait succeeds against a serialized slow inspection endpoint", async () => {
+  let inspections = 0;
+  const server = createServer(async (request, response) => {
+    if (request.url === "/v1/session/inspect" && request.method === "POST") {
+      let body = "";
+      request.on("data", chunk => { body += chunk; });
+      await new Promise(resolve => request.on("end", resolve));
+      // Serialized launcher inspections answer one client at a time and can take
+      // longer than short poll timeouts; a small delay exercises the retry wiring.
+      inspections += 1;
+      await new Promise(resolve => setTimeout(resolve, 150));
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ authenticated: true, temporary: true, url: "https://chatgpt.com/?temporary-chat=true" }));
+      return;
+    }
+    response.writeHead(404, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: "unexpected" }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  try {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server has no port");
+    const path = descriptorFile(`http://127.0.0.1:${address.port}`, `http://127.0.0.1:${address.port}`);
+    await expect(waitForLauncherBrowserHostSessionReady(path)).resolves.toBeUndefined();
+    expect(inspections).toBeGreaterThanOrEqual(1);
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test("launcher session-ready attempts use the full session-inspection timeout, not a sub-5s poll hard-code", async () => {
+  // DreamBook regression: serialized launcher inspections legitimately take ~5.5s, so a
+  // hard-coded 5s per-attempt timeout can never succeed regardless of the overall deadline.
+  const source = readFileSync(join(import.meta.dir, "../src/lifecycle.ts"), "utf8");
+  const start = source.indexOf("export async function waitForLauncherBrowserHostSessionReady");
+  expect(start).toBeGreaterThanOrEqual(0);
+  const end = source.indexOf("\nexport ", start + 1);
+  const readyWaitSource = source.slice(start, end === -1 ? undefined : end);
+  expect(readyWaitSource).not.toMatch(/timeoutMs:\s*5_000/);
+  expect(readyWaitSource).toContain("LAUNCHER_SESSION_INSPECTION_TIMEOUT_MS");
 });

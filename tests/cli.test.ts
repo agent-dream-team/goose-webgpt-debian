@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { defaultBrokerEndpoint } from "../src/config";
@@ -153,6 +153,58 @@ test("authorized launcher uninstall does not re-probe an already stopped full ru
     expect({ exitCode: result.exitCode, stderr: result.stderr }).toEqual({ exitCode: 0, stderr: "" });
     expect(result.stdout).toContain("Uninstalled and removed private application data");
     expect(existsSync(appHome)).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("launcher-owned login operates on a genuinely fresh profile without config.json", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-fresh-login-"));
+  try {
+    // A fake browser that exits immediately keeps the test at the exact boundary we care
+    // about: the command must get past configuration and reach the system-browser stage.
+    const fakeChrome = join(root, "fake-chrome.sh");
+    writeFileSync(fakeChrome, "#!/bin/sh\nexit 0\n");
+    chmodSync(fakeChrome, 0o755);
+    const storageStatePath = join(root, "transfer", "storage-state.json");
+
+    const result = await runCli([
+      "login",
+      "--launcher-owned",
+      "--chrome",
+      fakeChrome,
+      "--storage-state",
+      storageStatePath,
+    ], {
+      ...process.env,
+      CODEX_CHATGPT_WEB_HOME: join(root, "app-home"),
+    });
+    expect(result.stderr).not.toContain("Configuration is missing");
+    expect(result.exitCode).toBe(1);
+    // The fake browser quits cleanly (the manual completion signal), then verification of the
+    // persisted profile fails because the fake binary cannot open a real authenticated page.
+    expect(result.stderr).toMatch(/Failed to launch|Executable doesn.t exist|has been closed|cannot be launched|exited with status/i);
+
+    // Launcher ownership still requires the explicit inputs it promises to pass.
+    for (const args of [
+      ["login", "--launcher-owned"],
+      ["login", "--launcher-owned", "--chrome", fakeChrome],
+    ]) {
+      const incomplete = await runCli(args, {
+        ...process.env,
+        CODEX_CHATGPT_WEB_HOME: join(root, "app-home"),
+      });
+      expect(incomplete.exitCode).toBe(1);
+      expect(incomplete.stderr).toContain("--launcher-owned login requires an explicit --");
+    }
+
+    // Ordinary logins keep requiring full configuration on a fresh profile.
+    const ordinary = await runCli(["login"], {
+      ...process.env,
+      CODEX_CHATGPT_WEB_HOME: join(root, "app-home"),
+    });
+    expect(ordinary.exitCode).toBe(1);
+    expect(ordinary.stderr).toContain("Configuration is missing");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

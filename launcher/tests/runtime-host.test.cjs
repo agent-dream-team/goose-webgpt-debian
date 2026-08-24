@@ -307,7 +307,7 @@ test("system-browser login uses the Goose transfer storage-state path", async ()
     supervisor: {
       coreHome: path.join(root, "goose-home"),
       readConfig: () => ({ mode: "browser-only", browserHost: "managed-chrome" }),
-      readSetupConfig: () => ({ mode: "browser-only", browserHost: "managed-chrome" }),
+      readSetupConfig: () => ({ mode: "browser-only", browserHost: "managed-chrome", chromeExecutablePath: process.execPath }),
     },
   });
   host.run = async (_name, args, options) => {
@@ -329,6 +329,13 @@ test("system-browser login uses the Goose transfer storage-state path", async ()
     assert.equal(calls[0].args[0], "login");
     assert.equal(calls[0].args.includes("--launcher-control"), false);
     assert.equal(calls[0].args.includes("--storage-state"), true);
+    assert.equal(calls[0].args.includes("--chrome"), true);
+    const chromeIndex = calls[0].args.indexOf("--chrome");
+    assert.equal(calls[0].args[chromeIndex + 1], process.execPath);
+    assert.equal(calls[0].args.includes("--launcher-owned"), true);
+    assert.equal(calls[0].args.includes("--login-profile"), true);
+    const profileIndex = calls[0].args.indexOf("--login-profile");
+    assert.equal(calls[0].args[profileIndex + 1], path.join(root, "browser-login", "login-profile"));
     assert.equal(calls[0].env.CODEX_CHATGPT_WEB_HOME, path.join(root, "goose-home"));
   } finally {
     await transfer.cleanup();

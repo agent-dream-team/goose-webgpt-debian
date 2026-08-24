@@ -28,6 +28,7 @@ import {
   extractCompactUserMessages,
 } from "./responses/compaction";
 import { isStockGooseCompactionRequestBody } from "./responses/goose-compaction";
+import { isStockGooseSessionNameRequestBody, stockGooseSessionNameAnswer } from "./responses/goose-session-name";
 import { parseRequest } from "./responses/parser";
 import { expandPreviousResponseInput, flushResponseState, rememberResponseState } from "./responses/state";
 import { namespacedToolName, type AdapterEvent, type CodexParsedRequest } from "./types";
@@ -418,6 +419,9 @@ export async function responseRequest(
     ? (raw as { previous_response_id?: unknown }).previous_response_id
     : undefined;
   const stockGooseCompaction = config.standalone === true && isStockGooseCompactionRequestBody(raw);
+  const stockGooseSessionName = config.standalone === true
+    && !stockGooseCompaction
+    && isStockGooseSessionNameRequestBody(raw);
   const standalonePrepared = prepareStandaloneToolRequest(prepareStandaloneTextRequest(raw, config), config);
   const expanded = expandPreviousResponseInput(standalonePrepared);
   let parsed: CodexParsedRequest;
@@ -451,6 +455,39 @@ export async function responseRequest(
     parsed.context.messages.push({ role: "user", content: COMPACT_PROMPT, timestamp: Date.now() });
   }
 
+  if (stockGooseSessionName) {
+    // Stock Goose session naming is optional cosmetic bookkeeping whose entire input already
+    // rides in the request body. Answer it locally - deterministically derived from the wrapped
+    // user messages - instead of spending one of the few concurrent authenticated ChatGPT
+    // browser turns on it and leaving an aborted auxiliary trace behind. The wire shape is the
+    // same ordinary text turn Goose's OpenAI-compatible client already understands.
+    const answer = stockGooseSessionNameAnswer(raw)!;
+    const queue = new AsyncEventQueue<AdapterEvent>();
+    queue.push({ type: "text_delta", text: answer, phase: "final_answer" });
+    queue.push({ type: "done", stopReason: "stop", endTurn: true });
+    queue.close();
+    const maps = toolBridgeMaps(parsed);
+    const responseModel = route.slug;
+    // The recognizer requires stream:true, so the local answer always rides the SSE bridge.
+    const stream = bridgeToResponsesSSE(
+      queue,
+      responseModel,
+      maps.toolNsMap,
+      maps.freeformToolNames,
+      maps.toolSearchToolNames,
+      () => {},
+      2_000,
+      { hideThinkingSummary: parsed.options.hideThinkingSummary },
+    );
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+      },
+    });
+  }
   const adapter = adapterFactory(providerConfig(config));
   const queue = new AsyncEventQueue<AdapterEvent>();
   const abort = new AbortController();

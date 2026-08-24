@@ -25,6 +25,10 @@ The qualified runtime base is the Electron checkpoint `c624274` plus current-mai
 - [`goose-control-plan.md`](goose-control-plan.md) — Goose Control is the next active milestone. Its backend is settled on authenticated loopback Goose ACP; its first Planner-facing proof is a private GPT Action calling a narrow authenticated HTTPS REST/OpenAPI facade.
 - [`roadmap.md`](roadmap.md) — current and next work only.
 
+## Debian/Linux port groundwork
+
+- [`debian-portability.md`](debian-portability.md) — Debian 12 host findings, platform inventory/portability map, and the chronological qualification record through **phase closure (2026-08-24)**: the Debian ChatGPT-Web runtime — browser-only text path and the full/tool-capable mode — is implemented and live-qualified on this host as the `Goose Native 2nd Shift` deployment. Still deliberately out of scope on this branch: systemd/autostart supervision and merge to `main`.
+
 ## Provisional / not yet proven
 
 The actual Mac **reboot/login → automatic reconstruction → ordinary Goose first turn → separate dependent `--resume`** proof has not been run. Ordered autostart is implemented and live-checked without that reboot boundary.

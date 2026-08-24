@@ -33,6 +33,7 @@ Usage:
   codex-chatgpt-web setup --browser-only [--standalone] [options]
   codex-chatgpt-web setup --full --tunnel-id ID --runtime-key-file PATH [options]
   codex-chatgpt-web login
+  codex-chatgpt-web login --launcher-owned --chrome PATH --storage-state PATH [--login-profile PATH]
   codex-chatgpt-web doctor [--json]
   codex-chatgpt-web route <status|connect|disconnect>
   codex-chatgpt-web browser check
@@ -228,7 +229,7 @@ async function serviceCommand(args: string[]): Promise<void> {
   }
   const status = action === "status" ? getServiceStatus()
     : action === "install" ? installService(config!)
-      : action === "start" ? startService()
+      : action === "start" ? await startService()
         : action === "restart" ? await restartService(config!)
           : action === "stop" ? await stopService(config!)
             : undefined;
@@ -247,7 +248,7 @@ async function tunnelCommand(args: string[]): Promise<void> {
     return;
   }
   const config = loadConfig();
-  if (action === "start") startTunnelService();
+  if (action === "start") await startTunnelService();
   else if (action === "restart") {
     await assertServiceIdle(config);
     await restartTunnelService();
@@ -372,7 +373,22 @@ async function main(): Promise<void> {
   else if (command === "setup") await setupCommand(args);
   else if (command === "login") {
     const storageStatePath = takeOption(args, "--storage-state");
+    const chrome = takeOption(args, "--chrome");
+    const loginProfile = takeOption(args, "--login-profile");
+    const launcherOwned = takeFlag(args, "--launcher-owned");
     assertNoArgs(args);
+    if (launcherOwned) {
+      // The launcher's own sign-in flow runs before setup exists on a fresh profile, so it must
+      // not require config.json. Everything login needs is passed explicitly by the launcher;
+      // ordinary (non-launcher-owned) logins keep requiring full configuration below.
+      if (!storageStatePath) throw new Error("--launcher-owned login requires an explicit --storage-state path");
+      if (!chrome) throw new Error("--launcher-owned login requires an explicit --chrome executable path");
+      const result = await loginToChatGpt({ chromeExecutablePath: chrome, storageStatePath }, {
+        ...(loginProfile ? { profileDir: loginProfile } : {}),
+      });
+      stdout.write(`ChatGPT login stored at ${result.storageStatePath}\n`);
+      return;
+    }
     const config = loadConfig();
     if (config.browserHost === "launcher") {
       throw new Error("ChatGPT login is owned by the launcher; open Codex Web GPT and use its Sign in step");
