@@ -2,6 +2,8 @@
 
 These instructions apply to coding/automation agents working in this repository.
 
+Before creating or modifying source code, scripts, or behavioral/executable configuration, read and apply `.agents/skills/code-maintainability/SKILL.md`.
+
 For documentation work, and before completing a technical change that may alter documented state, read and apply `.agents/skills/lean-documentation/SKILL.md`.
 
 ## Read current documentation first
