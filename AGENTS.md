@@ -2,6 +2,8 @@
 
 These instructions apply to coding/automation agents working in this repository.
 
+For documentation creation, changes, review, or cleanup, read and apply `.agents/skills/lean-documentation/SKILL.md`.
+
 ## Read current documentation first
 
 Before architecture, lifecycle, BrowserHost, tunnel, or Goose Control work, read:
