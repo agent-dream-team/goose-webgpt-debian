@@ -1,11 +1,11 @@
 ---
 name: lean-documentation
-description: Create, update, review, and remove technical documentation using minimum sufficient documentation, one authoritative source per concern, explicit navigation, and a small shared schema.
+description: Create, maintain, review, and remove technical documentation using minimum sufficient documentation, current-state hygiene, one authoritative source per concern, explicit navigation, and a small shared schema.
 ---
 
 # Lean Documentation
 
-Apply this skill when creating, changing, reviewing, or cleaning technical documentation.
+Apply this skill when creating, changing, reviewing, or cleaning technical documentation, and when a technical change may alter documented state.
 
 Project-local architecture, safety, and contribution rules still govern their own subjects.
 
@@ -57,6 +57,34 @@ When ownership moves:
 
 Do not preserve redirect documents unless an external dependency makes them necessary.
 
+## Current-state maintenance
+
+Current documentation must change with the system.
+
+Before completing a technical change, determine whether it changes any documented behavior, architecture, interface, configuration, command, path, ownership boundary, or operating procedure.
+
+If it does:
+
+1. Update the authoritative documentation in the same work.
+2. Remove or rewrite instructions and claims that are no longer true.
+3. Update meaningful links when authoritative ownership moves.
+4. Delete obsolete current-state documentation rather than preserving stale procedures for history.
+5. Verify that surviving current documentation describes the resulting system.
+
+Do not create documentation churn when a change does not affect documented information.
+
+`reference`, `how-to`, and `explanation` documents normally describe current state. Future or proposed behavior belongs in a `plan`, `roadmap`, issue, or PR and must not read as current operating procedure.
+
+### When documentation and the system disagree
+
+If current documentation conflicts with authoritative implementation, configuration, or observed system behavior, treat the documentation as potentially stale.
+
+Do not blindly follow a disputed operational procedure when doing so could disrupt working infrastructure.
+
+Establish the current state and authoritative owner, then correct stale documentation as part of the work. Until the conflict is resolved, do not treat the disputed documentation as authority for a potentially disruptive action.
+
+If the conflict cannot be resolved safely, stop before the potentially disruptive action and surface the mismatch rather than guessing.
+
 ## Navigation
 
 Assume any document may be the reader's entry point.
@@ -90,9 +118,7 @@ Use this block when adjacent ownership could reasonably be confused:
 > **Elsewhere:** Exact provider/model aliases are defined in `provider-model-aliases.md`.
 ```
 
-Use only the lines needed.
-
-Do not add a navigation block where the document's purpose and boundaries are already obvious.
+Use only the lines needed. Do not add a navigation block where the document's purpose and boundaries are already obvious.
 
 ## Documentation schema
 
@@ -117,87 +143,45 @@ status: current
 
 Use only defined values. Do not include empty or unused fields.
 
-## Types
+### Types
 
-### `reference`
+- `reference` — authoritative facts, interfaces, configuration meaning, commands, limits, mappings, or other exact current information.
+- `how-to` — a procedure for achieving a specific task.
+- `explanation` — architecture, boundaries, relationships, or concepts needed to understand how or why the current system works.
+- `decision` — rationale for an important decision that remains useful after implementation.
+- `roadmap` — durable remaining direction across multiple pieces of work.
+- `plan` — bounded implementation, migration, investigation, or change planning. Plans are normally temporary; prefer an issue or PR when it is an adequate working surface.
+- `evidence` — qualification, experiment, incident, compatibility, investigation, or other evidence whose result remains useful. Evidence is normally time-sensitive and disposable.
 
-Authoritative facts, interfaces, configuration meaning, commands, limits, mappings, or other exact current information.
+### Status
 
-### `how-to`
-
-A procedure for achieving a specific task.
-
-### `explanation`
-
-Architecture, boundaries, relationships, or concepts needed to understand how or why the current system works.
-
-### `decision`
-
-The rationale for an important decision that remains useful after implementation.
-
-### `roadmap`
-
-Durable remaining direction across multiple pieces of work.
-
-### `plan`
-
-Bounded implementation, migration, investigation, or change planning.
-
-Plans are normally temporary. Prefer an issue or PR over a repository plan when it provides an adequate working surface.
-
-### `evidence`
-
-Qualification, experiment, incident, compatibility, investigation, or other evidence whose result remains useful.
-
-Evidence is normally time-sensitive and disposable.
-
-## Status
-
-### `current`
-
-The document is a valid current source.
-
-### `temporary`
-
-The document exists for active work or evidence and should be removed when that purpose ends.
-
-### `superseded`
-
-The document is no longer current but remains because its historical rationale or evidence still serves a specific purpose.
+- `current` — a valid current source.
+- `temporary` — exists for active work or evidence and should be removed when that purpose ends.
+- `superseded` — no longer current but retained because its historical rationale or evidence still serves a specific purpose.
 
 There is no `obsolete` status. Delete obsolete documents.
 
-## Optional metadata
+### Optional metadata
 
 Use optional metadata only when it changes how the document should be interpreted or maintained.
 
-### `as_of`
+`as_of` marks inherently time-sensitive truth such as provider availability, qualification state, external pricing or limits, compatibility, or environment state. Do not use it merely as a last-edited date.
 
 ```yaml
-as_of: 2026-08-28
+as_of: <YYYY-MM-DD>
 ```
 
-Use when the documented truth is inherently time-sensitive, such as provider availability, qualification state, external pricing or limits, compatibility, or environment state.
-
-Do not use it merely as a last-edited date.
-
-### `superseded_by`
+`superseded_by` is used only with `status: superseded` and points directly to the replacement when one exists.
 
 ```yaml
 superseded_by: replacement-decision.md
 ```
 
-Use only with `status: superseded`. Point directly to the replacement when one exists.
-
-### `source_of_truth`
+`source_of_truth` identifies another source that owns exact values while this document explains or presents them. Do not use it when the document itself owns the information.
 
 ```yaml
 source_of_truth: config/routes.yaml
 ```
-
-Use when exact authoritative values live elsewhere and this document explains or presents them.
-
-Do not use it when the document itself owns the information.
 
 ## README
 
@@ -212,21 +196,9 @@ It should contain only what is needed to:
 
 Do not copy architecture, policy, roadmap, or reference material into the README when another source owns it.
 
-## Living documentation
-
-`reference`, `how-to`, and `explanation` documents normally describe current state.
-
-Use present tense for current facts. Use imperative verbs for procedures.
-
-Do not narrate the planning, debugging, or implementation path that produced the current system.
-
-Preserve historical material only when it remains necessary evidence or explains an important decision.
-
 ## Decision records
 
-Use `type: decision`.
-
-Create one only when preserving the rationale is likely to help future work.
+Use `type: decision` only when preserving rationale is likely to help future work. Keep one decision per record.
 
 Use:
 
@@ -240,31 +212,21 @@ Use:
 ## Consequences
 ```
 
-Add another section only when it carries necessary information. Keep one decision per record.
+Add another section only when it carries necessary information.
 
-When replaced:
+When replaced, set `status: superseded`, add `superseded_by`, and retain the record only if its rationale remains useful.
 
-- set `status: superseded`;
-- add `superseded_by`;
-- retain the record only if its rationale remains useful.
-
-Decision records explain why. Living documentation explains what is true now.
+Decision records explain why. `reference`, `how-to`, and `explanation` documents explain what is true now.
 
 ## Roadmaps
 
-Use `type: roadmap`.
-
-A roadmap contains remaining direction, not completed history.
+Use `type: roadmap` for remaining direction, not completed history.
 
 Remove completed work. Do not create separate phase documents when one current roadmap can express the remaining direction.
 
 ## Plans
 
-Use `type: plan`.
-
-Plans are normally `status: temporary`.
-
-Use a repository plan only when the work needs a durable repository-local planning artifact.
+Use `type: plan`, normally with `status: temporary`, only when work needs a durable repository-local planning artifact.
 
 When the work finishes:
 
@@ -277,19 +239,9 @@ When the work finishes:
 
 Use `type: evidence`.
 
-Evidence should state near the beginning:
+State near the beginning what was tested or observed, the result, and what conclusion it supports. Use `as_of` when freshness matters. Include reproduction details only when needed to reproduce or interpret the result.
 
-- what was tested or observed;
-- the result;
-- what conclusion the result supports.
-
-Use `as_of` when freshness matters. Include reproduction details only when needed to reproduce or interpret the result.
-
-When the evidence stops serving an active purpose:
-
-- move durable conclusions into the appropriate current source;
-- preserve reusable verification elsewhere;
-- delete the evidence document.
+When the evidence stops serving an active purpose, move durable conclusions into the appropriate current source, preserve reusable verification elsewhere, and delete the evidence document.
 
 Do not keep old smoke tests, qualification reports, or investigation notes merely because the work once mattered.
 
@@ -299,9 +251,7 @@ Put the answer, rule, action, or current state before supporting detail.
 
 Use direct declarative sentences for facts and rules. Use imperative verbs for procedures.
 
-Use concrete properties instead of generic quality claims.
-
-Avoid unsupported terms such as `robust`, `seamless`, `scalable`, `production-ready`, `best-practice`, or `comprehensive`.
+Use concrete properties instead of generic quality claims. Avoid unsupported terms such as `robust`, `seamless`, `scalable`, `production-ready`, `best-practice`, or `comprehensive`.
 
 Do not instruct an agent to "write professionally", "follow best practices", or similar. State the required behavior instead.
 
@@ -315,7 +265,7 @@ Do not create hierarchy that contains only one meaningful child or exists only t
 
 ## Filenames
 
-Use stable descriptive filenames for living documentation.
+Use stable descriptive filenames for current documentation.
 
 Do not date filenames merely to record when a document was written. Use dates only when the document intentionally represents a time-bound snapshot or historical record.
 
@@ -325,25 +275,11 @@ Prefer subject names over development-phase names.
 
 When reviewing existing documentation, classify each document or section as:
 
-### Keep
-
-It has a current purpose and is the correct owner.
-
-### Merge
-
-Useful information belongs in another authoritative source.
-
-### Replace with link
-
-Another source owns the information and this location only needs navigation.
-
-### Convert
-
-Useful rationale belongs in a decision record, or reusable evidence belongs in a test, check, fixture, or procedure.
-
-### Delete
-
-It no longer serves a current purpose.
+- **Keep** — it has a current purpose and is the correct owner.
+- **Merge** — useful information belongs in another authoritative source.
+- **Replace with link** — another source owns the information and this location only needs navigation.
+- **Convert** — useful rationale belongs in a decision record, or reusable evidence belongs in a test, check, fixture, or procedure.
+- **Delete** — it no longer serves a current purpose.
 
 Deletion is a successful outcome.
 
@@ -364,14 +300,14 @@ Prefer extending the shared vocabulary over creating repository-local equivalent
 
 ## Completion check
 
-Before finishing a documentation change, verify:
+Before finishing a documentation change or a technical change that affects documented state, verify:
 
 - every surviving document has a current purpose;
 - each concern has one authoritative owner;
 - related documents link to that owner instead of duplicating it;
 - direct-entry readers can quickly determine scope and where to go next;
 - schema fields are valid and necessary;
-- current documentation describes current state;
+- changes that affect documented system state have updated or removed the affected documentation, and no surviving current documentation describes superseded behavior;
 - temporary plans and evidence remain only while useful;
 - obsolete material has been deleted;
 - no content can be removed without losing useful information, navigation, or lifecycle meaning.

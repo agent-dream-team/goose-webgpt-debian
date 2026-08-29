@@ -2,7 +2,7 @@
 
 These instructions apply to coding/automation agents working in this repository.
 
-For documentation creation, changes, review, or cleanup, read and apply `.agents/skills/lean-documentation/SKILL.md`.
+For documentation work, and before completing a technical change that may alter documented state, read and apply `.agents/skills/lean-documentation/SKILL.md`.
 
 ## Read current documentation first
 
