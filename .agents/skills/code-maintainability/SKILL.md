@@ -5,9 +5,9 @@ description: Keep code safe to modify across agents by preserving non-obvious in
 
 # Code Maintainability
 
-Apply this skill before creating or modifying source code, scripts, or behavioral/executable configuration.
+Apply this skill before creating or modifying source code, scripts, or behavioral/executable configuration, and when explicitly reviewing code maintainability.
 
-Do not load it for ordinary read-only work unless the task explicitly reviews code maintainability or is preparing a code change.
+Do not load it for other read-only work.
 
 ## Write for the next editor
 
