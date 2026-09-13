@@ -120,7 +120,7 @@ export function rebuildConversationKey(projectId: string, gooseSessionId: string
 }
 
 function abortIfRequested(signal: AbortSignal): void {
-  if (signal.aborted) throw new DOMException("Persistent browser turn aborted before send", "AbortError");
+  if (signal.aborted) throw new DOMException("Persistent browser turn aborted", "AbortError");
 }
 
 function isTargetClosedError(error: unknown): boolean {
@@ -543,11 +543,24 @@ export function createRebuildPersistentBrowserDriver(
         }
       };
       const waitForAcceptedIdentity = async (): Promise<void> => {
-        const currentPage = requireLiveSurface();
         if (!baseline) throw new Error("Persistent ChatGPT submission baseline is missing");
-        const deadline = Date.now() + timeoutMs;
-        while (Date.now() < deadline) {
+        // Once the durable send fence is armed, elapsed time cannot prove non-acceptance. Keep the
+        // owned observer alive until remote identity appears or an actual abort/browser failure occurs.
+        for (;;) {
+          abortIfRequested(input.preSendAbortSignal);
+          const currentPage = requireLiveSurface();
           const snapshot = await captureSnapshot(currentPage);
+          const baselineTurnIds = new Set(baseline.turnIdentities);
+          for (const turnId of snapshot.turnIdentities) {
+            if (baselineTurnIds.has(turnId)) continue;
+            validatePersistentChatTurnIdentity(turnId, "post-send turn");
+            const turn = currentPage.locator(`[data-turn-id-container=${JSON.stringify(turnId)}]`);
+            if (await turn.count() !== 1) {
+              throw new Error("Post-send ChatGPT turn is missing or duplicated");
+            }
+            const terminal = await detectChatGptTerminalError(turn);
+            if (terminal) throw new ChatGptUpstreamTerminalError(terminal);
+          }
           const userTurn = acceptedUserTurnIdentity(baseline.turnIdentities, snapshot);
           let conversationId: string | undefined;
           try {
@@ -568,7 +581,6 @@ export function createRebuildPersistentBrowserDriver(
           }
           await sleep(pollMs);
         }
-        throw new Error("Persistent ChatGPT submission never established canonical conversation and absolute user-turn identity");
       };
       const waitForFinalCandidate = async (): Promise<RebuildBrowserFinalEvidence> => {
         // Once ChatGPT has accepted the remote user turn, elapsed time is not terminal evidence.

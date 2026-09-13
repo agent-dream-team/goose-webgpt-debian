@@ -28,6 +28,7 @@ interface FakeSurface {
   setUrl(value: string): void;
   setRunning(value: boolean): void;
   setClosed(value: boolean): void;
+  setTerminalError(turnId: string, value: boolean): void;
   composerText(): string;
   gotos: string[];
   reloads: number;
@@ -40,6 +41,7 @@ function fakeSurface(onSend: () => void, initialUrl = LAUNCHER_BROWSER_IDLE_URL)
   let closes = 0;
   let running = false;
   let closed = false;
+  const terminalErrorTurnIds = new Set<string>();
   const gotos: string[] = [];
   let reloads = 0;
 
@@ -64,14 +66,27 @@ function fakeSurface(onSend: () => void, initialUrl = LAUNCHER_BROWSER_IDLE_URL)
     first: () => composer,
   };
   const stop = { isVisible: async () => running };
+  const hidden = { last: () => hidden, isVisible: async () => false };
+  const turnScope = (turnId: string) => {
+    const regenerate = { last: () => regenerate, isVisible: async () => terminalErrorTurnIds.has(turnId) };
+    return {
+      count: async () => 1,
+      getByTestId: (id: string) => id === "regenerate-thread-error-button" ? regenerate : hidden,
+      getByText: () => hidden,
+    };
+  };
   const page = {
     url: () => url,
     isClosed: () => closed,
+    getByTestId: () => hidden,
+    getByText: () => hidden,
     goto: async (target: string) => { gotos.push(target); url = target; return null; },
     reload: async () => { reloads += 1; return null; },
     locator: (selector: string) => {
       if (selector === CHATGPT_COMPOSER_SELECTOR) return composers;
       if (selector === CHATGPT_STOP_BUTTON_SELECTOR) return { last: () => stop };
+      const turnMatch = /^\[data-turn-id-container=(?:"([^"]+)"|'([^']+)')\]$/.exec(selector);
+      if (turnMatch) return turnScope(turnMatch[1] ?? turnMatch[2]!);
       throw new Error(`Unexpected locator: ${selector}`);
     },
   } as unknown as Page;
@@ -81,6 +96,10 @@ function fakeSurface(onSend: () => void, initialUrl = LAUNCHER_BROWSER_IDLE_URL)
     setUrl: value => { url = value; },
     setRunning: value => { running = value; },
     setClosed: value => { closed = value; },
+    setTerminalError: (turnId, value) => {
+      if (value) terminalErrorTurnIds.add(turnId);
+      else terminalErrorTurnIds.delete(turnId);
+    },
     composerText: () => text,
     gotos,
     get reloads() { return reloads; },
@@ -113,8 +132,9 @@ function makeInput(options: {
   toolInFlight?: () => boolean;
   onSendActivated?: () => void;
   onAccepted?: (conversationId: string, userTurnId: string) => void;
+  abortController?: AbortController;
 } = {}): RebuildPersistentBrowserTurnInput {
-  const controller = new AbortController();
+  const controller = options.abortController ?? new AbortController();
   return {
     turnRef: "turn_browser_driver_test",
     gooseSessionId: "goose-browser-driver",
@@ -685,6 +705,139 @@ test("stale-observation rebind and reopen preserve the post-tool answer boundary
   expect(sends).toBe(1);
   const confirmed = await execution.confirmFinal(candidate);
   expect(confirmed.contentAdvancedAfterLastTool).toBeTrue();
+});
+
+test("send-activated identity acquisition outlives the pre-send timeout without resend", async () => {
+  let sent = false;
+  let sends = 0;
+  let postSendSnapshots = 0;
+  let accepted = 0;
+  let surface!: FakeSurface;
+  surface = fakeSurface(() => {
+    sent = true;
+    sends += 1;
+  });
+  const harness = createHarness({
+    surface,
+    timeoutMs: 5,
+    prepareFresh: async () => { surface.setUrl("https://chatgpt.com/project/g-p-test/new"); },
+    captureSnapshot: async () => {
+      if (!sent) return snapshotsAfterSend(() => false);
+      postSendSnapshots += 1;
+      await Bun.sleep(2);
+      if (postSendSnapshots < 6) return snapshotsAfterSend(() => false);
+      surface.setUrl(`https://chatgpt.com/c/${CONVERSATION}`);
+      return snapshotsAfterSend(() => true);
+    },
+  });
+  const execution = harness.driver.createTurn(makeInput({
+    onAccepted: () => { accepted += 1; },
+  }));
+  const candidate = await execution.run();
+  expect(postSendSnapshots).toBeGreaterThanOrEqual(6);
+  expect(sends).toBe(1);
+  expect(accepted).toBe(1);
+  expect(candidate.canonicalConversationId).toBe(CONVERSATION);
+  expect(candidate.acceptedUserTurnId).toBe("user-1");
+  await execution.confirmFinal(candidate);
+});
+
+test("send-activated identity acquisition ignores terminal error UI from baseline turns", async () => {
+  let sent = false;
+  let surface!: FakeSurface;
+  surface = fakeSurface(() => {
+    sent = true;
+    surface.setUrl(`https://chatgpt.com/c/${CONVERSATION}`);
+  }, `https://chatgpt.com/c/${CONVERSATION}`);
+  surface.setTerminalError("assistant-old", true);
+  const baseline = {
+    turnIdentities: ["user-old", "assistant-old"],
+    userIdentities: ["user-old"],
+    assistantIdentities: ["assistant-old"],
+  };
+  const accepted = {
+    turnIdentities: ["user-old", "assistant-old", "user-1", "assistant-1"],
+    userIdentities: ["user-old", "user-1"],
+    assistantIdentities: ["assistant-old", "assistant-1"],
+  };
+  const harness = createHarness({
+    surface,
+    captureSnapshot: async () => sent ? accepted : baseline,
+  });
+  const execution = harness.driver.createTurn(makeInput({ existingConversationId: CONVERSATION }));
+  const candidate = await execution.run();
+  expect(candidate.acceptedUserTurnId).toBe("user-1");
+  expect(candidate.text).toBe("final answer");
+  await execution.confirmFinal(candidate);
+});
+
+test("send-activated identity acquisition fails on explicit page-level terminal error UI", async () => {
+  let sent = false;
+  let postSendSnapshots = 0;
+  let surface!: FakeSurface;
+  surface = fakeSurface(() => { sent = true; });
+  const harness = createHarness({
+    surface,
+    timeoutMs: 5,
+    prepareFresh: async () => { surface.setUrl("https://chatgpt.com/project/g-p-test/new"); },
+    captureSnapshot: async () => {
+      if (!sent) return snapshotsAfterSend(() => false);
+      postSendSnapshots += 1;
+      if (postSendSnapshots === 2) surface.setTerminalError("assistant-1", true);
+      return { turnIdentities: ["assistant-1"], userIdentities: [], assistantIdentities: ["assistant-1"] };
+    },
+  });
+  const execution = harness.driver.createTurn(makeInput());
+  await expect(execution.run()).rejects.toThrow("explicit upstream error state");
+  expect(sent).toBeTrue();
+  expect(harness.activities.filter(activity => activity.phase === "end")).toEqual([]);
+  expect(harness.closes()).toBe(1);
+});
+
+test("send-activated identity acquisition fails promptly when its browser surface closes", async () => {
+  let sent = false;
+  let postSendSnapshots = 0;
+  let surface!: FakeSurface;
+  surface = fakeSurface(() => { sent = true; });
+  const harness = createHarness({
+    surface,
+    timeoutMs: 5,
+    prepareFresh: async () => { surface.setUrl("https://chatgpt.com/project/g-p-test/new"); },
+    captureSnapshot: async () => {
+      if (!sent) return snapshotsAfterSend(() => false);
+      postSendSnapshots += 1;
+      if (postSendSnapshots === 2) surface.setClosed(true);
+      return snapshotsAfterSend(() => false);
+    },
+  });
+  const execution = harness.driver.createTurn(makeInput());
+  await expect(execution.run()).rejects.toThrow("Persistent ChatGPT browser surface is unavailable");
+  expect(sent).toBeTrue();
+  expect(harness.activities.filter(activity => activity.phase === "end")).toEqual([]);
+  expect(harness.closes()).toBe(1);
+});
+
+test("send-activated identity acquisition still stops on an explicit observer abort", async () => {
+  let sent = false;
+  const abortController = new AbortController();
+  let postSendSnapshots = 0;
+  const surface = fakeSurface(() => { sent = true; });
+  const harness = createHarness({
+    surface,
+    timeoutMs: 5,
+    prepareFresh: async () => { surface.setUrl("https://chatgpt.com/project/g-p-test/new"); },
+    captureSnapshot: async () => {
+      if (!sent) return snapshotsAfterSend(() => false);
+      postSendSnapshots += 1;
+      if (postSendSnapshots === 2) abortController.abort();
+      return snapshotsAfterSend(() => false);
+    },
+  });
+  const execution = harness.driver.createTurn(makeInput({ abortController }));
+  await expect(execution.run()).rejects.toThrow("Persistent browser turn aborted");
+  expect(sent).toBeTrue();
+  expect(harness.activities.filter(activity => activity.phase === "end")).toEqual([]);
+  expect(harness.closes()).toBe(1);
 });
 
 test("accepted final observation outlives the pre-send timeout until authoritative completion appears", async () => {
