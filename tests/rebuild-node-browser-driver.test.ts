@@ -1,0 +1,124 @@
+import { afterEach, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createRebuildNodeBrowserDriver } from "../src/rebuild-node-browser-driver";
+import type { RebuildPersistentBrowserTurnInput } from "../src/rebuild-provider-runtime";
+
+const ROOTS: string[] = [];
+const CONVERSATION = "aaaaaaaa-bbbb-4ccc-8ddd-000000000111";
+
+afterEach(() => {
+  while (ROOTS.length > 0) rmSync(ROOTS.pop()!, { recursive: true, force: true });
+});
+
+function workerFixture(): string {
+  const root = mkdtempSync(join(tmpdir(), "cgw-node-browser-driver-test-"));
+  ROOTS.push(root);
+  const path = join(root, "worker.mjs");
+  writeFileSync(path, `
+import { createInterface } from "node:readline";
+const out = value => process.stdout.write(JSON.stringify(value) + "\\n");
+let started = false;
+const accepted = { canonicalConversationId: ${JSON.stringify(CONVERSATION)}, acceptedUserTurnId: "user-fixture" };
+const final = { ...accepted, text: "fixture final", remoteNonRunning: true };
+createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", line => {
+  const message = JSON.parse(line);
+  if (message.type === "start") {
+    if (started) return out({ type: "error", message: "duplicate start" });
+    if (message.config.connectorName !== "Goose Native 2nd Shift" || message.config.connectorMentionQuery !== "@Goose Native") {
+      return out({ type: "error", message: "connector config missing" });
+    }
+    started = true;
+    return out({ type: "lifecycle", event: "send_activated" });
+  }
+  if (message.type === "lifecycle_ack" && message.event === "send_activated") {
+    if (!message.ok) return out({ type: "error", message: message.message || "send rejected" });
+    return out({ type: "lifecycle", event: "accepted", evidence: accepted });
+  }
+  if (message.type === "lifecycle_ack" && message.event === "accepted") {
+    if (!message.ok) return out({ type: "error", message: message.message || "accept rejected" });
+    return out({ type: "candidate", evidence: final });
+  }
+  if (message.type === "boundary") return out({ type: "boundary", requestId: message.requestId, boundaryJson: "fixture-boundary" });
+  if (message.type === "confirm") {
+    out({ type: "confirmed", evidence: final });
+    return setImmediate(() => process.exit(0));
+  }
+  if (message.type === "abort") return out({ type: "error", message: "fixture aborted" });
+});
+out({ type: "ready", version: 1 });
+`, { mode: 0o600 });
+  return path;
+}
+
+function turnInput(overrides: Partial<RebuildPersistentBrowserTurnInput> = {}): RebuildPersistentBrowserTurnInput {
+  return {
+    turnRef: "turn-fixture",
+    gooseSessionId: "goose-fixture",
+    epoch: 1,
+    initialOpRef: "op-fixture",
+    submitNonce: "nonce-fixture",
+    prompt: "private prompt sentinel",
+    existingConversationId: null,
+    preSendAbortSignal: new AbortController().signal,
+    gooseWork: { isToolWorkInFlight: () => false },
+    lifecycle: {
+      onSendActivated: () => {},
+      onAccepted: () => {},
+    },
+    ...overrides,
+  };
+}
+
+function driver(workerPath: string) {
+  return createRebuildNodeBrowserDriver({
+    nodeExecutable: process.execPath,
+    workerPath,
+    descriptorPath: "/tmp/unused-descriptor.json",
+    projectId: "g-p-project",
+    projectName: "Project",
+    connectorName: "Goose Native 2nd Shift",
+    connectorMentionQuery: "@Goose Native",
+    toolStatePollMs: 10,
+  });
+}
+
+test("worker cannot advance past send activation or acceptance before parent durability acknowledgements", async () => {
+  const events: string[] = [];
+  const execution = driver(workerFixture()).createTurn(turnInput({
+    lifecycle: {
+      onSendActivated: async () => {
+        events.push("send-start");
+        await Bun.sleep(30);
+        events.push("send-durable");
+      },
+      onAccepted: async evidence => {
+        events.push(`accepted:${evidence.acceptedUserTurnId}`);
+        await Bun.sleep(20);
+        events.push("accept-durable");
+      },
+    },
+  }));
+
+  const candidate = await execution.run();
+  expect(events).toEqual(["send-start", "send-durable", "accepted:user-fixture", "accept-durable"]);
+  expect(candidate).toMatchObject({
+    canonicalConversationId: CONVERSATION,
+    acceptedUserTurnId: "user-fixture",
+    text: "fixture final",
+    remoteNonRunning: true,
+  });
+  expect(await execution.captureAnswerBoundary("op-fixture")).toBe("fixture-boundary");
+  expect(await execution.confirmFinal(candidate)).toEqual(candidate);
+});
+
+test("parent rejection of the send fence fails the worker turn instead of acknowledging irreversible send", async () => {
+  const execution = driver(workerFixture()).createTurn(turnInput({
+    lifecycle: {
+      onSendActivated: async () => { throw new Error("durable send fence failed"); },
+      onAccepted: () => { throw new Error("acceptance must not run"); },
+    },
+  }));
+  await expect(execution.run()).rejects.toThrow("durable send fence failed");
+});

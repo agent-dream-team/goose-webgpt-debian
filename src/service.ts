@@ -5,7 +5,7 @@ import type { AppConfig } from "./config";
 import { assertDurableRuntimeCommand, atomicWriteFile, getConfigDir } from "./config";
 import { runCommand, runChecked } from "./process";
 
-export const SERVICE_LABEL = "io.github.codex-chatgpt-web.daemon";
+const LABEL = "io.github.codex-chatgpt-web.daemon";
 
 export interface ServiceStatus {
   supported: boolean;
@@ -24,18 +24,8 @@ function xml(value: string): string {
     .replaceAll("'", "&apos;");
 }
 
-export function legacyServiceLaunchAgentPath(home = homedir()): string {
-  return join(home, "Library", "LaunchAgents", `${SERVICE_LABEL}.plist`);
-}
-
-export function managedServiceDefinitionPath(configDir = getConfigDir()): string {
-  return join(configDir, "launchd", `${SERVICE_LABEL}.plist`);
-}
-
 function plistPath(): string {
-  const legacy = legacyServiceLaunchAgentPath();
-  const managed = managedServiceDefinitionPath();
-  return existsSync(legacy) || !existsSync(managed) ? legacy : managed;
+  return join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
 }
 
 function launchDomain(): string {
@@ -43,7 +33,7 @@ function launchDomain(): string {
 }
 
 function serviceTarget(): string {
-  return `${launchDomain()}/${SERVICE_LABEL}`;
+  return `${launchDomain()}/${LABEL}`;
 }
 
 async function bootstrapService(path: string, timeoutMs = 20_000): Promise<void> {
@@ -63,10 +53,10 @@ async function waitForServiceUnloaded(timeoutMs = 20_000): Promise<void> {
   while (getServiceStatus().loaded && Date.now() < deadline) {
     await new Promise(resolveWait => setTimeout(resolveWait, 50));
   }
-  if (getServiceStatus().loaded) throw new Error(`launchd did not unload ${SERVICE_LABEL} after ${timeoutMs}ms`);
+  if (getServiceStatus().loaded) throw new Error(`launchd did not unload ${LABEL} after ${timeoutMs}ms`);
 }
 
-export function serviceDefinition(config: AppConfig): string {
+function plist(config: AppConfig): string {
   const logDir = join(getConfigDir(), "logs");
   const args = [...config.runtimeCommand, "serve"];
   return `<?xml version="1.0" encoding="UTF-8"?>
@@ -74,7 +64,7 @@ export function serviceDefinition(config: AppConfig): string {
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${SERVICE_LABEL}</string>
+  <string>${LABEL}</string>
   <key>ProgramArguments</key>
   <array>
 ${args.map(arg => `    <string>${xml(arg)}</string>`).join("\n")}
@@ -111,14 +101,14 @@ function assertMacOs(): void {
 }
 
 export function getServiceStatus(): ServiceStatus {
-  if (process.platform !== "darwin") return { supported: false, installed: false, loaded: false, label: SERVICE_LABEL };
+  if (process.platform !== "darwin") return { supported: false, installed: false, loaded: false, label: LABEL };
   const path = plistPath();
   const result = runCommand("launchctl", ["print", serviceTarget()]);
   return {
     supported: true,
     installed: existsSync(path),
     loaded: result.status === 0,
-    label: SERVICE_LABEL,
+    label: LABEL,
     definitionPath: path,
   };
 }
@@ -129,7 +119,7 @@ export function installService(config: AppConfig): ServiceStatus {
   const path = plistPath();
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   mkdirSync(join(getConfigDir(), "logs"), { recursive: true, mode: 0o700 });
-  const next = serviceDefinition(config);
+  const next = plist(config);
   if (!existsSync(path) || readFileSync(path, "utf8") !== next) atomicWriteFile(path, next);
   const status = getServiceStatus();
   if (!status.loaded) runChecked("launchctl", ["bootstrap", launchDomain(), path]);
@@ -149,7 +139,7 @@ export interface DrainLease {
   release: () => Promise<void>;
 }
 
-async function control(config: AppConfig, action: "drain" | "resume" | "cancel-browser-turns"): Promise<Record<string, unknown>> {
+async function control(config: AppConfig, action: "drain" | "resume" | "cancel-turns"): Promise<Record<string, unknown>> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5_000);
   try {
@@ -165,13 +155,56 @@ async function control(config: AppConfig, action: "drain" | "resume" | "cancel-b
   }
 }
 
-export async function cancelBrowserTurns(config: AppConfig): Promise<number> {
-  const result = await control(config, "cancel-browser-turns");
-  const cancelled = result.cancelled_browser_turns;
-  if (!Number.isInteger(cancelled) || (cancelled as number) < 0) {
-    throw new Error("daemon did not acknowledge browser-turn cancellation");
+export async function interruptActiveTurn(
+  config: AppConfig,
+  identity: { threadId: string; turnId: string },
+): Promise<{ cancelledHttpTurns: number; cancelledBrowserTurns: number }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 2_000);
+  try {
+    const response = await fetch(`http://${config.host}:${config.port}/admin/interrupt-turn`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${config.controlToken}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(identity),
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const result = await response.json() as Record<string, unknown>;
+    const cancelledHttpTurns = result.cancelled_http_turns;
+    const cancelledBrowserTurns = result.cancelled_browser_turns;
+    if (result.status !== "ok"
+      || !Number.isInteger(cancelledHttpTurns) || (cancelledHttpTurns as number) < 0
+      || !Number.isInteger(cancelledBrowserTurns) || (cancelledBrowserTurns as number) < 0) {
+      throw new Error("daemon returned an invalid interrupt acknowledgement");
+    }
+    return {
+      cancelledHttpTurns: cancelledHttpTurns as number,
+      cancelledBrowserTurns: cancelledBrowserTurns as number,
+    };
+  } finally {
+    clearTimeout(timeout);
   }
-  return cancelled as number;
+}
+
+export async function cancelActiveTurns(config: AppConfig): Promise<{
+  cancelledHttpTurns: number;
+  cancelledBrowserTurns: number;
+}> {
+  const result = await control(config, "cancel-turns");
+  const cancelledHttpTurns = result.cancelled_http_turns;
+  const cancelledBrowserTurns = result.cancelled_browser_turns;
+  if (!Number.isInteger(cancelledHttpTurns) || (cancelledHttpTurns as number) < 0
+    || !Number.isInteger(cancelledBrowserTurns) || (cancelledBrowserTurns as number) < 0
+    || result.active_http_turns !== 0 || result.active_browser_turns !== 0) {
+    throw new Error("daemon did not acknowledge complete active-turn cancellation");
+  }
+  return {
+    cancelledHttpTurns: cancelledHttpTurns as number,
+    cancelledBrowserTurns: cancelledBrowserTurns as number,
+  };
 }
 
 export async function negotiateDrain(
@@ -231,10 +264,10 @@ export async function assertServiceIdle(config: AppConfig): Promise<void> {
   await lease.release();
 }
 
-export async function restartService(config: AppConfig, drainConfig: AppConfig = config): Promise<ServiceStatus> {
+export async function restartService(config: AppConfig): Promise<ServiceStatus> {
   assertMacOs();
   if (!getServiceStatus().loaded) return startService();
-  const lease = await acquireDrain(drainConfig);
+  const lease = await acquireDrain(config);
   try {
     runChecked("launchctl", ["bootout", serviceTarget()]);
     await waitForServiceUnloaded();

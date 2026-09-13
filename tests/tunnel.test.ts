@@ -1,5 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { parseTunnelStatus, tunnelCommandOutput, tunnelConnectLaunchError } from "../src/tunnel";
+import { TUNNEL_VERSION, parseTunnelStatus, tunnelClientInstallAction, tunnelCommandOutput, tunnelConnectLaunchError } from "../src/tunnel";
+
+test("pins the fixed tunnel-client and migrates only the previously shipped version", () => {
+  expect(TUNNEL_VERSION).toBe("0.0.12");
+  expect(tunnelClientInstallAction("0.0.12")).toBe("reuse");
+  expect(tunnelClientInstallAction("0.0.10")).toBe("upgrade");
+  expect(() => tunnelClientInstallAction("0.0.11")).toThrow("not a trusted upgrade source");
+  expect(() => tunnelClientInstallAction("9.9.9")).toThrow("not a trusted upgrade source");
+});
 
 describe("tunnel status boundary", () => {
   test("requires the managed runtime process, health, and readiness together", () => {
@@ -49,7 +57,7 @@ describe("tunnel status boundary", () => {
     );
   });
 
-  test("requires connect to prove running, healthy, and ready before accepting its profile", () => {
+  test("accepts a healthy managed launch while setup waits for control-plane readiness", () => {
     expect(tunnelConnectLaunchError(JSON.stringify({
       running: true,
       healthy: true,
@@ -60,7 +68,13 @@ describe("tunnel status boundary", () => {
       running: true,
       healthy: true,
       ready: false,
-    }))).toContain("running=true; healthy=true; ready=false");
+    }))).toBeUndefined();
+
+    expect(tunnelConnectLaunchError(JSON.stringify({
+      running: true,
+      healthy: false,
+      ready: false,
+    }))).toContain("running=true; healthy=false; ready=false");
 
     expect(tunnelConnectLaunchError("not json")).toBe("tunnel-client returned non-JSON connect output");
   });

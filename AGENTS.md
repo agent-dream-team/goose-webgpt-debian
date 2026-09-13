@@ -1,71 +1,44 @@
-# Agent safety and runtime rules
+# Goose ChatGPT Web V1 rules
 
-These instructions apply to coding/automation agents working in this repository.
+This checkout contains the qualified Goose ChatGPT Web V1. Read `docs/persistent-chat-rebuild-plan.md` before architecture, browser, connector, lifecycle, security, or recovery work; it is now the durable qualification ledger and follow-up-gate authority rather than a pre-V1 design proposal. The exact deployed non-reboot V1 code checkpoint is `2ac2f561a674482d8eccf0e0cc690edc095b7806`; later repository commits may be documentation/closeout only.
 
-For explicit code-maintainability review, or before creating or modifying source code, scripts, or behavioral/executable configuration, read and apply `.agents/skills/code-maintainability/SKILL.md`.
+Baseline: `miuuyy/codex-chatgpt-web@e85e3693fdb4e3e033348c08df0298c20fcdb612` (v5.0.6 lineage). Inspect current upstream before diagnosing browser/UI/authentication behavior and reuse proven upstream mechanisms where their semantics fit.
 
-For documentation work, and before completing a technical change that may alter documented state, read and apply `.agents/skills/lean-documentation/SKILL.md`.
+## Authority and boundaries
 
-## Read current documentation first
+- Goose owns the canonical logical session/transcript projection, tools and approvals, delegation/subagents, project execution, and Goose context lifecycle.
+- A persistent ChatGPT conversation is provider-side working continuity only. It may continue only while its recorded Goose projection remains append-compatible.
+- **Core persistence invariant:** within that provider layer, the persistent remote object is the server-side ordinary ChatGPT conversation identified by its canonical `/c/<uuid>` conversation ID. BrowserHost tabs, renderer instances, Playwright handles, and launcher process memory are disposable views onto that conversation, never its identity. Loss of a view alone must recover/reopen the same canonical conversation; it is not permission to create a new epoch.
+- Goose compaction, truncation, revision, branching, or any other non-append-compatible model-visible history change forces a new remote conversation epoch. Proven remote-conversation irrecoverability or an explicit context/budget boundary may also roll an epoch, but only after bounded same-ID reopen/reconstruction has failed; ephemeral tab/process loss does not qualify.
+- Epoch rollover may replay the current canonical Goose projection. Full-history replay is reduced to explicit boundaries, not claimed to be eliminated.
+- Do not recreate Goose session, delegation, approval, or context authority inside this repository.
+- Model-visible turn identifiers are correlation values, never the sole authorization for local tools.
 
-Before architecture, lifecycle, BrowserHost, tunnel, or Goose Control work, read:
+## Current product boundary
 
-1. `docs/README.md`
-2. `docs/architecture.md`
-3. `docs/runtime-lifecycle.md`
-4. `docs/roadmap.md`
-5. `docs/goose-control-plan.md` when the task concerns Goose Control
+This repository is **Goose ChatGPT Web**, not the inherited Codex product described by the upstream README. For V1 operation and follow-up qualification:
 
-Current documentation outranks historical roadmap material and draft PR designs. Draft PR #25 and PR #26 are design inputs only after the documentation reconciliation on current `main`.
+- **Rebuild-owned production path:** `runtimeKind=persistent-rebuild`, core/profile root `~/.local/share/goose-chatgpt-web-rebuild`, persistent Goose Responses facade, Session Broker, rebuild connector gateway, launcher-owned BrowserHost, and the reused `Goose Native 2nd Shift` tunnel/connector identity.
+- **Borrowed development mechanisms:** Electron BrowserHost/profile/session ownership, embedded ChatGPT login/browser surface, selected Playwright/DOM/auth helpers, packaging/runtime installation primitives, and launcher supervision where explicitly adapted. Borrowing a mechanism does **not** import its Codex setup semantics.
+- **Retired legacy appliance:** `/home/dreamteam/repos/goose-webgpt-debian` and `~/.goose-chatgpt-web-dev` were removed after the V1 cutover on 2026-09-13. They are historical evidence only and are not a supported rollback route.
+- **Inherited upstream surfaces that are not rebuild workflow:** top-level README Quick Start, browser smoke → Install models, Setup/MCP pages, Codex route/catalog integration, `Codex Native2`, Bigger Context, Zero Risk/manual mode, Codex compaction/subagents, and default `~/.codex-chatgpt-web` / `~/.config/Codex Web GPT` production profile. Do not use these to configure, qualify, or repair the persistent rebuild.
+- **Qualification-only scaffolding:** `.qualification/`, isolated worktrees, VNC/x11vnc, and source/account-fence/Xvfb launch helpers are disposable local evidence unless explicitly promoted. `.qualification/` is ignored and should be removed once its durable conclusions are recorded.
 
-## Check upstream before new diagnosis
+If an inherited UI or document conflicts with this section or `docs/persistent-chat-rebuild-plan.md`, treat it as heritage/reference and stop before acting on it.
 
-Before diagnosing a new ChatGPT-Web UI, browser, authentication, lifecycle, or compatibility problem from scratch, check current upstream `miuuyy/codex-chatgpt-web` first, including recent commits, issues, and pull requests: https://github.com/miuuyy/codex-chatgpt-web
+## Safety and isolation
 
-Reuse or adapt an upstream fix when it fits. Do not blindly replace Goose-specific architecture or unrelated live state; investigate locally only where upstream does not already explain the symptom or where this fork intentionally differs.
+- The pre-rebuild appliance and its mutable state were retired after V1 cutover. Do not recreate them as an implicit fallback; any future rollback design must be explicit and independently qualified.
+- The production mutable root is `~/.local/share/goose-chatgpt-web-rebuild`; do not share its browser profile, broker database, connector authorization, or tunnel runtime with another CGW appliance.
+- The package-owned account fence remains the local single-appliance authority. Defensive checks for historical legacy paths may remain in code, but those paths are not production infrastructure.
+- The dedicated `CGW Provider Sessions` Project with project-only memory is the accepted provider-chat topology for Gate 0, but it is a **behavioral** correctness mechanism rather than a security boundary: ChatGPT can technically reference sibling Project chats. Project instructions require each provider chat to ignore sibling memory, and correctness must not treat sibling inaccessibility as guaranteed. Any observed cross-session bleed halts shared-Project use until a fallback topology is qualified.
+- Never print, log, commit, or expose credentials, cookies, runtime keys, host-held connector authentication, or other secrets. Durable ChatGPT history also requires explicit local-data retention/redaction controls.
+- Do not use broad process kills. Target only positively identified rebuild-owned processes during an explicitly authorized qualification gate.
+- Do not mutate live ChatGPT/browser/runtime/service/tunnel/account state unless the current qualification gate explicitly authorizes it.
+- Never auto-answer a ChatGPT connector approval surface. Unexpected approval/permission UI is `HUMAN_REQUIRED`/`UNCERTAIN`; neither automatic Allow nor automatic Deny is a valid rebuild recovery action.
 
-## Host/session safety
+## Workflow
 
-- Preserve ignored `.env` files, browser authentication state, runtime keys, credentials, and unrelated local proof artifacts unless the task explicitly authorizes changing them.
-- Never print, log, commit, or otherwise expose credentials or authentication material.
-- Do not enumerate macOS Keychain contents or use broad discovery commands such as `security dump-keychain`.
-- If a task genuinely requires a Keychain item, access only the exact known service/account entry needed for that task.
-- A Goose main agent must never restart, quit, upgrade, relaunch, terminate, or otherwise replace the Goose host carrying its own session.
-- Do not use broad process-kill commands for Chrome, Electron, Playwright, the Responses daemon, or the tunnel. Target only a known project-owned process when an explicit test requires it.
+Gate sequencing and current qualification status live in `docs/persistent-chat-rebuild-plan.md`; do not infer the next gate from this rules file. Later evidence may reopen any contradicted contract.
 
-## Current ownership and lifecycle
-
-- Goose owns logical session state, tools/approvals, delegation/subagents, recipes/extensions, project execution, and context lifecycle.
-- The Responses daemon and Secure MCP Tunnel are independently supervised.
-- Electron owns BrowserHost only: authenticated browser state, task-bound surfaces, BrowserHost control, and CDP.
-- Do not restore daemon/tunnel ownership to Electron `RuntimeSupervisor` in standalone Goose mode.
-
-Canonical lifecycle:
-
-```text
-start: tunnel ready → BrowserHost genuinely ready → Responses daemon ready
-stop:  Responses daemon → BrowserHost → tunnel
-```
-
-Use the canonical lifecycle entry point rather than reconstructing startup from lower-level service scripts.
-
-## Proof boundaries that must not be rediscovered
-
-- BrowserHost readiness uses the descriptor-provided browser helper with Node/Electron Node semantics and `ELECTRON_RUN_AS_NODE=1`. Bun-direct Playwright/CDP is not authoritative readiness evidence.
-- A lifecycle/autostart proof launched from an active BrowserHost-backed turn can interfere with the runtime carrying that same turn. Do not generalize such self-interference into an Electron regression.
-- Ordinary Goose continuation proof is a persisted named session followed by a separate later `--resume`. Do not substitute stdin-interactive Goose or a hand-written `previous_response_id` request for that proof.
-- Fresh ChatGPT Temporary Chats across Goose user turns are expected. Goose, not browser chat reuse, owns durable continuation.
-- Ordered macOS autostart is implemented and live-checked short of an actual reboot/login. Reboot/login reconstruction remains **NOT RUN** until explicitly performed.
-
-## Goose Control boundary
-
-- Goose Control addresses persisted Goose sessions through authenticated loopback `goose serve` ACP.
-- It must not address Electron windows, CDP targets, ChatGPT browser sessions, or BrowserHost process identity.
-- It is separate from Goose Native's per-turn `turn_token` capability.
-- Do not invent a second Goose session/execution API; use native ACP session operations.
-- The first implementation proof is the narrow synchronous GPT Action → REST/OpenAPI → ACP continuation path documented in `docs/goose-control-plan.md`; async jobs, cancellation, multi-target routing, fresh sessions, and Orchestrator are later work.
-
-## Delegation
-
-- Until BrowserHost concurrency is explicitly qualified for a task, avoid parallel ChatGPT-Web child fan-out under the managed browser host.
-- When delegating to a non-ChatGPT/free worker, name the intended provider/model explicitly so it does not inherit ChatGPT-Web transport by accident.
+For documentation work apply the current Day Shift lean-documentation skill. Before source/configuration changes apply the current code-maintainability skill and the plan's upstream keep/adapt/delete/excise boundary. Future behavior belongs in the plan until implemented and qualified; current-state documentation must describe only what is actually true.

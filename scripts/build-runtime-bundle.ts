@@ -1,6 +1,18 @@
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, cpSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import {
+  chmodSync,
+  copyFileSync,
+  cpSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { VERSION } from "../src/version";
 
 const root = resolve(import.meta.dir, "..");
@@ -14,6 +26,22 @@ if (!packageManagerMatch) throw new Error("package.json must pin an exact Bun pa
 const expectedBunVersion = packageManagerMatch[1];
 if (Bun.version !== expectedBunVersion) {
   throw new Error(`Runtime bundle requires Bun ${expectedBunVersion}, received ${Bun.version}`);
+}
+
+function embeddedBunExecutable(): string {
+  const configured = process.env.CODEX_CHATGPT_WEB_EMBEDDED_BUN;
+  if (!configured) return realpathSync(process.execPath);
+  if (!isAbsolute(configured)) throw new Error("CODEX_CHATGPT_WEB_EMBEDDED_BUN must be an absolute path");
+  const executable = realpathSync(configured);
+  const version = Bun.spawnSync([executable, "--version"], { stdout: "pipe", stderr: "pipe" });
+  if (version.exitCode !== 0) {
+    throw new Error(`Embedded Bun validation failed: ${version.stderr.toString() || version.stdout.toString()}`);
+  }
+  const reported = version.stdout.toString().trim();
+  if (reported !== expectedBunVersion) {
+    throw new Error(`Embedded Bun must be ${expectedBunVersion}, received ${reported || "no version"}`);
+  }
+  return executable;
 }
 const output = resolve(process.argv[2] ?? join(root, "dist", "runtime"));
 const appDir = join(output, "app");
@@ -52,6 +80,50 @@ if (!browserHelperBuild.success) {
   throw new Error(`Browser helper bundle failed: ${browserHelperBuild.logs.map(log => log.message).join("; ")}`);
 }
 
+const rebuildBrowserWorkerBuild = await Bun.build({
+  entrypoints: [join(root, "src", "rebuild-node-browser-worker.ts")],
+  target: "node",
+  format: "esm",
+  minify: true,
+  external: ["playwright-core"],
+  packages: "external",
+  outdir: appDir,
+  naming: "rebuild-node-browser-worker.mjs",
+});
+if (!rebuildBrowserWorkerBuild.success) {
+  throw new Error(`Rebuild browser worker bundle failed: ${rebuildBrowserWorkerBuild.logs.map(log => log.message).join("; ")}`);
+}
+
+if (process.platform === "linux") {
+  const dreamBookSupportBuilds = [
+    {
+      entrypoint: join(root, "scripts", "dreambook-account-browser-lease.ts"),
+      naming: "dreambook-account-browser-lease.js",
+      label: "DreamBook account lease",
+    },
+    {
+      entrypoint: join(root, "scripts", "dreambook-headless-xvfb-runner.ts"),
+      naming: "dreambook-headless-xvfb-runner.js",
+      label: "DreamBook headless Xvfb runner",
+    },
+  ];
+  for (const support of dreamBookSupportBuilds) {
+    const result = await Bun.build({
+      entrypoints: [support.entrypoint],
+      target: "bun",
+      format: "esm",
+      minify: true,
+      packages: "bundle",
+      outdir: binDir,
+      naming: support.naming,
+    });
+    if (!result.success) {
+      throw new Error(`${support.label} bundle failed: ${result.logs.map(log => log.message).join("; ")}`);
+    }
+    chmodSync(join(binDir, support.naming), 0o755);
+  }
+}
+
 copyFileSync(join(root, "package.json"), join(appDir, "package.json"));
 copyFileSync(join(root, "bun.lock"), join(appDir, "bun.lock"));
 const install = Bun.spawnSync([process.execPath, "install", "--production", "--frozen-lockfile", "--ignore-scripts"], {
@@ -63,7 +135,7 @@ if (install.exitCode !== 0) {
   throw new Error(`Runtime dependencies failed to install: ${install.stderr.toString() || install.stdout.toString()}`);
 }
 const bunName = process.platform === "win32" ? "bun.exe" : "bun";
-cpSync(realpathSync(process.execPath), join(runtimeDir, bunName));
+cpSync(embeddedBunExecutable(), join(runtimeDir, bunName));
 if (process.platform !== "win32") chmodSync(join(runtimeDir, bunName), 0o755);
 
 const launcherName = process.platform === "win32" ? "codex-chatgpt-web.cmd" : "codex-chatgpt-web";
@@ -96,24 +168,97 @@ exec "$root/runtime/bun" "$root/app/cli.js" "$@"
 writeFileSync(join(binDir, launcherName), launcher, process.platform === "win32" ? undefined : { mode: 0o755 });
 if (process.platform !== "win32") chmodSync(join(binDir, launcherName), 0o755);
 
-const playwrightPackage = join(appDir, "node_modules", "playwright-core", "package.json");
-const bundleId = createHash("sha256");
-for (const relativePath of ["app/cli.js", "app/browser-helper.cjs", "app/package.json", "app/bun.lock"]) {
-  bundleId.update(relativePath);
-  bundleId.update("\0");
-  bundleId.update(readFileSync(join(output, relativePath)));
-  bundleId.update("\0");
+if (process.platform === "linux") {
+  const rebuildTunnelWrapperName = "dreambook-rebuild-tunnel-client-auth-wrapper.sh";
+  const rebuildTunnelWrapper = join(binDir, rebuildTunnelWrapperName);
+  copyFileSync(join(root, "scripts", rebuildTunnelWrapperName), rebuildTunnelWrapper);
+  chmodSync(rebuildTunnelWrapper, 0o755);
 }
+
+const notices = Bun.spawnSync([
+  process.execPath,
+  "run",
+  join(root, "scripts", "generate-third-party-notices.ts"),
+  join(output, "THIRD_PARTY_NOTICES.txt"),
+  "--include-launcher",
+], {
+  cwd: root,
+  stdout: "pipe",
+  stderr: "pipe",
+});
+if (notices.exitCode !== 0) {
+  throw new Error(`Third-party notices failed: ${notices.stderr.toString() || notices.stdout.toString()}`);
+}
+copyFileSync(join(root, "LICENSE"), join(output, "LICENSE"));
+cpSync(join(root, "LICENSES"), join(output, "LICENSES"), { recursive: true });
+
+interface RuntimeManifestFile {
+  path: string;
+  size: number;
+  sha256: string;
+}
+
+function comparePaths(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function runtimeManifestFiles(): RuntimeManifestFile[] {
+  const canonicalRoot = realpathSync(output);
+  const files: RuntimeManifestFile[] = [];
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((left, right) => comparePaths(left.name, right.name))) {
+      const absolutePath = join(directory, entry.name);
+      const relativePath = relative(output, absolutePath).split(sep).join("/");
+      if (relativePath === "manifest.json") continue;
+      if (entry.isDirectory()) {
+        visit(absolutePath);
+        continue;
+      }
+      const metadata = statSync(absolutePath);
+      if (!metadata.isFile()) throw new Error(`Unsupported runtime bundle entry: ${relativePath}`);
+      if (lstatSync(absolutePath).isSymbolicLink()) {
+        const target = realpathSync(absolutePath);
+        if (target !== canonicalRoot && !target.startsWith(`${canonicalRoot}${sep}`)) {
+          throw new Error(`Runtime bundle symlink escapes the bundle: ${relativePath}`);
+        }
+      }
+      files.push({
+        path: relativePath,
+        size: metadata.size,
+        sha256: createHash("sha256").update(readFileSync(absolutePath)).digest("hex"),
+      });
+    }
+  };
+  visit(output);
+  return files.sort((left, right) => comparePaths(left.path, right.path));
+}
+
+function bundleIdFor(files: RuntimeManifestFile[]): string {
+  const digest = createHash("sha256");
+  for (const file of files) {
+    digest.update(file.path);
+    digest.update("\0");
+    digest.update(String(file.size));
+    digest.update("\0");
+    digest.update(file.sha256);
+    digest.update("\0");
+  }
+  return digest.digest("hex");
+}
+
+const playwrightPackage = join(appDir, "node_modules", "playwright-core", "package.json");
+const files = runtimeManifestFiles();
 writeFileSync(join(output, "manifest.json"), `${JSON.stringify({
-  schemaVersion: 1,
+  schemaVersion: 2,
   appVersion: VERSION,
-  bundleId: bundleId.digest("hex"),
+  bundleId: bundleIdFor(files),
   bunVersion: Bun.version,
   platform: process.platform,
   arch: process.arch,
   launcher: `bin/${launcherName}`,
   entrypoint: "app/cli.js",
   playwright: JSON.parse(readFileSync(playwrightPackage, "utf8")).version,
+  files,
 }, null, 2)}\n`);
 
 process.stdout.write(`${output}\n`);

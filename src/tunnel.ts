@@ -1,12 +1,13 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { unzipSync } from "fflate";
-import type { AppConfig, TunnelConfig } from "./config";
+import type { AppConfig, BrowserInteractionMode, TunnelConfig } from "./config";
 import { atomicWriteFile, getConfigDir } from "./config";
 import { runCommand, runChecked } from "./process";
 
-const TUNNEL_VERSION = "0.0.10";
+export const TUNNEL_VERSION = "0.0.12";
+const MIGRATABLE_TUNNEL_VERSIONS = new Set(["0.0.10"]);
 const RELEASE_BASE = `https://github.com/openai/tunnel-client/releases/download/v${TUNNEL_VERSION}`;
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 export const TUNNEL_READY_TIMEOUT_MS = 120_000;
@@ -18,6 +19,12 @@ interface TunnelInstallManifest {
   asset: string;
   archiveSha256: string;
   binarySha256: string;
+}
+
+export function tunnelClientInstallAction(installedVersion: string): "reuse" | "upgrade" {
+  if (installedVersion === TUNNEL_VERSION) return "reuse";
+  if (MIGRATABLE_TUNNEL_VERSIONS.has(installedVersion)) return "upgrade";
+  throw new Error(`Installed tunnel-client version ${installedVersion} is not a trusted upgrade source`);
 }
 
 function sha256(bytes: Uint8Array): string {
@@ -71,22 +78,29 @@ function manifestPath(): string {
 export async function installTunnelClient(): Promise<string> {
   const executable = binaryPath();
   const manifestFile = manifestPath();
+  let previousInstallation: { binary: Uint8Array; manifestText: string } | undefined;
   if (existsSync(executable) && existsSync(manifestFile)) {
-    const manifest = JSON.parse(readFileSync(manifestFile, "utf8")) as Partial<TunnelInstallManifest>;
-    const actual = sha256(readFileSync(executable));
-    if (manifest.version === 1 && manifest.tunnelClientVersion === TUNNEL_VERSION && manifest.binarySha256 === actual) {
-      if (process.platform !== "win32" && (statSync(executable).mode & 0o111) === 0) {
-        throw new Error(`Existing tunnel-client is not executable: ${executable}`);
-      }
-      const version = runChecked(executable, ["--version"], { timeout: 10_000 });
-      if (!version.stdout.includes(TUNNEL_VERSION) && !version.stderr.includes(TUNNEL_VERSION)) {
-        throw new Error(`Existing tunnel-client did not report version ${TUNNEL_VERSION}`);
-      }
-      return executable;
+    const manifestText = readFileSync(manifestFile, "utf8");
+    const manifest = JSON.parse(manifestText) as Partial<TunnelInstallManifest>;
+    const installedBinary = new Uint8Array(readFileSync(executable));
+    const actual = sha256(installedBinary);
+    if (manifest.version !== 1 || typeof manifest.tunnelClientVersion !== "string"
+      || manifest.binarySha256 !== actual) {
+      throw new Error(`Existing tunnel-client failed integrity validation: ${executable}`);
     }
-    throw new Error(`Existing tunnel-client failed integrity validation: ${executable}`);
+    if (process.platform !== "win32" && (statSync(executable).mode & 0o111) === 0) {
+      throw new Error(`Existing tunnel-client is not executable: ${executable}`);
+    }
+    const action = tunnelClientInstallAction(manifest.tunnelClientVersion);
+    const installedVersion = runChecked(executable, ["--version"], { timeout: 10_000 });
+    if (!installedVersion.stdout.includes(manifest.tunnelClientVersion)
+      && !installedVersion.stderr.includes(manifest.tunnelClientVersion)) {
+      throw new Error(`Existing tunnel-client did not report version ${manifest.tunnelClientVersion}`);
+    }
+    if (action === "reuse") return executable;
+    previousInstallation = { binary: installedBinary, manifestText };
   }
-  if (existsSync(executable) || existsSync(manifestFile)) {
+  if (!previousInstallation && (existsSync(executable) || existsSync(manifestFile))) {
     rmSync(executable, { force: true });
     rmSync(manifestFile, { force: true });
   }
@@ -105,18 +119,17 @@ export async function installTunnelClient(): Promise<string> {
   if (!entry) throw new Error(`${asset} does not contain ${expectedName}`);
   const binary = entry[1];
   mkdirSync(dirname(executable), { recursive: true, mode: 0o700 });
-  atomicWriteFile(executable, binary);
-  if (process.platform !== "win32") chmodSync(executable, 0o700);
+  const stagedExecutable = `${executable}.install-${process.pid}-${randomUUID()}${process.platform === "win32" ? ".exe" : ""}`;
+  atomicWriteFile(stagedExecutable, binary);
   let version: ReturnType<typeof runChecked>;
   try {
-    version = runChecked(executable, ["--version"], { timeout: 10_000 });
-  } catch (error) {
-    rmSync(executable, { force: true });
-    throw error;
-  }
-  if (!version.stdout.includes(TUNNEL_VERSION) && !version.stderr.includes(TUNNEL_VERSION)) {
-    rmSync(executable, { force: true });
-    throw new Error(`Installed tunnel-client did not report version ${TUNNEL_VERSION}`);
+    if (process.platform !== "win32") chmodSync(stagedExecutable, 0o700);
+    version = runChecked(stagedExecutable, ["--version"], { timeout: 10_000 });
+    if (!version.stdout.includes(TUNNEL_VERSION) && !version.stderr.includes(TUNNEL_VERSION)) {
+      throw new Error(`Installed tunnel-client did not report version ${TUNNEL_VERSION}`);
+    }
+  } finally {
+    rmSync(stagedExecutable, { force: true });
   }
   const manifest: TunnelInstallManifest = {
     version: 1,
@@ -125,25 +138,48 @@ export async function installTunnelClient(): Promise<string> {
     archiveSha256: archiveHash,
     binarySha256: sha256(binary),
   };
-  atomicWriteFile(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+  try {
+    atomicWriteFile(executable, binary);
+    if (process.platform !== "win32") chmodSync(executable, 0o700);
+    atomicWriteFile(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
+  } catch (error) {
+    if (previousInstallation) {
+      atomicWriteFile(executable, previousInstallation.binary);
+      if (process.platform !== "win32") chmodSync(executable, 0o700);
+      atomicWriteFile(manifestFile, previousInstallation.manifestText);
+    } else {
+      rmSync(executable, { force: true });
+      rmSync(manifestFile, { force: true });
+    }
+    throw error;
+  }
   return executable;
 }
 
-export function installRuntimeKey(sourcePath: string): string {
+export function installRuntimeKey(
+  sourcePath: string,
+  interactionMode: BrowserInteractionMode = "automatic",
+): string {
   if (!existsSync(sourcePath)) throw new Error(`Tunnel runtime key file does not exist: ${sourcePath}`);
   const key = readFileSync(sourcePath);
   if (key.byteLength === 0 || key.byteLength > 64 * 1024) throw new Error("Tunnel runtime key file is empty or unexpectedly large");
-  return installRuntimeKeyBytes(key);
+  return installRuntimeKeyBytes(key, interactionMode);
 }
 
-export function managedRuntimeKeyPath(): string {
-  return join(getConfigDir(), "secrets", "tunnel-runtime.key");
+export function managedRuntimeKeyPath(interactionMode: BrowserInteractionMode = "automatic"): string {
+  const fileName = interactionMode === "manual"
+    ? "tunnel-runtime-zero-risk.key"
+    : "tunnel-runtime-automatic.key";
+  return join(getConfigDir(), "secrets", fileName);
 }
 
-export function installRuntimeKeyBytes(key: Uint8Array | string): string {
+export function installRuntimeKeyBytes(
+  key: Uint8Array | string,
+  interactionMode: BrowserInteractionMode = "automatic",
+): string {
   const bytes = typeof key === "string" ? new TextEncoder().encode(key.trim()) : key;
   if (bytes.byteLength === 0 || bytes.byteLength > 64 * 1024) throw new Error("Tunnel runtime key is empty or unexpectedly large");
-  const destination = managedRuntimeKeyPath();
+  const destination = managedRuntimeKeyPath(interactionMode);
   atomicWriteFile(destination, bytes);
   return destination;
 }
@@ -183,12 +219,19 @@ function tunnelCommandQuoted(value: string): string {
 }
 
 export function mcpCommand(config: AppConfig, platform = process.platform): string {
+  const contract = config.browserInteractionMode === "manual" ? "safe" : "native";
+  const command = [
+    ...config.runtimeCommand,
+    "mcp",
+    "--contract",
+    contract,
+    "--broker-socket",
+    config.brokerSocketPath,
+  ];
   if (platform === "win32") {
-    return [...config.runtimeCommand, "mcp", "--broker-socket", config.brokerSocketPath]
-      .map(tunnelCommandQuoted)
-      .join(" ");
+    return command.map(tunnelCommandQuoted).join(" ");
   }
-  return [...config.runtimeCommand, "mcp", "--broker-socket", config.brokerSocketPath].map(shellQuote).join(" ");
+  return command.map(shellQuote).join(" ");
 }
 
 function tunnel(config: AppConfig): TunnelConfig {
@@ -292,7 +335,7 @@ export function tunnelConnectLaunchError(output: string): string | undefined {
   const running = parsed.running === true;
   const healthy = parsed.healthy === true;
   const ready = parsed.ready === true;
-  if (running && healthy && ready) return undefined;
+  if (running && healthy) return undefined;
   const diagnostics = nestedRecord(parsed, "launch_diagnostics");
   const exitCode = typeof parsed.exit_code === "number" ? parsed.exit_code
     : typeof diagnostics?.exit_code === "number" ? diagnostics.exit_code
@@ -308,7 +351,7 @@ export function tunnelConnectLaunchError(output: string): string | undefined {
     ...(exitCode !== undefined ? [`exit_code=${exitCode}`] : []),
     ...(remoteError ? [`remote_error=${remoteError}`] : []),
     ...(logTail ? [`runtime_log=${logTail}`] : []),
-    ...(!remoteError && !logTail ? ["runtime did not complete a healthy ready launch"] : []),
+    ...(!remoteError && !logTail ? ["runtime did not complete a healthy launch"] : []),
   ].join("; "));
 }
 
@@ -371,8 +414,4 @@ export async function waitForTunnelReady(
     status = tunnelStatus(config);
   }
   return status;
-}
-
-export function tunnelClientVersion(): string {
-  return TUNNEL_VERSION;
 }

@@ -1,0 +1,1553 @@
+import { randomUUID } from "node:crypto";
+import { Database } from "bun:sqlite";
+import {
+  conversationBudgetPolicyJson,
+  parseConversationBudgetPolicyJson,
+  resolveConversationBudgetPolicy,
+  type ConversationBudgetPolicy,
+} from "./conversation-budget";
+
+export type LeaseState = "IDLE" | "TURN_OUTSTANDING" | "UNRECONCILED";
+export type TurnState =
+  | "QUEUED"
+  | "TURN_OUTSTANDING"
+  | "UNRECONCILED"
+  | "COMPLETE"
+  | "CANCELLED"
+  | "ABANDONED";
+// Keep abandonment out of the persisted state enum: exact older broker DBs have an immutable
+// state CHECK, so additive abandoned_at preserves upgrade compatibility without rebuilding turns.
+type StoredTurnState = Exclude<TurnState, "ABANDONED">;
+export type OperationState = "MINTED" | "CLAIMED" | "SUCCESS" | "FAILURE" | "UNCERTAIN";
+export type TerminalOperationState = Extract<OperationState, "SUCCESS" | "FAILURE">;
+
+export interface RemoteEpoch {
+  gooseSessionId: string;
+  epoch: number;
+  projectId: string;
+  conversationId: string | null;
+  historyWatermark: string | null;
+  budgetPolicyJson: string | null;
+  budgetConsumedTokens: number | null;
+  isCurrent: boolean;
+  leaseState: LeaseState;
+  leaseTurnRef: string | null;
+}
+
+export interface BrokerTurn {
+  turnRef: string;
+  gooseSessionId: string;
+  epoch: number;
+  requestHash: string;
+  submitNonce: string;
+  state: TurnState;
+  acceptedUserTurnId: string | null;
+  revision: number;
+  completionClaimRevision: number | null;
+  checkpointJson: string | null;
+  finalDigest: string | null;
+  unreconciledReason: string | null;
+  budgetReservedTokens: number | null;
+  budgetPromptTokens: number | null;
+  budgetGrowthConsumedTokens: number | null;
+}
+
+export interface BrokerOperation {
+  opRef: string;
+  turnRef: string;
+  seq: number;
+  state: OperationState;
+  inputHash: string | null;
+  resultJson: string | null;
+  ownerId: string | null;
+  answerBoundaryJson: string | null;
+  terminalAt: number | null;
+  budgetReservedTokens: number;
+  budgetChargeTokens: number | null;
+}
+
+export interface PositiveTerminalEvidence {
+  canonicalConversationId: string;
+  acceptedUserTurnId: string;
+  remoteUiNonRunningAcrossQualifiedSettle: boolean;
+  noUnresolvedGooseWork: boolean;
+  noContradictoryActivity: boolean;
+}
+
+export interface CompletionEvidence {
+  connectorFinal: "ACKNOWLEDGED" | "UNAVAILABLE";
+  canonicalConversationId: string;
+  acceptedUserTurnId: string;
+  noUnresolvedGooseWork: boolean;
+  remoteNonRunning: boolean;
+  observedFinalDigest: string;
+  canonicalHistoryWatermark: string;
+  budgetFinalTokens?: number;
+  answerBoundary: { opRef: string; contentAdvanced: boolean; qualifiedTerminal?: boolean } | null;
+}
+
+export interface CompletionClaim {
+  turnRef: string;
+  revision: number;
+}
+
+export type OperationClaimDecision =
+  | { kind: "EXECUTE"; opRef: string; seq: number }
+  | { kind: "ATTACH"; opRef: string; seq: number }
+  | { kind: "REPLAY"; opRef: string; seq: number; outcome: TerminalOperationState; resultJson: string; nextOpRef: string }
+  | { kind: "UNCERTAIN"; opRef: string; seq: number }
+  | { kind: "CONFLICT"; opRef: string; seq: number }
+  | { kind: "BOUNDARY_REQUIRED"; opRef: string; seq: number }
+  | { kind: "OUT_OF_ORDER"; opRef: string; seq: number }
+  | { kind: "PROTOCOL_VIOLATION"; opRef: string; seq: number | null }
+  | { kind: "BUDGET_REQUIRED"; opRef: string; seq: number }
+  | { kind: "STALE"; opRef: string; seq: number }
+  | { kind: "WRONG_TURN"; opRef: string; seq: number }
+  | { kind: "UNKNOWN"; opRef: string; seq: null };
+
+export type MissingOperationDecision =
+  | { kind: "UNCERTAIN"; matchingOpRefs: string[] }
+  | { kind: "PROTOCOL_VIOLATION" }
+  | { kind: "INVALID" };
+
+export interface SessionBrokerOptions {
+  projectId: string;
+  terminalReplayWindowMs: number;
+  conversationBudgetPolicy?: Partial<ConversationBudgetPolicy>;
+  now?: () => number;
+  instanceId?: string;
+  makeTurnRef?: () => string;
+  makeSubmitNonce?: () => string;
+  makeOpRef?: () => string;
+}
+
+export class SessionBrokerError extends Error {
+  constructor(public readonly code: string, message: string) {
+    super(message);
+    this.name = "SessionBrokerError";
+  }
+}
+
+interface EpochRow {
+  goose_session_id: string;
+  epoch: number;
+  project_id: string;
+  conversation_id: string | null;
+  history_watermark: string | null;
+  budget_policy_json: string | null;
+  budget_consumed_tokens: number | null;
+  is_current: number;
+}
+
+interface TurnRow {
+  turn_ref: string;
+  goose_session_id: string;
+  epoch: number;
+  request_hash: string;
+  submit_nonce: string;
+  state: StoredTurnState;
+  slot_held: number;
+  accepted_user_turn_id: string | null;
+  revision: number;
+  completion_claim_revision: number | null;
+  checkpoint_json: string | null;
+  final_digest: string | null;
+  unreconciled_reason: string | null;
+  abandoned_at: number | null;
+  pre_send_retryable_cancelled: number;
+  budget_reserved_tokens: number | null;
+  budget_prompt_tokens: number | null;
+  budget_growth_consumed_tokens: number | null;
+}
+
+interface OperationRow {
+  op_ref: string;
+  turn_ref: string;
+  seq: number;
+  state: OperationState;
+  input_hash: string | null;
+  result_json: string | null;
+  owner_id: string | null;
+  answer_boundary_json: string | null;
+  terminal_at: number | null;
+  budget_reserved_tokens: number;
+  budget_charge_tokens: number | null;
+}
+
+const schema = `
+CREATE TABLE IF NOT EXISTS remote_epochs (
+  goose_session_id TEXT NOT NULL,
+  epoch INTEGER NOT NULL,
+  project_id TEXT NOT NULL,
+  conversation_id TEXT,
+  history_watermark TEXT,
+  budget_policy_json TEXT,
+  budget_consumed_tokens INTEGER CHECK (budget_consumed_tokens IS NULL OR budget_consumed_tokens >= 0),
+  is_current INTEGER NOT NULL CHECK (is_current IN (0, 1)),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (goose_session_id, epoch)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_current_epoch_per_session
+  ON remote_epochs(goose_session_id) WHERE is_current = 1;
+CREATE UNIQUE INDEX IF NOT EXISTS unique_remote_conversation
+  ON remote_epochs(conversation_id) WHERE conversation_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS turns (
+  queue_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  turn_ref TEXT NOT NULL UNIQUE,
+  goose_session_id TEXT NOT NULL,
+  epoch INTEGER NOT NULL,
+  request_hash TEXT NOT NULL,
+  submit_nonce TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN (
+    'QUEUED', 'TURN_OUTSTANDING', 'UNRECONCILED', 'COMPLETE', 'CANCELLED'
+  )),
+  slot_held INTEGER NOT NULL DEFAULT 0 CHECK (slot_held IN (0, 1)),
+  accepted_user_turn_id TEXT,
+  revision INTEGER NOT NULL DEFAULT 0,
+  completion_claim_revision INTEGER,
+  checkpoint_json TEXT,
+  final_digest TEXT,
+  unreconciled_reason TEXT,
+  positive_terminal_evidence_json TEXT,
+  pre_send_retryable_cancelled INTEGER NOT NULL DEFAULT 0 CHECK (pre_send_retryable_cancelled IN (0, 1)),
+  abandoned_at INTEGER CHECK (
+    abandoned_at IS NULL OR (
+      state = 'UNRECONCILED' AND slot_held = 0 AND positive_terminal_evidence_json IS NOT NULL
+      AND final_digest IS NULL AND completion_claim_revision IS NULL
+    )
+  ),
+  budget_reserved_tokens INTEGER CHECK (budget_reserved_tokens IS NULL OR budget_reserved_tokens >= 0),
+  budget_prompt_tokens INTEGER CHECK (budget_prompt_tokens IS NULL OR budget_prompt_tokens >= 0),
+  budget_growth_consumed_tokens INTEGER CHECK (budget_growth_consumed_tokens IS NULL OR budget_growth_consumed_tokens >= 0),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (goose_session_id, epoch) REFERENCES remote_epochs(goose_session_id, epoch),
+  CHECK (slot_held = 0 OR state NOT IN ('COMPLETE', 'CANCELLED'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS unique_submit_nonce ON turns(submit_nonce);
+CREATE UNIQUE INDEX IF NOT EXISTS one_open_turn_per_epoch
+  ON turns(goose_session_id, epoch)
+  WHERE state IN ('QUEUED', 'TURN_OUTSTANDING', 'UNRECONCILED');
+CREATE UNIQUE INDEX IF NOT EXISTS one_account_slot_holder ON turns(slot_held) WHERE slot_held = 1;
+CREATE INDEX IF NOT EXISTS queued_turns ON turns(state, queue_seq);
+
+CREATE TABLE IF NOT EXISTS broker_owner (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  owner_id TEXT,
+  pid INTEGER,
+  updated_at INTEGER NOT NULL,
+  CHECK ((owner_id IS NULL AND pid IS NULL) OR (owner_id IS NOT NULL AND pid IS NOT NULL))
+);
+
+CREATE TABLE IF NOT EXISTS operations (
+  op_ref TEXT PRIMARY KEY,
+  turn_ref TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('MINTED', 'CLAIMED', 'SUCCESS', 'FAILURE', 'UNCERTAIN')),
+  input_hash TEXT,
+  result_json TEXT,
+  owner_id TEXT,
+  answer_boundary_json TEXT,
+  budget_reserved_tokens INTEGER NOT NULL DEFAULT 0 CHECK (budget_reserved_tokens >= 0),
+  budget_charge_tokens INTEGER CHECK (budget_charge_tokens IS NULL OR budget_charge_tokens >= 0),
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  terminal_at INTEGER,
+  UNIQUE (turn_ref, seq),
+  FOREIGN KEY (turn_ref) REFERENCES turns(turn_ref),
+  CHECK (
+    (state = 'MINTED' AND input_hash IS NULL AND result_json IS NULL AND owner_id IS NULL AND terminal_at IS NULL)
+    OR (state = 'CLAIMED' AND input_hash IS NOT NULL AND result_json IS NULL AND owner_id IS NOT NULL AND terminal_at IS NULL AND answer_boundary_json IS NOT NULL)
+    OR (state = 'UNCERTAIN' AND input_hash IS NOT NULL AND result_json IS NULL AND owner_id IS NULL AND terminal_at IS NULL AND answer_boundary_json IS NOT NULL)
+    OR (state IN ('SUCCESS', 'FAILURE') AND input_hash IS NOT NULL AND result_json IS NOT NULL AND owner_id IS NULL AND terminal_at IS NOT NULL AND answer_boundary_json IS NOT NULL)
+  )
+);
+CREATE INDEX IF NOT EXISTS operations_by_turn ON operations(turn_ref, seq);
+`;
+
+function epochFromRow(
+  row: EpochRow,
+  lease: { state: LeaseState; turnRef: string | null },
+): RemoteEpoch {
+  return {
+    gooseSessionId: row.goose_session_id,
+    epoch: row.epoch,
+    projectId: row.project_id,
+    conversationId: row.conversation_id,
+    historyWatermark: row.history_watermark,
+    budgetPolicyJson: row.budget_policy_json,
+    budgetConsumedTokens: row.budget_consumed_tokens,
+    isCurrent: row.is_current === 1,
+    leaseState: lease.state,
+    leaseTurnRef: lease.turnRef,
+  };
+}
+
+function turnFromRow(row: TurnRow): BrokerTurn {
+  return {
+    turnRef: row.turn_ref,
+    gooseSessionId: row.goose_session_id,
+    epoch: row.epoch,
+    requestHash: row.request_hash,
+    submitNonce: row.submit_nonce,
+    state: row.abandoned_at === null ? row.state : "ABANDONED",
+    acceptedUserTurnId: row.accepted_user_turn_id,
+    revision: row.revision,
+    completionClaimRevision: row.completion_claim_revision,
+    checkpointJson: row.checkpoint_json,
+    finalDigest: row.final_digest,
+    unreconciledReason: row.unreconciled_reason,
+    budgetReservedTokens: row.budget_reserved_tokens,
+    budgetPromptTokens: row.budget_prompt_tokens,
+    budgetGrowthConsumedTokens: row.budget_growth_consumed_tokens,
+  };
+}
+
+function operationFromRow(row: OperationRow): BrokerOperation {
+  return {
+    opRef: row.op_ref,
+    turnRef: row.turn_ref,
+    seq: row.seq,
+    state: row.state,
+    inputHash: row.input_hash,
+    resultJson: row.result_json,
+    ownerId: row.owner_id,
+    answerBoundaryJson: row.answer_boundary_json,
+    terminalAt: row.terminal_at,
+    budgetReservedTokens: row.budget_reserved_tokens,
+    budgetChargeTokens: row.budget_charge_tokens,
+  };
+}
+
+function positiveTerminalSatisfied(evidence: PositiveTerminalEvidence): boolean {
+  return Boolean(evidence.canonicalConversationId)
+    && Boolean(evidence.acceptedUserTurnId)
+    && evidence.remoteUiNonRunningAcrossQualifiedSettle
+    && evidence.noUnresolvedGooseWork
+    && evidence.noContradictoryActivity;
+}
+
+export class SessionBroker {
+  private readonly db: Database;
+  private readonly projectId: string;
+  private readonly now: () => number;
+  private readonly makeTurnRef: () => string;
+  private readonly makeSubmitNonce: () => string;
+  private readonly makeOpRef: () => string;
+  private readonly instanceId: string;
+  private readonly terminalReplayWindowMs: number;
+  private readonly conversationBudgetPolicy: ConversationBudgetPolicy | null;
+  private readonly conversationBudgetPolicyJson: string | null;
+
+  constructor(databasePath: string, options: SessionBrokerOptions) {
+    if (!options.projectId) {
+      throw new SessionBrokerError("INVALID_POLICY", "projectId must not be empty");
+    }
+    if (!Number.isFinite(options.terminalReplayWindowMs) || options.terminalReplayWindowMs <= 0) {
+      throw new SessionBrokerError("INVALID_POLICY", "terminalReplayWindowMs must be a positive finite duration");
+    }
+    this.projectId = options.projectId;
+    this.now = options.now ?? Date.now;
+    this.makeTurnRef = options.makeTurnRef ?? (() => `turn_${randomUUID()}`);
+    this.makeSubmitNonce = options.makeSubmitNonce ?? (() => `submit_${randomUUID()}`);
+    this.makeOpRef = options.makeOpRef ?? (() => `op_${randomUUID()}`);
+    this.instanceId = options.instanceId ?? `broker_${randomUUID()}`;
+    this.terminalReplayWindowMs = options.terminalReplayWindowMs;
+    this.conversationBudgetPolicy = options.conversationBudgetPolicy
+      ? resolveConversationBudgetPolicy(options.conversationBudgetPolicy)
+      : null;
+    this.conversationBudgetPolicyJson = this.conversationBudgetPolicy
+      ? conversationBudgetPolicyJson(this.conversationBudgetPolicy)
+      : null;
+    this.db = new Database(databasePath, { create: true, strict: true });
+    this.db.query("PRAGMA journal_mode = WAL").get();
+    this.db.exec("PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
+    try {
+      this.db.exec(schema);
+      const at = this.now();
+      this.db.query("INSERT OR IGNORE INTO broker_owner(singleton, owner_id, pid, updated_at) VALUES (1, NULL, NULL, ?)").run(at);
+      this.claimBrokerOwnership();
+      this.assertProjectBinding();
+      this.migrateSchema();
+      this.recoverAfterRestart();
+    } catch (error) {
+      try {
+        this.db.query("UPDATE broker_owner SET owner_id = NULL, pid = NULL, updated_at = ? WHERE singleton = 1 AND owner_id = ?")
+          .run(this.now(), this.instanceId);
+      } catch {
+        // Preserve the original constructor failure; process death remains fail-closed fallback.
+      }
+      this.db.close();
+      throw error;
+    }
+  }
+
+  close(): void {
+    this.transaction(() => {
+      this.db.query("UPDATE broker_owner SET owner_id = NULL, pid = NULL, updated_at = ? WHERE singleton = 1 AND owner_id = ?")
+        .run(this.now(), this.instanceId);
+    });
+    this.db.close();
+  }
+
+  createEpoch(input: {
+    gooseSessionId: string;
+    historyWatermark?: string | null;
+  }): RemoteEpoch {
+    if (!input.gooseSessionId) this.fail("INVALID_SESSION", "gooseSessionId must not be empty");
+    return this.transaction(() => {
+      const current = this.currentEpochRow(input.gooseSessionId);
+      if (current) {
+        if (this.hasNonterminalTurn(input.gooseSessionId, current.epoch)) {
+          this.fail("EPOCH_BUSY", "Cannot roll epoch while its conversation or turn is nonterminal");
+        }
+        this.db.query("UPDATE remote_epochs SET is_current = 0, updated_at = ? WHERE goose_session_id = ? AND epoch = ?")
+          .run(this.now(), input.gooseSessionId, current.epoch);
+      }
+      const maximum = this.db.query("SELECT MAX(epoch) AS value FROM remote_epochs WHERE goose_session_id = ?")
+        .get(input.gooseSessionId) as { value: number | null } | null;
+      const epoch = (maximum?.value ?? 0) + 1;
+      const at = this.now();
+      this.db.query(`INSERT INTO remote_epochs(
+        goose_session_id, epoch, project_id, conversation_id, history_watermark,
+        budget_policy_json, budget_consumed_tokens, is_current, created_at, updated_at
+      ) VALUES (?, ?, ?, NULL, ?, ?, ?, 1, ?, ?)`)
+        .run(
+          input.gooseSessionId,
+          epoch,
+          this.projectId,
+          input.historyWatermark ?? null,
+          this.conversationBudgetPolicyJson,
+          this.conversationBudgetPolicy?.baseAllowanceTokens ?? null,
+          at,
+          at,
+        );
+      return this.getEpochRequired(input.gooseSessionId, epoch);
+    });
+  }
+
+  bindConversation(input: {
+    gooseSessionId: string;
+    epoch: number;
+    conversationId: string;
+  }): RemoteEpoch {
+    if (!input.conversationId) this.fail("INVALID_CONVERSATION", "conversationId must not be empty");
+    return this.transaction(() => {
+      const row = this.epochRowRequired(input.gooseSessionId, input.epoch);
+      if (row.is_current !== 1) this.fail("STALE_EPOCH", "Only the current epoch may bind a conversation");
+      if (row.conversation_id && row.conversation_id !== input.conversationId) {
+        this.fail("CONVERSATION_CONFLICT", "Remote epoch is already bound to another canonical conversation");
+      }
+      const existing = this.db.query("SELECT goose_session_id, epoch FROM remote_epochs WHERE conversation_id = ?")
+        .get(input.conversationId) as { goose_session_id: string; epoch: number } | null;
+      if (existing && (existing.goose_session_id !== input.gooseSessionId || existing.epoch !== input.epoch)) {
+        this.fail("CONVERSATION_CONFLICT", "Canonical conversation is already bound to another epoch");
+      }
+      this.db.query(`UPDATE remote_epochs SET conversation_id = ?, updated_at = ?
+        WHERE goose_session_id = ? AND epoch = ?`)
+        .run(input.conversationId, this.now(), input.gooseSessionId, input.epoch);
+      return this.getEpochRequired(input.gooseSessionId, input.epoch);
+    });
+  }
+
+  getCurrentEpoch(gooseSessionId: string): RemoteEpoch | null {
+    const row = this.currentEpochRow(gooseSessionId);
+    return row ? this.epochFromRow(row) : null;
+  }
+
+  enqueueTurn(input: {
+    gooseSessionId: string;
+    requestHash: string;
+    checkpointJson?: string;
+    budgetPromptTokens?: (identity: {
+      turnRef: string;
+      submitNonce: string;
+      initialOpRef: string;
+      epoch: RemoteEpoch;
+    }) => number;
+  }): BrokerTurn {
+    if (!input.gooseSessionId || !input.requestHash) {
+      this.fail("INVALID_TURN", "gooseSessionId and requestHash are required");
+    }
+    return this.transaction(() => {
+      const latest = this.db.query("SELECT * FROM turns WHERE goose_session_id = ? ORDER BY queue_seq DESC LIMIT 1")
+        .get(input.gooseSessionId) as TurnRow | null;
+      // requestHash identifies the initial Goose delivery for logical-turn replay. checkpointJson
+      // is mutable provider progress and may already have advanced through later tool rounds; an
+      // old transport retry must never overwrite or be rejected merely because that checkpoint
+      // has moved forward.
+      if (latest?.request_hash === input.requestHash
+        && !(latest.state === "CANCELLED" && latest.pre_send_retryable_cancelled === 1)) {
+        return turnFromRow(latest);
+      }
+
+      const epochRow = this.currentEpochRow(input.gooseSessionId);
+      if (!epochRow) this.fail("UNKNOWN_EPOCH", "Goose session has no current remote epoch");
+      if (this.hasNonterminalTurn(input.gooseSessionId, epochRow.epoch)) {
+        this.fail("CONVERSATION_BUSY", "Current remote epoch cannot accept another turn");
+      }
+      const turnRef = this.makeTurnRef();
+      const submitNonce = this.makeSubmitNonce();
+      if (!turnRef || !submitNonce) this.fail("INVALID_TURN_IDENTITY", "Turn identity factories returned an empty value");
+
+      let budgetReservedTokens: number | null = null;
+      let budgetPromptTokens: number | null = null;
+      let initialOpRef: string | null = null;
+      if (this.conversationBudgetPolicy) {
+        if (!input.budgetPromptTokens) {
+          this.fail("BUDGET_REQUIRED", "Conversation-budget admission requires an exact rendered prompt estimate");
+        }
+        if (epochRow.budget_policy_json !== this.conversationBudgetPolicyJson
+          || epochRow.budget_consumed_tokens === null) {
+          this.fail("BUDGET_ROLLOVER_REQUIRED", "Current remote epoch has incompatible or unknown conversation-budget accounting");
+        }
+        initialOpRef = this.makeOpRef();
+        if (!initialOpRef) this.fail("INVALID_OP_REF", "Operation reference factory returned an empty value");
+        budgetPromptTokens = input.budgetPromptTokens({
+          turnRef,
+          submitNonce,
+          initialOpRef,
+          epoch: this.epochFromRow(epochRow),
+        });
+        if (!Number.isSafeInteger(budgetPromptTokens) || budgetPromptTokens < 0) {
+          this.fail("INVALID_BUDGET", "Rendered prompt token estimate must be a non-negative safe integer");
+        }
+        budgetReservedTokens = budgetPromptTokens + this.conversationBudgetPolicy.turnGrowthReserveTokens;
+        if (epochRow.budget_consumed_tokens + budgetReservedTokens
+          + this.conversationBudgetPolicy.recoveryReserveTokens > this.conversationBudgetPolicy.softLimitTokens) {
+          this.fail("BUDGET_ROLLOVER_REQUIRED", "Current remote epoch lacks reserve-first conversation-budget headroom");
+        }
+      } else if (input.budgetPromptTokens) {
+        this.fail("INVALID_BUDGET", "Conversation-budget prompt estimator supplied without a broker budget policy");
+      }
+
+      const at = this.now();
+      this.db.query(`INSERT INTO turns(
+        turn_ref, goose_session_id, epoch, request_hash, submit_nonce, state, slot_held,
+        accepted_user_turn_id, revision, completion_claim_revision, checkpoint_json,
+        final_digest, unreconciled_reason, positive_terminal_evidence_json,
+        budget_reserved_tokens, budget_prompt_tokens, budget_growth_consumed_tokens,
+        created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 'QUEUED', 0, NULL, 0, NULL, ?, NULL, NULL, NULL, ?, ?, ?, ?, ?)`)
+        .run(
+          turnRef,
+          input.gooseSessionId,
+          epochRow.epoch,
+          input.requestHash,
+          submitNonce,
+          input.checkpointJson ?? null,
+          budgetReservedTokens,
+          budgetPromptTokens,
+          this.conversationBudgetPolicy ? 0 : null,
+          at,
+          at,
+        );
+      if (initialOpRef) this.insertOperation(initialOpRef, turnRef, 1);
+      return this.getTurnRequired(turnRef);
+    });
+  }
+
+  admitNext(): { turn: BrokerTurn; initialOpRef: string } | null {
+    return this.transaction(() => {
+      const holder = this.accountSlotHolder();
+      if (holder) {
+        const turn = this.turnRowRequired(holder);
+        if (turn.state !== "QUEUED") return null;
+        const initialOpRef = this.operationRefAt(turn.turn_ref, 1);
+        if (!initialOpRef) this.fail("JOURNAL_CORRUPT", "Admitted pre-send turn is missing its initial operation ref");
+        return { turn: turnFromRow(turn), initialOpRef };
+      }
+      const next = this.db.query("SELECT * FROM turns WHERE state = 'QUEUED' ORDER BY queue_seq ASC LIMIT 1")
+        .get() as TurnRow | null;
+      if (!next) return null;
+      const epoch = this.epochRowRequired(next.goose_session_id, next.epoch);
+      if (epoch.is_current !== 1) {
+        this.fail("QUEUE_INVARIANT", "Oldest queued turn no longer belongs to the current epoch");
+      }
+      const slot = this.db.query("UPDATE turns SET slot_held = 1, updated_at = ? WHERE turn_ref = ? AND slot_held = 0")
+        .run(this.now(), next.turn_ref);
+      if (slot.changes !== 1) this.fail("ACCOUNT_SLOT", "Failed to acquire the account execution slot");
+      const initialOpRef = this.operationRefAt(next.turn_ref, 1) ?? this.mintOperation(next.turn_ref, 1);
+      return { turn: turnFromRow(next), initialOpRef };
+    });
+  }
+
+  cancelBeforeSend(turnRef: string): BrokerTurn {
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(turnRef);
+      if (turn.state === "CANCELLED") return turnFromRow(turn);
+      if (turn.state !== "QUEUED") this.fail("TURN_STATE", "Only a slot-owning queued turn may be cancelled before send");
+      this.requireSlotHolder(turnRef);
+      const result = this.db.query(`UPDATE turns SET state = 'CANCELLED', slot_held = 0, completion_claim_revision = NULL,
+        budget_reserved_tokens = CASE WHEN budget_reserved_tokens IS NULL THEN NULL ELSE 0 END,
+        revision = revision + 1, updated_at = ? WHERE turn_ref = ? AND slot_held = 1`)
+        .run(this.now(), turnRef);
+      if (result.changes !== 1) this.fail("ACCOUNT_SLOT", "Pre-send cancellation lost its account slot");
+      return this.getTurnRequired(turnRef);
+    });
+  }
+
+  /** Cancel only while the durable send fence is still QUEUED; exact replay may create a fresh attempt. */
+  cancelRetryableBeforeSend(turnRef: string): BrokerTurn {
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(turnRef);
+      if (turn.state === "CANCELLED" && turn.pre_send_retryable_cancelled === 1) return turnFromRow(turn);
+      if (turn.state !== "QUEUED") {
+        this.fail("TURN_STATE", "Retryable cancellation is valid only before durable send activation");
+      }
+      const result = this.db.query(`UPDATE turns SET state = 'CANCELLED', slot_held = 0,
+        pre_send_retryable_cancelled = 1, completion_claim_revision = NULL,
+        budget_reserved_tokens = CASE WHEN budget_reserved_tokens IS NULL THEN NULL ELSE 0 END,
+        revision = revision + 1, updated_at = ? WHERE turn_ref = ? AND state = 'QUEUED'`)
+        .run(this.now(), turnRef);
+      if (result.changes !== 1) this.fail("TURN_STATE", "Retryable pre-send cancellation lost the queued turn state");
+      return this.getTurnRequired(turnRef);
+    });
+  }
+
+  // Persist TURN_OUTSTANDING immediately before the irreversible Enter/click.
+  markSendActivated(turnRef: string): BrokerTurn {
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(turnRef);
+      if (turn.state === "TURN_OUTSTANDING") return turnFromRow(turn);
+      if (turn.state !== "QUEUED") this.fail("TURN_STATE", "Only a slot-owning queued turn may arm submission");
+      this.requireSlotHolder(turnRef);
+      this.db.query("UPDATE turns SET state = 'TURN_OUTSTANDING', completion_claim_revision = NULL, revision = revision + 1, updated_at = ? WHERE turn_ref = ?")
+        .run(this.now(), turnRef);
+      return this.getTurnRequired(turnRef);
+    });
+  }
+
+  markAccepted(turnRef: string, acceptedUserTurnId: string | null = null): BrokerTurn {
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(turnRef);
+      if (turn.abandoned_at !== null) {
+        if (acceptedUserTurnId && acceptedUserTurnId !== turn.accepted_user_turn_id) {
+          this.fail("USER_TURN_CONFLICT", "Accepted user turn is already bound to another identity");
+        }
+        return turnFromRow(turn);
+      }
+      if (turn.state === "UNRECONCILED") {
+        if (!acceptedUserTurnId) return turnFromRow(turn);
+        this.bindAcceptedUserTurnId(turn, acceptedUserTurnId);
+        return this.getTurnRequired(turnRef);
+      }
+      if (turn.state !== "TURN_OUTSTANDING") this.fail("TURN_STATE", "Submission must be durably armed before semantic acceptance");
+      if (acceptedUserTurnId) this.bindAcceptedUserTurnId(turn, acceptedUserTurnId);
+      return this.getTurnRequired(turnRef);
+    });
+  }
+
+  markUnreconciled(turnRef: string, reason: string): BrokerTurn {
+    if (!reason) this.fail("INVALID_REASON", "Unreconciled state requires a reason");
+    return this.transaction(() => this.markUnreconciledInside(turnRef, reason));
+  }
+
+  resumeVerifiedRemoteTurn(input: {
+    turnRef: string;
+    canonicalConversationId: string;
+    acceptedUserTurnId: string;
+    remoteRunning: true;
+  }): BrokerTurn {
+    if (input.remoteRunning !== true) this.fail("RECOVERY_EVIDENCE", "Recovery requires positive remote-running evidence");
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(input.turnRef);
+      if (turn.abandoned_at !== null || (turn.state !== "UNRECONCILED" && turn.state !== "TURN_OUTSTANDING")) {
+        this.fail("TURN_STATE", "Only an unreconciled or already-running remote turn may pass verified rebind");
+      }
+      this.requireSlotHolder(input.turnRef);
+      const epoch = this.epochRowRequired(turn.goose_session_id, turn.epoch);
+      if (epoch.conversation_id !== input.canonicalConversationId
+        || turn.accepted_user_turn_id !== input.acceptedUserTurnId) {
+        this.fail("RECOVERY_IDENTITY", "Recovery identity does not match the durable conversation/turn binding");
+      }
+      if (turn.final_digest) this.fail("RECOVERY_FINAL", "A turn with accepted final content cannot resume as running");
+      if (this.hasAmbiguousOperation(input.turnRef)) {
+        this.fail("UNRESOLVED_OPERATION", "A turn with claimed or uncertain operations cannot resume ordinary execution");
+      }
+      if (turn.state === "TURN_OUTSTANDING") return turnFromRow(turn);
+      this.db.query(`UPDATE turns SET state = 'TURN_OUTSTANDING', unreconciled_reason = NULL,
+        completion_claim_revision = NULL, revision = revision + 1, updated_at = ? WHERE turn_ref = ?`)
+        .run(this.now(), input.turnRef);
+      return this.getTurnRequired(input.turnRef);
+    });
+  }
+
+  releaseSlotAfterPositiveTerminal(turnRef: string, evidence: PositiveTerminalEvidence): BrokerTurn {
+    if (!positiveTerminalSatisfied(evidence)) {
+      this.fail("POSITIVE_TERMINAL_REQUIRED", "Account-slot release requires the full positive terminal predicate");
+    }
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(turnRef);
+      if (turn.state !== "UNRECONCILED") this.fail("TURN_STATE", "Only an unreconciled turn can be quarantined with its slot released");
+      const epoch = this.epochRowRequired(turn.goose_session_id, turn.epoch);
+      if (epoch.conversation_id !== evidence.canonicalConversationId
+        || turn.accepted_user_turn_id !== evidence.acceptedUserTurnId) {
+        this.fail("POSITIVE_TERMINAL_REQUIRED", "Positive-terminal identity evidence does not match the durable conversation/turn binding");
+      }
+      if (turn.final_digest) this.fail("POSITIVE_TERMINAL_REQUIRED", "Accepted final content must use normal completion reconciliation");
+      if (turn.completion_claim_revision !== null) this.fail("COMPLETION_IN_FLIGHT", "Cannot release account slot while a completion claim exists");
+      if (this.hasUnresolvedOperation(turnRef)) this.fail("UNRESOLVED_OPERATION", "Cannot release account slot with claimed or uncertain operations");
+      if (this.accountSlotHolder() !== turnRef) {
+        const recorded = this.recordedSlotDemotionEvidence(turnRef);
+        if (recorded !== null) {
+          if (recorded !== JSON.stringify(evidence)) {
+            this.fail("POSITIVE_TERMINAL_CONFLICT", "Slot demotion is already recorded with different evidence");
+          }
+          return turnFromRow(turn);
+        }
+        this.fail("ACCOUNT_SLOT", "Unreconciled turn lost its account slot without durable demotion evidence");
+      }
+      const result = this.db.query(`UPDATE turns SET positive_terminal_evidence_json = ?, slot_held = 0,
+        revision = revision + 1, updated_at = ? WHERE turn_ref = ? AND slot_held = 1`)
+        .run(JSON.stringify(evidence), this.now(), turnRef);
+      if (result.changes !== 1) this.fail("ACCOUNT_SLOT", "Positive-terminal demotion lost its account slot");
+      return this.getTurnRequired(turnRef);
+    });
+  }
+
+  abandonUnreconciled(turnRef: string): BrokerTurn {
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(turnRef);
+      if (turn.abandoned_at !== null) return turnFromRow(turn);
+      if (turn.state !== "UNRECONCILED") {
+        this.fail("TURN_STATE", "Only an unreconciled conversation may be explicitly abandoned");
+      }
+      if (turn.slot_held !== 0) {
+        this.fail("ACCOUNT_SLOT", "Explicit abandonment requires prior positive-terminal account-slot release");
+      }
+      if (this.recordedSlotDemotionEvidence(turnRef) === null) {
+        this.fail("POSITIVE_TERMINAL_REQUIRED", "Explicit abandonment requires durable positive-terminal demotion evidence");
+      }
+      if (turn.final_digest) {
+        this.fail("FINAL_DIGEST_PRESENT", "A turn with accepted final content must use normal completion reconciliation");
+      }
+      if (turn.completion_claim_revision !== null) {
+        this.fail("COMPLETION_IN_FLIGHT", "Cannot abandon a conversation while a completion claim exists");
+      }
+      if (this.hasUnresolvedOperation(turnRef)) {
+        this.fail("UNRESOLVED_OPERATION", "Cannot abandon a conversation with claimed or uncertain operations");
+      }
+      const at = this.now();
+      const result = this.db.query(`UPDATE turns SET abandoned_at = ?, completion_claim_revision = NULL,
+        revision = revision + 1, updated_at = ?
+        WHERE turn_ref = ? AND state = 'UNRECONCILED' AND slot_held = 0 AND abandoned_at IS NULL`)
+        .run(at, at, turnRef);
+      if (result.changes !== 1) this.fail("TURN_STATE", "Explicit abandonment lost the quarantined turn state");
+      // Abandonment is the durable decision that this remote conversation will never be resumed.
+      // Retire the epoch in the same transaction so the next logical Goose turn must seed a fresh
+      // conversation rather than attempting to append to a launcher lease we intentionally ended.
+      const retired = this.db.query(`UPDATE remote_epochs SET is_current = 0, updated_at = ?
+        WHERE goose_session_id = ? AND epoch = ? AND is_current = 1`)
+        .run(at, turn.goose_session_id, turn.epoch);
+      if (retired.changes !== 1) this.fail("STALE_EPOCH", "Abandoned turn no longer owns the current remote epoch");
+      return this.getTurnRequired(turnRef);
+    });
+  }
+
+  recordProgress(turnRef: string, checkpointJson?: string): BrokerTurn {
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(turnRef);
+      if (turn.abandoned_at !== null || (turn.state !== "TURN_OUTSTANDING" && turn.state !== "UNRECONCILED")) {
+        this.fail("TURN_STATE", "Progress evidence requires a remotely outstanding or unreconciled turn");
+      }
+      if (checkpointJson === undefined) this.bumpTurnRevision(turnRef);
+      else this.db.query(`UPDATE turns SET checkpoint_json = ?, completion_claim_revision = NULL,
+        revision = revision + 1, updated_at = ? WHERE turn_ref = ?`).run(checkpointJson, this.now(), turnRef);
+      return this.getTurnRequired(turnRef);
+    });
+  }
+
+  recordFinalDigest(turnRef: string, finalDigest: string): BrokerTurn {
+    if (!finalDigest) this.fail("INVALID_FINAL_DIGEST", "Final digest must not be empty");
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(turnRef);
+      if (turn.abandoned_at !== null || (turn.state !== "TURN_OUTSTANDING" && turn.state !== "UNRECONCILED")) {
+        this.fail("TURN_STATE", "Final digest requires an outstanding or unreconciled remote turn");
+      }
+      if (turn.final_digest && turn.final_digest !== finalDigest) {
+        this.fail("FINAL_DIGEST_CONFLICT", "A different final digest is already durably acknowledged");
+      }
+      if (!turn.final_digest) {
+        this.db.query("UPDATE turns SET final_digest = ?, completion_claim_revision = NULL, revision = revision + 1, updated_at = ? WHERE turn_ref = ?")
+          .run(finalDigest, this.now(), turnRef);
+      }
+      return this.getTurnRequired(turnRef);
+    });
+  }
+
+  recordAnswerBoundary(turnRef: string, opRef: string, boundaryJson: string): BrokerOperation {
+    if (!boundaryJson) this.fail("INVALID_BOUNDARY", "Answer boundary must not be empty");
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(turnRef);
+      if (turn.state !== "TURN_OUTSTANDING") this.fail("TURN_STATE", "Answer boundary requires an outstanding remote turn");
+      const epoch = this.epochRowRequired(turn.goose_session_id, turn.epoch);
+      if (!epoch.conversation_id || !turn.accepted_user_turn_id) {
+        this.fail("BOUNDARY_IDENTITY_REQUIRED", "Answer boundary requires canonical conversation and accepted user-turn identity");
+      }
+      const op = this.operationRowRequired(opRef);
+      if (op.turn_ref !== turnRef) this.fail("WRONG_TURN", "Operation belongs to another turn");
+      if (op.state !== "MINTED") this.fail("OP_STATE", "Answer boundary can be attached only before operation claim");
+      if (op.answer_boundary_json && op.answer_boundary_json !== boundaryJson) {
+        this.fail("BOUNDARY_CONFLICT", "Operation already has a different answer boundary");
+      }
+      if (!op.answer_boundary_json) {
+        this.db.query("UPDATE operations SET answer_boundary_json = ?, updated_at = ? WHERE op_ref = ?")
+          .run(boundaryJson, this.now(), opRef);
+        this.bumpTurnRevision(turnRef);
+      }
+      return this.getOperationRequired(opRef);
+    });
+  }
+
+  claimOperation(input: { turnRef: string; opRef: string; inputHash: string }): OperationClaimDecision {
+    if (!input.inputHash) this.fail("INVALID_INPUT_HASH", "inputHash must not be empty");
+    return this.transaction(() => {
+      const op = this.operationRow(input.opRef);
+      if (!op) {
+        const turn = this.turnRow(input.turnRef);
+        if (turn?.abandoned_at !== null && turn?.abandoned_at !== undefined) {
+          return { kind: "PROTOCOL_VIOLATION", opRef: input.opRef, seq: null };
+        }
+        if (turn?.final_digest) {
+          if (turn.state === "TURN_OUTSTANDING") this.markUnreconciledInside(input.turnRef, "unknown_operation_after_final");
+          return { kind: "PROTOCOL_VIOLATION", opRef: input.opRef, seq: null };
+        }
+        return { kind: "UNKNOWN", opRef: input.opRef, seq: null };
+      }
+      if (op.turn_ref !== input.turnRef) return { kind: "WRONG_TURN", opRef: op.op_ref, seq: op.seq };
+      const turn = this.turnRowRequired(input.turnRef);
+      if (turn.final_digest && op.input_hash && op.input_hash !== input.inputHash) {
+        if (turn.state === "TURN_OUTSTANDING") this.markUnreconciledInside(input.turnRef, "conflicting_operation_after_final");
+        return { kind: "PROTOCOL_VIOLATION", opRef: op.op_ref, seq: op.seq };
+      }
+      if (op.input_hash && op.input_hash !== input.inputHash) return { kind: "CONFLICT", opRef: op.op_ref, seq: op.seq };
+
+      if (op.state === "SUCCESS" || op.state === "FAILURE") {
+        if (op.terminal_at === null || this.now() - op.terminal_at > this.terminalReplayWindowMs) {
+          return { kind: "STALE", opRef: op.op_ref, seq: op.seq };
+        }
+        const nextOpRef = this.nextOpRef(op.turn_ref, op.seq);
+        if (op.result_json === null || !nextOpRef) this.fail("JOURNAL_CORRUPT", "Terminal operation is missing replay state");
+        return { kind: "REPLAY", opRef: op.op_ref, seq: op.seq, outcome: op.state, resultJson: op.result_json, nextOpRef };
+      }
+      if (turn.abandoned_at !== null) return { kind: "STALE", opRef: op.op_ref, seq: op.seq };
+      if (op.state === "UNCERTAIN") return { kind: "UNCERTAIN", opRef: op.op_ref, seq: op.seq };
+      if (op.state === "CLAIMED") {
+        return op.owner_id === this.instanceId
+          ? { kind: "ATTACH", opRef: op.op_ref, seq: op.seq }
+          : { kind: "UNCERTAIN", opRef: op.op_ref, seq: op.seq };
+      }
+
+      if (turn.state === "COMPLETE" || turn.state === "CANCELLED") {
+        return { kind: "STALE", opRef: op.op_ref, seq: op.seq };
+      }
+      if (turn.final_digest) {
+        if (turn.state === "TURN_OUTSTANDING") this.markUnreconciledInside(input.turnRef, "fresh_operation_after_final");
+        return { kind: "PROTOCOL_VIOLATION", opRef: op.op_ref, seq: op.seq };
+      }
+      if (turn.state === "UNRECONCILED") return { kind: "UNCERTAIN", opRef: op.op_ref, seq: op.seq };
+      if (turn.state !== "TURN_OUTSTANDING") return { kind: "OUT_OF_ORDER", opRef: op.op_ref, seq: op.seq };
+      if (!op.answer_boundary_json) return { kind: "BOUNDARY_REQUIRED", opRef: op.op_ref, seq: op.seq };
+      const newest = this.db.query("SELECT MAX(seq) AS value FROM operations WHERE turn_ref = ?")
+        .get(input.turnRef) as { value: number | null } | null;
+      if (newest?.value !== op.seq) return { kind: "OUT_OF_ORDER", opRef: op.op_ref, seq: op.seq };
+
+      let budgetReservedTokens = 0;
+      const budget = this.turnBudgetPolicy(turn);
+      if (budget) {
+        if (turn.budget_growth_consumed_tokens === null) this.fail("JOURNAL_CORRUPT", "Budgeted turn is missing growth consumption");
+        const required = turn.budget_growth_consumed_tokens
+          + budget.toolOperationReserveTokens
+          + budget.finalResponseReserveTokens
+          + budget.budgetFailureReserveTokens;
+        if (required > budget.turnGrowthReserveTokens) {
+          return { kind: "BUDGET_REQUIRED", opRef: op.op_ref, seq: op.seq };
+        }
+        budgetReservedTokens = budget.toolOperationReserveTokens;
+      }
+
+      this.db.query(`UPDATE operations SET state = 'CLAIMED', input_hash = ?, owner_id = ?,
+        budget_reserved_tokens = ?, updated_at = ? WHERE op_ref = ?`)
+        .run(input.inputHash, this.instanceId, budgetReservedTokens, this.now(), input.opRef);
+      this.bumpTurnRevision(input.turnRef);
+      return { kind: "EXECUTE", opRef: op.op_ref, seq: op.seq };
+    });
+  }
+
+  classifyMissingOperationRef(turnRef: string, inputHash: string): MissingOperationDecision {
+    if (!inputHash) this.fail("INVALID_INPUT_HASH", "inputHash must not be empty");
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(turnRef);
+      if (turn.abandoned_at !== null) return { kind: "PROTOCOL_VIOLATION" };
+      if (turn.final_digest) {
+        if (turn.state === "TURN_OUTSTANDING") this.markUnreconciledInside(turnRef, "ticketless_operation_after_final");
+        return { kind: "PROTOCOL_VIOLATION" };
+      }
+      const cutoff = this.now() - this.terminalReplayWindowMs;
+      const rows = this.db.query(`SELECT op_ref FROM operations WHERE turn_ref = ? AND input_hash = ? AND (
+        state IN ('CLAIMED', 'UNCERTAIN') OR (state IN ('SUCCESS', 'FAILURE') AND terminal_at >= ?)
+      ) ORDER BY seq ASC`).all(turnRef, inputHash, cutoff) as Array<{ op_ref: string }>;
+      return rows.length
+        ? { kind: "UNCERTAIN", matchingOpRefs: rows.map(row => row.op_ref) }
+        : { kind: "INVALID" };
+    });
+  }
+
+  rejectOperationForBudget(input: {
+    turnRef: string;
+    opRef: string;
+    inputHash: string;
+    resultJson: string;
+  }): { operation: BrokerOperation; nextOpRef: string } {
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(input.turnRef);
+      const budget = this.turnBudgetPolicy(turn);
+      if (!budget || turn.budget_growth_consumed_tokens === null) {
+        this.fail("BUDGET_REQUIRED", "Budget rejection requires a budget-tracked turn");
+      }
+      const op = this.operationRowRequired(input.opRef);
+      if (op.turn_ref !== input.turnRef) this.fail("WRONG_TURN", "Operation belongs to another turn");
+      if (op.state === "FAILURE" && op.input_hash === input.inputHash && op.result_json === input.resultJson) {
+        const nextOpRef = this.nextOpRef(op.turn_ref, op.seq);
+        if (!nextOpRef) this.fail("JOURNAL_CORRUPT", "Budget rejection is missing its next operation ref");
+        return { operation: operationFromRow(op), nextOpRef };
+      }
+      if (op.state !== "MINTED" || !op.answer_boundary_json || op.input_hash !== null) {
+        this.fail("OP_STATE", "Only the current unclaimed boundary-bearing operation may be rejected for budget");
+      }
+      if (turn.state !== "TURN_OUTSTANDING") {
+        this.fail("TURN_STATE", "Budget rejection requires an outstanding remote turn");
+      }
+      const newest = this.db.query("SELECT MAX(seq) AS value FROM operations WHERE turn_ref = ?")
+        .get(input.turnRef) as { value: number | null } | null;
+      if (newest?.value !== op.seq) this.fail("OUT_OF_ORDER", "Budget rejection must target the newest operation ref");
+      const charge = budget.budgetFailureReserveTokens;
+      if (turn.budget_growth_consumed_tokens + charge + budget.finalResponseReserveTokens > budget.turnGrowthReserveTokens) {
+        this.fail("BUDGET_EXHAUSTED", "Turn growth reserve cannot even contain the deterministic budget rejection");
+      }
+      const at = this.now();
+      this.db.query(`UPDATE operations SET state = 'FAILURE', input_hash = ?, result_json = ?,
+        owner_id = NULL, budget_reserved_tokens = 0, budget_charge_tokens = ?, terminal_at = ?, updated_at = ?
+        WHERE op_ref = ?`)
+        .run(input.inputHash, input.resultJson, charge, at, at, input.opRef);
+      this.db.query(`UPDATE turns SET budget_growth_consumed_tokens = budget_growth_consumed_tokens + ?,
+        completion_claim_revision = NULL, revision = revision + 1, updated_at = ? WHERE turn_ref = ?`)
+        .run(charge, at, input.turnRef);
+      let nextOpRef = this.nextOpRef(input.turnRef, op.seq);
+      if (!nextOpRef) nextOpRef = this.mintOperation(input.turnRef, op.seq + 1);
+      this.markUnreconciledInside(input.turnRef, "conversation_budget_tool_growth_exhausted");
+      return { operation: this.getOperationRequired(input.opRef), nextOpRef };
+    });
+  }
+
+  completeOperation(input: {
+    opRef: string;
+    inputHash: string;
+    outcome: TerminalOperationState;
+    resultJson: string;
+    budgetChargeTokens?: number;
+  }): { operation: BrokerOperation; nextOpRef: string } {
+    return this.transaction(() => this.finishOperationInside(input, false));
+  }
+
+  completeOperationWithProgress(input: {
+    turnRef: string;
+    opRef: string;
+    inputHash: string;
+    outcome: TerminalOperationState;
+    resultJson: string;
+    checkpointJson: string;
+    budgetChargeTokens?: number;
+  }): { operation: BrokerOperation; nextOpRef: string } {
+    if (!input.checkpointJson) this.fail("INVALID_CHECKPOINT", "Progress checkpoint must not be empty");
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(input.turnRef);
+      const op = this.operationRowRequired(input.opRef);
+      if (op.turn_ref !== input.turnRef) this.fail("WRONG_TURN", "Operation does not belong to the supplied turn");
+      if (op.input_hash !== input.inputHash) this.fail("OP_REF_CONFLICT", "Operation input hash does not match its durable claim");
+      if (op.state !== "CLAIMED" || op.owner_id !== this.instanceId) {
+        this.fail("OP_STATE", "Only the live broker-owned claim can atomically commit tool progress");
+      }
+      if (turn.abandoned_at !== null || (turn.state !== "TURN_OUTSTANDING" && turn.state !== "UNRECONCILED")) {
+        this.fail("TURN_STATE", "Tool progress requires a remotely outstanding or unreconciled turn");
+      }
+      this.db.query(`UPDATE turns SET checkpoint_json = ?, completion_claim_revision = NULL,
+        revision = revision + 1, updated_at = ? WHERE turn_ref = ?`)
+        .run(input.checkpointJson, this.now(), input.turnRef);
+      return this.finishOperationInside({
+        opRef: input.opRef,
+        inputHash: input.inputHash,
+        outcome: input.outcome,
+        resultJson: input.resultJson,
+        budgetChargeTokens: input.budgetChargeTokens,
+      }, false);
+    });
+  }
+
+  reconcileLateTerminal(input: {
+    opRef: string;
+    inputHash: string;
+    outcome: TerminalOperationState;
+    resultJson: string;
+    budgetChargeTokens?: number;
+  }): { operation: BrokerOperation; nextOpRef: string } {
+    return this.transaction(() => this.finishOperationInside(input, true));
+  }
+
+  reconcileKnownOperationTerminal(input: {
+    turnRef: string;
+    opRef: string;
+    inputHash: string;
+    outcome: TerminalOperationState;
+    resultJson: string;
+    budgetChargeTokens?: number;
+  }): { operation: BrokerOperation; nextOpRef: string } {
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(input.turnRef);
+      if (turn.abandoned_at !== null || turn.state !== "UNRECONCILED") {
+        this.fail("TURN_STATE", "Known operation reconciliation requires an unreconciled turn");
+      }
+      if (turn.final_digest) {
+        this.fail("RECOVERY_FINAL", "A turn with accepted final content must use normal completion reconciliation");
+      }
+      const op = this.operationRowRequired(input.opRef);
+      if (op.turn_ref !== input.turnRef) this.fail("WRONG_TURN", "Operation belongs to another turn");
+      if (!op.answer_boundary_json) this.fail("BOUNDARY_REQUIRED", "Known operation reconciliation requires the durable pre-tool answer boundary");
+      if (op.input_hash !== input.inputHash) this.fail("OP_REF_CONFLICT", "Operation input hash does not match its durable claim");
+      if (op.state === "MINTED" || op.state === "CLAIMED") {
+        this.fail("OP_STATE", "Known operation reconciliation requires a post-owner UNCERTAIN operation");
+      }
+      return this.finishOperationInside({
+        opRef: input.opRef,
+        inputHash: input.inputHash,
+        outcome: input.outcome,
+        resultJson: input.resultJson,
+        budgetChargeTokens: input.budgetChargeTokens,
+      }, true);
+    });
+  }
+
+  beginCompletion(turnRef: string): CompletionClaim {
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(turnRef);
+      if (turn.abandoned_at !== null || (turn.state !== "TURN_OUTSTANDING" && turn.state !== "UNRECONCILED")) {
+        this.fail("TURN_STATE", "Completion requires an outstanding or unreconciled remote turn");
+      }
+      this.requireSlotHolder(turnRef);
+      const epoch = this.epochRowRequired(turn.goose_session_id, turn.epoch);
+      if (!epoch.conversation_id || !turn.accepted_user_turn_id) {
+        this.fail("COMPLETION_IDENTITY_REQUIRED", "Completion requires canonical conversation and absolute user-turn identity");
+      }
+      if (!turn.final_digest) this.fail("FINAL_DIGEST_REQUIRED", "Completion requires a durably acknowledged final digest");
+      if (this.hasUnresolvedOperation(turnRef)) this.fail("UNRESOLVED_OPERATION", "Completion cannot begin with claimed or uncertain operations");
+      if (turn.completion_claim_revision !== null) {
+        if (turn.completion_claim_revision !== turn.revision) this.fail("COMPLETION_STALE", "Existing completion claim is stale");
+        return { turnRef, revision: turn.revision };
+      }
+      this.db.query("UPDATE turns SET completion_claim_revision = ?, updated_at = ? WHERE turn_ref = ?")
+        .run(turn.revision, this.now(), turnRef);
+      return { turnRef, revision: turn.revision };
+    });
+  }
+
+  commitCompletion(claim: CompletionClaim, evidence: CompletionEvidence): BrokerTurn {
+    if (!evidence.noUnresolvedGooseWork || !evidence.remoteNonRunning
+      || !evidence.observedFinalDigest || !evidence.canonicalHistoryWatermark) {
+      this.fail("COMPLETION_EVIDENCE", "Completion evidence is not conjunctively satisfied");
+    }
+    if (evidence.connectorFinal !== "ACKNOWLEDGED" && evidence.connectorFinal !== "UNAVAILABLE") {
+      this.fail("COMPLETION_EVIDENCE", "Connector-final state is invalid");
+    }
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(claim.turnRef);
+      if (turn.abandoned_at !== null || (turn.state !== "TURN_OUTSTANDING" && turn.state !== "UNRECONCILED")) {
+        this.fail("TURN_STATE", "Only an outstanding or unreconciled turn can complete");
+      }
+      if (turn.revision !== claim.revision || turn.completion_claim_revision !== claim.revision) {
+        this.fail("COMPLETION_STALE", "Completion CAS revision changed after begin");
+      }
+      if (this.hasUnresolvedOperation(claim.turnRef)) this.fail("UNRESOLVED_OPERATION", "Completion cannot commit with claimed or uncertain operations");
+      this.requireSlotHolder(claim.turnRef);
+      const epoch = this.epochRowRequired(turn.goose_session_id, turn.epoch);
+      if (epoch.conversation_id !== evidence.canonicalConversationId
+        || turn.accepted_user_turn_id !== evidence.acceptedUserTurnId) {
+        this.fail("COMPLETION_EVIDENCE", "Completion identity evidence does not match the durable conversation/turn binding");
+      }
+      if (!turn.final_digest) this.fail("FINAL_DIGEST_REQUIRED", "Completion lost its durable final digest");
+      if (turn.final_digest !== evidence.observedFinalDigest) {
+        this.fail("COMPLETION_EVIDENCE", "Observed final digest does not match the durably acknowledged final");
+      }
+      this.assertAnswerBoundarySatisfied(claim.turnRef, evidence);
+
+      const budget = this.turnBudgetPolicy(turn);
+      let budgetConsumedTokens = epoch.budget_consumed_tokens;
+      let retireEpoch = false;
+      if (budget) {
+        if (epoch.budget_consumed_tokens === null || turn.budget_reserved_tokens === null
+          || turn.budget_prompt_tokens === null || turn.budget_growth_consumed_tokens === null) {
+          this.fail("JOURNAL_CORRUPT", "Budgeted completion lost durable reservation state");
+        }
+        if (!Number.isSafeInteger(evidence.budgetFinalTokens) || evidence.budgetFinalTokens! < 0) {
+          this.fail("COMPLETION_EVIDENCE", "Budgeted completion requires a non-negative final token estimate");
+        }
+        const finalTokens = evidence.budgetFinalTokens!;
+        const actualTurnTokens = turn.budget_prompt_tokens + turn.budget_growth_consumed_tokens + finalTokens;
+        if (!Number.isSafeInteger(actualTurnTokens)) this.fail("BUDGET_ESTIMATOR_OVERRUN", "Turn token accounting overflowed");
+        budgetConsumedTokens = epoch.budget_consumed_tokens + actualTurnTokens;
+        retireEpoch = finalTokens > budget.finalResponseReserveTokens
+          || actualTurnTokens > turn.budget_reserved_tokens
+          || budgetConsumedTokens + budget.recoveryReserveTokens > budget.softLimitTokens;
+      }
+
+      const at = this.now();
+      const result = this.db.query(`UPDATE turns SET state = 'COMPLETE', slot_held = 0, completion_claim_revision = NULL,
+        budget_reserved_tokens = CASE WHEN budget_reserved_tokens IS NULL THEN NULL ELSE 0 END,
+        revision = revision + 1, updated_at = ? WHERE turn_ref = ? AND slot_held = 1`)
+        .run(at, claim.turnRef);
+      if (result.changes !== 1) this.fail("ACCOUNT_SLOT", "Completion lost its account slot");
+      this.db.query(`UPDATE remote_epochs SET history_watermark = ?, budget_consumed_tokens = ?,
+        is_current = CASE WHEN ? THEN 0 ELSE is_current END, updated_at = ?
+        WHERE goose_session_id = ? AND epoch = ?`)
+        .run(
+          evidence.canonicalHistoryWatermark,
+          budgetConsumedTokens,
+          retireEpoch ? 1 : 0,
+          at,
+          turn.goose_session_id,
+          turn.epoch,
+        );
+      return this.getTurnRequired(claim.turnRef);
+    });
+  }
+
+  getTurn(turnRef: string): BrokerTurn | null {
+    const row = this.turnRow(turnRef);
+    return row ? turnFromRow(row) : null;
+  }
+
+  findInitialRequestReplay(gooseSessionId: string, requestHash: string): BrokerTurn | null {
+    if (!gooseSessionId || !requestHash) this.fail("INVALID_TURN", "gooseSessionId and requestHash are required");
+    const latest = this.db.query("SELECT * FROM turns WHERE goose_session_id = ? ORDER BY queue_seq DESC LIMIT 1")
+      .get(gooseSessionId) as TurnRow | null;
+    if (!latest || latest.request_hash !== requestHash
+      || (latest.state === "CANCELLED" && latest.pre_send_retryable_cancelled === 1)) return null;
+    return turnFromRow(latest);
+  }
+
+  getOpenTurnForSession(gooseSessionId: string): BrokerTurn | null {
+    if (!gooseSessionId) this.fail("INVALID_SESSION", "gooseSessionId must not be empty");
+    const row = this.db.query(`SELECT * FROM turns WHERE goose_session_id = ?
+      AND abandoned_at IS NULL AND state IN ('QUEUED', 'TURN_OUTSTANDING', 'UNRECONCILED')
+      ORDER BY queue_seq DESC LIMIT 1`).get(gooseSessionId) as TurnRow | null;
+    return row ? turnFromRow(row) : null;
+  }
+
+  getOperation(opRef: string): BrokerOperation | null {
+    const row = this.operationRow(opRef);
+    return row ? operationFromRow(row) : null;
+  }
+
+  getAccountSlotHolder(): string | null {
+    return this.accountSlotHolder();
+  }
+
+  private claimBrokerOwnership(): void {
+    this.transaction(() => {
+      const row = this.db.query("SELECT owner_id, pid FROM broker_owner WHERE singleton = 1").get() as { owner_id: string | null; pid: number | null };
+      if (row.owner_id && row.pid !== null && this.processIsAlive(row.pid)) {
+        this.fail("BROKER_BUSY", "Another live Session Broker owns this database");
+      }
+      this.db.query("UPDATE broker_owner SET owner_id = ?, pid = ?, updated_at = ? WHERE singleton = 1")
+        .run(this.instanceId, process.pid, this.now());
+    });
+  }
+
+  private migrateSchema(): void {
+    this.transaction(() => {
+      const epochColumns = this.db.query("PRAGMA table_info(remote_epochs)").all() as Array<{ name: string }>;
+      if (!epochColumns.some(column => column.name === "budget_policy_json")) {
+        this.db.exec("ALTER TABLE remote_epochs ADD COLUMN budget_policy_json TEXT");
+      }
+      if (!epochColumns.some(column => column.name === "budget_consumed_tokens")) {
+        // Existing bound conversations deliberately remain NULL: their historic remote growth is
+        // not reconstructible without guessing, so a budget-enabled runtime will roll them first.
+        this.db.exec(`ALTER TABLE remote_epochs ADD COLUMN budget_consumed_tokens INTEGER
+          CHECK (budget_consumed_tokens IS NULL OR budget_consumed_tokens >= 0)`);
+      }
+
+      const turnColumns = this.db.query("PRAGMA table_info(turns)").all() as Array<{ name: string }>;
+      if (!turnColumns.some(column => column.name === "abandoned_at")) {
+        this.db.exec(`ALTER TABLE turns ADD COLUMN abandoned_at INTEGER CHECK (
+          abandoned_at IS NULL OR (
+            state = 'UNRECONCILED' AND slot_held = 0 AND positive_terminal_evidence_json IS NOT NULL
+            AND final_digest IS NULL AND completion_claim_revision IS NULL
+          )
+        )`);
+      }
+      if (!turnColumns.some(column => column.name === "pre_send_retryable_cancelled")) {
+        this.db.exec(`ALTER TABLE turns ADD COLUMN pre_send_retryable_cancelled INTEGER NOT NULL DEFAULT 0
+          CHECK (pre_send_retryable_cancelled IN (0, 1))`);
+      }
+      if (!turnColumns.some(column => column.name === "budget_reserved_tokens")) {
+        this.db.exec(`ALTER TABLE turns ADD COLUMN budget_reserved_tokens INTEGER
+          CHECK (budget_reserved_tokens IS NULL OR budget_reserved_tokens >= 0)`);
+      }
+      if (!turnColumns.some(column => column.name === "budget_prompt_tokens")) {
+        this.db.exec(`ALTER TABLE turns ADD COLUMN budget_prompt_tokens INTEGER
+          CHECK (budget_prompt_tokens IS NULL OR budget_prompt_tokens >= 0)`);
+      }
+      if (!turnColumns.some(column => column.name === "budget_growth_consumed_tokens")) {
+        this.db.exec(`ALTER TABLE turns ADD COLUMN budget_growth_consumed_tokens INTEGER
+          CHECK (budget_growth_consumed_tokens IS NULL OR budget_growth_consumed_tokens >= 0)`);
+      }
+
+      const operationColumns = this.db.query("PRAGMA table_info(operations)").all() as Array<{ name: string }>;
+      if (!operationColumns.some(column => column.name === "budget_reserved_tokens")) {
+        this.db.exec(`ALTER TABLE operations ADD COLUMN budget_reserved_tokens INTEGER NOT NULL DEFAULT 0
+          CHECK (budget_reserved_tokens >= 0)`);
+      }
+      if (!operationColumns.some(column => column.name === "budget_charge_tokens")) {
+        this.db.exec(`ALTER TABLE operations ADD COLUMN budget_charge_tokens INTEGER
+          CHECK (budget_charge_tokens IS NULL OR budget_charge_tokens >= 0)`);
+      }
+
+      const openTurnIndex = this.db.query(`SELECT sql FROM sqlite_master
+        WHERE type = 'index' AND name = 'one_open_turn_per_epoch'`).get() as { sql: string | null } | null;
+      if (!openTurnIndex?.sql?.includes("abandoned_at IS NULL")) {
+        this.db.exec(`DROP INDEX IF EXISTS one_open_turn_per_epoch;
+          CREATE UNIQUE INDEX one_open_turn_per_epoch ON turns(goose_session_id, epoch)
+          WHERE abandoned_at IS NULL AND state IN ('QUEUED', 'TURN_OUTSTANDING', 'UNRECONCILED');`);
+      }
+      const invalid = this.db.query(`SELECT turn_ref FROM turns WHERE abandoned_at IS NOT NULL AND (
+        state <> 'UNRECONCILED' OR slot_held <> 0 OR positive_terminal_evidence_json IS NULL
+        OR final_digest IS NOT NULL OR completion_claim_revision IS NOT NULL
+      ) LIMIT 1`).get() as { turn_ref: string } | null;
+      if (invalid) this.fail("JOURNAL_CORRUPT", "Persisted abandoned turn violates quarantine invariants");
+      const foreignKeyErrors = this.db.query("PRAGMA foreign_key_check").all();
+      if (foreignKeyErrors.length > 0) this.fail("JOURNAL_CORRUPT", "Session Broker schema migration failed foreign-key validation");
+    });
+  }
+
+  private assertProjectBinding(): void {
+    const mismatch = this.db.query("SELECT project_id FROM remote_epochs WHERE project_id <> ? LIMIT 1")
+      .get(this.projectId) as { project_id: string } | null;
+    if (mismatch) {
+      this.fail("PROJECT_MISMATCH", "Persisted Session Broker state belongs to a different ChatGPT Project");
+    }
+  }
+
+  private processIsAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  }
+
+  private recoverAfterRestart(): void {
+    this.transaction(() => {
+      const at = this.now();
+      // Older rebuild checkpoints recorded abandonment on the turn but left that epoch current.
+      // Repair that additive state on open so an explicitly retired remote conversation can never
+      // become an append target after provider restart or upgrade.
+      this.db.query(`UPDATE remote_epochs SET is_current = 0, updated_at = ?
+        WHERE is_current = 1 AND EXISTS (
+          SELECT 1 FROM turns
+          WHERE turns.goose_session_id = remote_epochs.goose_session_id
+            AND turns.epoch = remote_epochs.epoch
+            AND turns.abandoned_at IS NOT NULL
+        )`).run(at);
+      // QUEUED is strictly before the durable send fence. After process restart its HTTP owner is
+      // gone, so retaining it would let an ownerless FIFO entry capture the global account slot.
+      // Make it retryable-cancelled: exact Goose replay can create a fresh pre-send attempt.
+      this.db.query(`UPDATE turns SET state = 'CANCELLED', slot_held = 0,
+        pre_send_retryable_cancelled = 1, completion_claim_revision = NULL,
+        budget_reserved_tokens = CASE WHEN budget_reserved_tokens IS NULL THEN NULL ELSE 0 END,
+        revision = revision + 1, updated_at = ? WHERE state = 'QUEUED'`)
+        .run(at);
+
+      const claimed = this.db.query("SELECT turn_ref FROM operations WHERE state = 'CLAIMED'")
+        .all() as Array<{ turn_ref: string }>;
+      this.db.query("UPDATE operations SET state = 'UNCERTAIN', owner_id = NULL, updated_at = ? WHERE state = 'CLAIMED'")
+        .run(at);
+
+      // A broker restart invalidates any completion claim because Requirement 10
+      // requires the terminal observation to be fresh after begin(). Durable final
+      // evidence remains, so reconciliation can begin a new claim after restart.
+      const interrupted = this.db.query(`SELECT turn_ref FROM turns
+        WHERE abandoned_at IS NULL AND (state = 'TURN_OUTSTANDING' OR completion_claim_revision IS NOT NULL)`)
+        .all() as Array<{ turn_ref: string }>;
+      const affected = new Set(interrupted.map(row => row.turn_ref));
+
+      for (const turnRef of affected) {
+        this.db.query(`UPDATE turns SET state = 'UNRECONCILED',
+          unreconciled_reason = COALESCE(unreconciled_reason, 'broker_restart_with_remote_turn'),
+          completion_claim_revision = NULL, revision = revision + 1, updated_at = ? WHERE turn_ref = ?`)
+          .run(at, turnRef);
+      }
+
+      for (const { turn_ref: turnRef } of claimed) {
+        if (affected.has(turnRef)) continue;
+        const turn = this.turnRowRequired(turnRef);
+        if (turn.state === "COMPLETE" || turn.state === "CANCELLED" || turn.abandoned_at !== null) {
+          this.fail("JOURNAL_CORRUPT", "Terminal turn contains a nonterminal operation claim");
+        }
+        this.db.query(`UPDATE turns SET state = 'UNRECONCILED', unreconciled_reason = COALESCE(unreconciled_reason, 'stale_claim_after_broker_restart'),
+          completion_claim_revision = NULL, revision = revision + 1, updated_at = ? WHERE turn_ref = ?`)
+          .run(at, turnRef);
+      }
+    });
+  }
+
+  private finishOperationInside(input: {
+    opRef: string;
+    inputHash: string;
+    outcome: TerminalOperationState;
+    resultJson: string;
+    budgetChargeTokens?: number;
+  }, allowUncertain: boolean): { operation: BrokerOperation; nextOpRef: string } {
+    const op = this.operationRowRequired(input.opRef);
+    if (op.input_hash !== input.inputHash) this.fail("OP_REF_CONFLICT", "Operation input hash does not match its durable claim");
+    if (op.state === "SUCCESS" || op.state === "FAILURE") {
+      if (op.state !== input.outcome || op.result_json !== input.resultJson) {
+        this.fail("TERMINAL_CONFLICT", "Operation already has a different terminal result");
+      }
+      const nextOpRef = this.nextOpRef(op.turn_ref, op.seq);
+      if (!nextOpRef) this.fail("JOURNAL_CORRUPT", "Terminal operation is missing its next minted ref");
+      return { operation: operationFromRow(op), nextOpRef };
+    }
+    const ownedClaim = op.state === "CLAIMED" && op.owner_id === this.instanceId;
+    const late = allowUncertain && op.state === "UNCERTAIN";
+    if (!ownedClaim && !late) this.fail("OP_STATE", "Operation cannot accept this terminal result");
+
+    const turn = this.turnRowRequired(op.turn_ref);
+    const budget = this.turnBudgetPolicy(turn);
+    let budgetChargeTokens: number | null = null;
+    if (budget) {
+      if (turn.budget_growth_consumed_tokens === null) this.fail("JOURNAL_CORRUPT", "Budgeted turn is missing growth consumption");
+      if (!Number.isSafeInteger(input.budgetChargeTokens) || input.budgetChargeTokens! < 0) {
+        this.fail("INVALID_BUDGET", "Budgeted operation terminal requires a non-negative token charge");
+      }
+      budgetChargeTokens = input.budgetChargeTokens!;
+      if (op.budget_reserved_tokens <= 0 || budgetChargeTokens > op.budget_reserved_tokens) {
+        this.fail("BUDGET_ESTIMATOR_OVERRUN", "Observed connector result exceeded its reserved remote-growth budget");
+      }
+      if (turn.budget_growth_consumed_tokens + budgetChargeTokens + budget.finalResponseReserveTokens
+          > budget.turnGrowthReserveTokens) {
+        this.fail("BUDGET_ESTIMATOR_OVERRUN", "Observed connector growth exceeded the turn growth reserve");
+      }
+    }
+
+    const at = this.now();
+    this.db.query(`UPDATE operations SET state = ?, result_json = ?, owner_id = NULL,
+      budget_reserved_tokens = 0, budget_charge_tokens = ?, terminal_at = ?, updated_at = ?
+      WHERE op_ref = ?`)
+      .run(input.outcome, input.resultJson, budgetChargeTokens, at, at, input.opRef);
+    if (budgetChargeTokens !== null) {
+      this.db.query(`UPDATE turns SET budget_growth_consumed_tokens = budget_growth_consumed_tokens + ?,
+        completion_claim_revision = NULL, revision = revision + 1, updated_at = ? WHERE turn_ref = ?`)
+        .run(budgetChargeTokens, at, op.turn_ref);
+    } else {
+      this.bumpTurnRevision(op.turn_ref);
+    }
+    let nextOpRef = this.nextOpRef(op.turn_ref, op.seq);
+    if (!nextOpRef) nextOpRef = this.mintOperation(op.turn_ref, op.seq + 1);
+    return { operation: this.getOperationRequired(input.opRef), nextOpRef };
+  }
+
+  private assertAnswerBoundarySatisfied(turnRef: string, evidence: CompletionEvidence): void {
+    const latest = this.db.query(`SELECT op_ref, answer_boundary_json FROM operations
+      WHERE turn_ref = ? AND state IN ('SUCCESS', 'FAILURE') ORDER BY seq DESC LIMIT 1`)
+      .get(turnRef) as { op_ref: string; answer_boundary_json: string | null } | null;
+    if (!latest) {
+      if (evidence.answerBoundary !== null) this.fail("COMPLETION_EVIDENCE", "No dispatched operation requires answer-boundary evidence");
+      return;
+    }
+    if (!latest.answer_boundary_json) this.fail("JOURNAL_CORRUPT", "Terminal operation is missing its durable answer boundary");
+    if (!evidence.answerBoundary || evidence.answerBoundary.opRef !== latest.op_ref) {
+      this.fail("COMPLETION_EVIDENCE", "Completion must reference the latest dispatched operation boundary");
+    }
+    if (!evidence.answerBoundary.contentAdvanced && !evidence.answerBoundary.qualifiedTerminal) {
+      this.fail("COMPLETION_EVIDENCE", "Completion must prove post-tool content or qualified terminal semantics");
+    }
+  }
+
+  private markUnreconciledInside(turnRef: string, reason: string): BrokerTurn {
+    const turn = this.turnRowRequired(turnRef);
+    if (turn.state === "UNRECONCILED") return turnFromRow(turn);
+    if (turn.state !== "TURN_OUTSTANDING") {
+      this.fail("TURN_STATE", "Only a remotely outstanding turn can become unreconciled");
+    }
+    this.requireSlotHolder(turnRef);
+    this.db.query(`UPDATE turns SET state = 'UNRECONCILED', unreconciled_reason = ?, completion_claim_revision = NULL,
+      revision = revision + 1, updated_at = ? WHERE turn_ref = ?`)
+      .run(reason, this.now(), turnRef);
+    return this.getTurnRequired(turnRef);
+  }
+
+  private bindAcceptedUserTurnId(turn: TurnRow, acceptedUserTurnId: string): void {
+    if (turn.accepted_user_turn_id && turn.accepted_user_turn_id !== acceptedUserTurnId) {
+      this.fail("USER_TURN_CONFLICT", "Accepted user turn is already bound to another identity");
+    }
+    if (!turn.accepted_user_turn_id) {
+      this.db.query("UPDATE turns SET accepted_user_turn_id = ?, completion_claim_revision = NULL, revision = revision + 1, updated_at = ? WHERE turn_ref = ?")
+        .run(acceptedUserTurnId, this.now(), turn.turn_ref);
+    }
+  }
+
+  private mintOperation(turnRef: string, seq: number): string {
+    const opRef = this.makeOpRef();
+    if (!opRef) this.fail("INVALID_OP_REF", "Operation reference factory returned an empty value");
+    this.insertOperation(opRef, turnRef, seq);
+    return opRef;
+  }
+
+  private insertOperation(opRef: string, turnRef: string, seq: number): void {
+    const at = this.now();
+    this.db.query(`INSERT INTO operations(
+      op_ref, turn_ref, seq, state, input_hash, result_json, owner_id,
+      answer_boundary_json, budget_reserved_tokens, budget_charge_tokens, created_at, updated_at, terminal_at
+    ) VALUES (?, ?, ?, 'MINTED', NULL, NULL, NULL, NULL, 0, NULL, ?, ?, NULL)`)
+      .run(opRef, turnRef, seq, at, at);
+  }
+
+  private operationRefAt(turnRef: string, seq: number): string | null {
+    const row = this.db.query("SELECT op_ref FROM operations WHERE turn_ref = ? AND seq = ?")
+      .get(turnRef, seq) as { op_ref: string } | null;
+    return row?.op_ref ?? null;
+  }
+
+  private nextOpRef(turnRef: string, seq: number): string | null {
+    return this.operationRefAt(turnRef, seq + 1);
+  }
+
+  private turnBudgetPolicy(turn: TurnRow): ConversationBudgetPolicy | null {
+    const tracked = turn.budget_reserved_tokens !== null
+      || turn.budget_prompt_tokens !== null
+      || turn.budget_growth_consumed_tokens !== null;
+    if (!tracked) return null;
+    if (turn.budget_reserved_tokens === null || turn.budget_prompt_tokens === null
+      || turn.budget_growth_consumed_tokens === null) {
+      this.fail("JOURNAL_CORRUPT", "Turn has incomplete conversation-budget accounting");
+    }
+    const epoch = this.epochRowRequired(turn.goose_session_id, turn.epoch);
+    if (!epoch.budget_policy_json || epoch.budget_consumed_tokens === null) {
+      this.fail("JOURNAL_CORRUPT", "Budgeted turn belongs to an epoch without durable budget policy/consumption");
+    }
+    try {
+      return parseConversationBudgetPolicyJson(epoch.budget_policy_json);
+    } catch {
+      this.fail("JOURNAL_CORRUPT", "Persisted conversation-budget policy is invalid");
+    }
+  }
+
+  private hasNonterminalTurn(gooseSessionId: string, epoch: number): boolean {
+    const row = this.db.query(`SELECT 1 AS value FROM turns WHERE goose_session_id = ? AND epoch = ?
+      AND abandoned_at IS NULL AND state IN ('QUEUED', 'TURN_OUTSTANDING', 'UNRECONCILED') LIMIT 1`)
+      .get(gooseSessionId, epoch) as { value: number } | null;
+    return Boolean(row);
+  }
+
+  private hasAmbiguousOperation(turnRef: string): boolean {
+    const row = this.db.query("SELECT 1 AS value FROM operations WHERE turn_ref = ? AND state IN ('CLAIMED', 'UNCERTAIN') LIMIT 1")
+      .get(turnRef) as { value: number } | null;
+    return Boolean(row);
+  }
+
+  private hasUnresolvedOperation(turnRef: string): boolean {
+    const row = this.db.query(`SELECT 1 AS value FROM operations WHERE turn_ref = ? AND (
+      state IN ('CLAIMED', 'UNCERTAIN') OR (state = 'MINTED' AND answer_boundary_json IS NOT NULL)
+    ) LIMIT 1`).get(turnRef) as { value: number } | null;
+    return Boolean(row);
+  }
+
+  private recordedSlotDemotionEvidence(turnRef: string): string | null {
+    const row = this.db.query("SELECT positive_terminal_evidence_json AS evidence FROM turns WHERE turn_ref = ?")
+      .get(turnRef) as { evidence: string | null } | null;
+    return row?.evidence ?? null;
+  }
+
+  private bumpTurnRevision(turnRef: string): void {
+    this.db.query("UPDATE turns SET completion_claim_revision = NULL, revision = revision + 1, updated_at = ? WHERE turn_ref = ?")
+      .run(this.now(), turnRef);
+  }
+
+  private requireSlotHolder(turnRef: string): void {
+    if (this.accountSlotHolder() !== turnRef) this.fail("ACCOUNT_SLOT", "Turn does not own the account execution slot");
+  }
+
+  private accountSlotHolder(): string | null {
+    const row = this.db.query("SELECT turn_ref FROM turns WHERE slot_held = 1").get() as { turn_ref: string } | null;
+    return row?.turn_ref ?? null;
+  }
+
+  private currentEpochRow(gooseSessionId: string): EpochRow | null {
+    return this.db.query("SELECT * FROM remote_epochs WHERE goose_session_id = ? AND is_current = 1")
+      .get(gooseSessionId) as EpochRow | null;
+  }
+
+  private epochRow(gooseSessionId: string, epoch: number): EpochRow | null {
+    return this.db.query("SELECT * FROM remote_epochs WHERE goose_session_id = ? AND epoch = ?")
+      .get(gooseSessionId, epoch) as EpochRow | null;
+  }
+
+  private epochRowRequired(gooseSessionId: string, epoch: number): EpochRow {
+    const row = this.epochRow(gooseSessionId, epoch);
+    if (!row) this.fail("UNKNOWN_EPOCH", "Remote epoch does not exist");
+    return row;
+  }
+
+  private getEpochRequired(gooseSessionId: string, epoch: number): RemoteEpoch {
+    return this.epochFromRow(this.epochRowRequired(gooseSessionId, epoch));
+  }
+
+  private epochFromRow(row: EpochRow): RemoteEpoch {
+    const lease = this.db.query(`SELECT turn_ref, state FROM turns
+      WHERE goose_session_id = ? AND epoch = ? AND abandoned_at IS NULL
+      AND state IN ('TURN_OUTSTANDING', 'UNRECONCILED') LIMIT 1`)
+      .get(row.goose_session_id, row.epoch) as { turn_ref: string; state: StoredTurnState } | null;
+    return epochFromRow(row, lease
+      ? { state: lease.state === "UNRECONCILED" ? "UNRECONCILED" : "TURN_OUTSTANDING", turnRef: lease.turn_ref }
+      : { state: "IDLE", turnRef: null });
+  }
+
+  private turnRow(turnRef: string): TurnRow | null {
+    return this.db.query("SELECT * FROM turns WHERE turn_ref = ?").get(turnRef) as TurnRow | null;
+  }
+
+  private turnRowRequired(turnRef: string): TurnRow {
+    const row = this.turnRow(turnRef);
+    if (!row) this.fail("UNKNOWN_TURN", "Broker turn does not exist");
+    return row;
+  }
+
+  private getTurnRequired(turnRef: string): BrokerTurn {
+    return turnFromRow(this.turnRowRequired(turnRef));
+  }
+
+  private operationRow(opRef: string): OperationRow | null {
+    return this.db.query("SELECT * FROM operations WHERE op_ref = ?").get(opRef) as OperationRow | null;
+  }
+
+  private operationRowRequired(opRef: string): OperationRow {
+    const row = this.operationRow(opRef);
+    if (!row) this.fail("UNKNOWN_OP_REF", "Operation reference does not exist");
+    return row;
+  }
+
+  private getOperationRequired(opRef: string): BrokerOperation {
+    return operationFromRow(this.operationRowRequired(opRef));
+  }
+
+  private transaction<T>(body: () => T): T {
+    return this.db.transaction(body)();
+  }
+
+  private fail(code: string, message: string): never {
+    throw new SessionBrokerError(code, message);
+  }
+}

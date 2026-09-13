@@ -7,22 +7,6 @@ export interface CodexParsedRequest {
   _rawBody?: unknown;
   /** Number of leading raw input items restored from local previous_response_id state. */
   _replayPrefixLen?: number;
-  /** True when the proxy expanded a previous_response_id request into a full input replay. */
-  _previousResponseInputExpanded?: boolean;
-  /** Stable upstream client thread identity, used only to derive provider-scoped continuation ids. */
-  _clientThreadId?: string;
-  /**
-   * The hosted `{type:"web_search", ...}` tool config, stashed when Codex enables web search. Routed
-   * (non-OpenAI) providers can't run it server-side, so the proxy re-exposes it as a function tool and
-   * executes searches via the gpt-5.4-mini sidecar (see src/web-search). Absent when not requested.
-   */
-  _webSearch?: Record<string, unknown>;
-  /**
-   * True when Codex requested structured output (`text.format` = json_schema/json_object). The
-   * web-search tool_result is then rendered as compact JSON instead of markdown prose, so its
-   * answer/"Sources:" text can't bleed into and corrupt the model's schema-constrained output.
-   */
-  _structuredOutput?: boolean;
   /**
    * True when the input carried `{type:"compaction_trigger"}` — Codex remote compaction v2 asking
    * this turn to produce a `{type:"compaction"}` output item. Routed adapters can't natively;
@@ -31,20 +15,9 @@ export interface CodexParsedRequest {
    */
   _compactionRequest?: boolean;
   /**
-   * True only for the current stock Goose `complete_fast()` history-compaction request. Unlike
-   * `_compactionRequest`, this still returns an ordinary Responses assistant-message stream; the
-   * flag exists solely to force the browser turn into tool-free compaction semantics.
-   */
-  _gooseCompactionRequest?: boolean;
-  /**
-   * True when the current request newly introduced a stored compaction summary/marker. Historical
-   * markers restored by previous_response_id expansion were already acknowledged and do not reset
-   * provider-private continuation caches again on every later turn.
-   */
-  _contextCompactionBoundary?: boolean;
-  /**
    * True when Codex MultiAgent V2 delegated an agent_message as provider-private encrypted_content.
-   * ChatGPT Web has no OpenAI backend key for that blob and must fail before opening the browser.
+   * ChatGPT Web has no OpenAI backend key for that blob; the Responses HTTP boundary rejects it
+   * before constructing the browser adapter.
    */
   _opaqueMultiAgentV2Payload?: boolean;
 }
@@ -57,12 +30,22 @@ export interface CodexContext {
 
 export type CodexMessage =
   | CodexUserMessage
+  | CodexAgentMessage
   | CodexAssistantMessage
   | CodexDeveloperMessage
   | CodexToolResultMessage;
 
 export interface CodexUserMessage {
   role: "user";
+  content: string | CodexContentPart[];
+  timestamp: number;
+}
+
+/** A readable MultiAgent message delivered between native Codex agents. */
+export interface CodexAgentMessage {
+  role: "agentMessage";
+  author?: string;
+  recipient?: string;
   content: string | CodexContentPart[];
   timestamp: number;
 }
@@ -90,8 +73,6 @@ export interface CodexToolResultMessage {
   toolNamespace?: string;
   /** Text, or content parts when a tool (e.g. Codex view_image) returns an image in its output. */
   content: string | CodexContentPart[];
-  /** True when the Responses result contained opaque encrypted output this browser bridge cannot translate. */
-  containsEncryptedContent?: boolean;
   isError: boolean;
   timestamp: number;
 }
@@ -126,7 +107,6 @@ export interface CodexToolCall {
   id: string;
   name: string;
   arguments: Record<string, unknown>;
-  customWireName?: string;
   thoughtSignature?: string;
   /** MCP namespace (e.g. "mcp__context7") when this call targets a namespaced tool. */
   namespace?: string;
@@ -145,10 +125,6 @@ export interface CodexTool {
   freeform?: boolean;
   /** Client-executed tool discovery (tool_search): the model's call must be relayed as a tool_search_call. */
   toolSearch?: boolean;
-  /** Tool definition restored from a prior tool_search output; transports may prioritize it when catalogs are bounded. */
-  loadedFromToolSearch?: boolean;
-  /** Synthetic web_search tool: the model's call is executed by the gpt-5.4-mini sidecar, not relayed to Codex. */
-  webSearch?: boolean;
 }
 
 /**
@@ -161,20 +137,6 @@ export function namespacedToolName(namespace: string | undefined, name: string):
   return namespace ? `${namespace}__${name}` : name;
 }
 
-export function toolChoiceAliases(tool: Pick<CodexTool, "namespace" | "name">): string[] {
-  const wireName = namespacedToolName(tool.namespace, tool.name);
-  return tool.namespace ? [wireName, `${tool.namespace}.${tool.name}`] : [wireName];
-}
-
-export function toolAllowedByChoice(tool: Pick<CodexTool, "namespace" | "name">, allowedTools: ReadonlySet<string>): boolean {
-  return toolChoiceAliases(tool).some(name => allowedTools.has(name));
-}
-
-export function resolveToolChoiceWireName(tools: readonly Pick<CodexTool, "namespace" | "name">[] | undefined, name: string): string {
-  const match = tools?.find(tool => toolChoiceAliases(tool).includes(name));
-  return match ? namespacedToolName(match.namespace, match.name) : name;
-}
-
 export type CodexToolChoice =
   | "auto"
   | "none"
@@ -182,8 +144,13 @@ export type CodexToolChoice =
   | { name: string }
   | { allowedTools: string[]; mode: "auto" | "required" };
 
-export function isAllowedToolChoice(value: CodexToolChoice | undefined): value is { allowedTools: string[]; mode: "auto" | "required" } {
-  return typeof value === "object" && value !== null && "allowedTools" in value;
+export type CodexVerbosity = "low" | "medium" | "high";
+
+export interface CodexJsonSchemaOutputFormat {
+  type: "json_schema";
+  name: string;
+  strict: boolean;
+  schema: unknown;
 }
 
 export interface CodexRequestOptions {
@@ -198,6 +165,10 @@ export interface CodexRequestOptions {
   serviceTier?: string;
   presencePenalty?: number;
   frequencyPenalty?: number;
+  /** Native Responses text verbosity requested by Codex. */
+  verbosity?: CodexVerbosity;
+  /** Native Responses JSON-schema output contract requested by Codex. */
+  outputFormat?: CodexJsonSchemaOutputFormat;
   /** Responses prompt-cache affinity key. Passthrough preserves it via _rawBody; routed adapters do not consume it unless their upstream wire supports it. */
   promptCacheKey?: string;
 }
@@ -225,14 +196,6 @@ export type AdapterEvent =
   | { type: "tool_call_end" }
   /** Internal boundary between a guarded first pass and its one-shot continuation. */
   | { type: "assistant_boundary" }
-  // Native web-search activity surfaced by the web-search sidecar so Codex renders a "Searched the
-  // web" cell. Emitted as a lifecycle PAIR at real wall-clock moments by src/web-search/loop.ts
-  // (routed adapters never emit these): `begin` right before the sidecar runs so Codex shows the
-  // "Searching the web" spinner, then `end` once it resolves. The bridge maps begin → an
-  // output_item.added(in_progress) and end → the matching output_item.done(completed|failed) under
-  // the SAME output index, so the activity animates instead of flashing completed instantly.
-  | { type: "web_search_call_begin"; id: string }
-  | { type: "web_search_call_end"; id: string; queries: string[]; status?: "completed" | "failed"; sources?: CodexUrlCitation[] }
   | {
       type: "done";
       usage?: CodexUsage;
@@ -262,16 +225,6 @@ export type AdapterEvent =
       code?: string;
       retryable?: boolean;
     };
-
-/**
- * A web source backing a search answer. Surfaced on the search-end event and rendered by the bridge
- * as a `url_citation` annotation on the following assistant message (the desktop app's Sources chip
- * reads these; the TUI ignores annotations, so this is additive).
- */
-export interface CodexUrlCitation {
-  url: string;
-  title?: string;
-}
 
 /**
  * Canonical Responses usage convention:
@@ -309,10 +262,16 @@ export interface CodexProviderConfig {
   chatgptWeb?: {
     /** ChatGPT custom connector attached to tool-capable temporary chats. */
     appName?: string;
+    /** Whether ChatGPT DOM interaction is automatic or explicitly driven by the user. */
+    browserInteractionMode?: "automatic" | "manual";
     /** Explicit browser owner. Launcher mode attaches to the embedded Electron ChatGPT surface. */
     browserHost?: "managed-chrome" | "launcher";
     /** Owner-only descriptor containing the launcher's loopback CDP and control endpoints. */
     browserHostDescriptorPath?: string;
+    /** Explicit browser-helper bundle. DEV builds current source; the launcher still supplies Electron-as-Node. */
+    browserHelperScriptPath?: string;
+    /** Explicit private diagnostic root for isolated harnesses. */
+    browserDiagnosticsPath?: string;
     /** Playwright storage-state file created by the explicit browser login. */
     storageStatePath?: string;
     /** System Chrome executable. The runtime never downloads a browser. */
@@ -321,17 +280,28 @@ export interface CodexProviderConfig {
     brokerSocketPath?: string;
     /** Persisted, trusted Codex task authority used for follow-up turns that omit the envelope. */
     threadEnvironmentStatePath?: string;
-    /** Deprecated compatibility field; accepted but never used as an accepted-turn/model-generation deadline. */
+    /** Persisted exact-parent rolling checkpoints used only by Free/Luna turns. */
+    lunaCheckpointStatePath?: string;
+    /** Optional explicit safety ceiling. Browser turns have no absolute deadline by default. */
     turnTimeoutMs?: number;
+    /**
+     * Seconds of adapter silence before the Responses bridge cancels a turn as a hung upstream.
+     * The adapter heartbeats every CHATGPT_WEB_ADAPTER_HEARTBEAT_MS for the whole of a turn, so a
+     * healthy turn never approaches this no matter how long it thinks; raise it only to tolerate a
+     * genuinely unresponsive upstream for longer. Defaults to DEFAULT_STALL_TIMEOUT_SEC.
+     */
+    stallTimeoutSec?: number;
     /** Keep the single controlled browser visible. */
     headed?: boolean;
-    /** Attach the turn-bound Codex MCP capability for non-Pro efforts. */
+    /** Attach the turn-bound Codex MCP capability for every connector-capable Web model. */
     localToolsEnabled?: boolean;
+    /** Account capability proven by the authenticated browser probe. */
+    solAvailable?: boolean;
     /** Account capability proven by the authenticated browser probe. */
     proAvailable?: boolean;
     /** Authorize per-call "Allow once" confirmation clicks for this connector. */
     autoApproveToolCalls?: boolean;
-    /** True when this daemon runs without any native Codex integration; the outer harness is not Codex. */
-    standalone?: boolean;
+    /** DEV-only experimental transport: adapt one context across one, two, or three ChatGPT messages. */
+    experimentalBiggerContext?: boolean;
   };
 }

@@ -1,109 +1,128 @@
 # Security model
 
-Status: **current/proven** for the existing runtime. Goose Control notes are **active design** until that surface is implemented.
+> **HERITAGE DOCUMENT:** This security model describes the inherited Codex authority/token architecture. Reuse its generic local-browser/secret cautions only where the rebuild plan explicitly adapts them; current Goose provider authority is `AGENTS.md` plus `docs/persistent-chat-rebuild-plan.md`.
+
 
 ## Trust boundaries
 
-The user trusts:
-
-- Goose as the outer harness;
-- the local Responses daemon;
-- the project-owned Electron BrowserHost and its private authenticated ChatGPT partition;
-- the selected ChatGPT account/workspace;
-- the Secure MCP Tunnel in full mode;
-- the exact `Goose Native` connector configured for the active Goose turn.
-
-Repository contents, websites, tool output, prompt text, and model output are untrusted data.
+The user trusts the local Codex app, this loopback daemon, the launcher's private Electron browser
+profile, the selected ChatGPT workspace, OpenAI's tunnel service, and the exact MCP connector they
+created. Repository contents, tool output, websites, and prompt text are untrusted data.
 
 ## Full-mode capability flow
 
-1. Goose sends a Responses-compatible provider request to the loopback daemon.
-2. Tool authority comes only from the active Goose turn/tool contract, never from user-authored prompt text.
-3. The daemon creates a random bounded per-turn capability.
-4. ChatGPT can request an action through the current `Goose Native` connector.
-5. The connector/tunnel path returns a normal provider tool request to Goose.
-6. Goose remains responsible for tool registry, execution, approvals/sandboxing, delegation, and tool results.
-7. The matching result returns to the same logical browser response.
-8. The turn capability is revoked on completion/abort/failure.
+1. The daemon accepts a Codex Responses turn on `127.0.0.1`.
+2. It extracts `cwd`, workspace roots, and sandbox policy from the native Codex envelope. When a
+   resumed root task or subagent omits that envelope, its canonical local rollout must prove the
+   exact thread and current turn (or latest source turn for standalone compaction). Request metadata
+   can only constrain that authority. Tools always come from the current request; user-authored
+   `<environment_context>` text is never a source of recovered authority.
+   A context-only continuation after completed compaction additionally binds the exact checkpoint
+   and source instruction to its native thread, turn, model and effort. A freshly emitted environment
+   claim without a new human message must match that turn's canonical rollout in cwd, roots and
+   sandbox policy; the checkpoint alone does not grant filesystem authority.
+3. It creates a random, turn-scoped token and embeds it in that one ChatGPT browser prompt.
+4. Every Codex Native action presents that same turn token. The MCP handler idempotently claims an
+   internal binding plus a request-scoped activity lease and immediately dispatches the requested
+   action; neither internal handle is exposed to the model. The lease is settled only after the MCP
+   handler finishes, including inventory calls that need no outer Codex tool.
+5. MCP can request only a callable tool advertised by the active outer Codex turn. The unrestricted
+   raw orchestration `exec` gateway remains available in Full mode. Before caller-authored
+   JavaScript runs, the bridge wraps its tool registry with a transparent proxy that enforces the
+   exact 10-second `wait_agent` polling contract and prevents recursive raw `exec`. The generic
+   inventory/call pair also provides a structured exact-name path. Codex remains responsible for
+   its sandbox, approval, UI, command sessions, and tool result.
+6. Before a Codex tool batch is dispatched, the browser records and acknowledges the current answer
+   projection. Completion stays blocked while the tool is unresolved and then requires a new stable
+   final-answer projection after that causal boundary. A two-phase broker fence then rereads the DOM
+   and commits completion only if the activity revision stayed unchanged with no active invocation;
+   a concurrent claim makes the candidate lose, while a claim after commit receives an explicit
+   terminal rejection. Recent MCP activity may suppress a false DOM-health failure but never adds
+   an idle delay to a successful completion.
 
-The bridge transports model decisions; it does not add a second planner, semantic router, or fallback model.
+The bridge transports decisions; it does not add a second planner, semantic router, or fallback
+model. Every available effort uses the same MCP contract. An unavailable account route, missing
+connector, or missing outer tool fails explicitly instead of becoming an effort-specific exception.
 
-## Runtime ownership as a security boundary
-
-Standalone Goose intentionally separates:
-
-- Responses daemon;
-- Electron BrowserHost;
-- Secure MCP Tunnel.
-
-Electron must not adopt or stop daemon/tunnel ownership. Lifecycle operations must target the exact project-owned component and use the canonical dependency order.
-
-BrowserHost readiness is also part of the safety boundary: PID/descriptor/CDP existence alone is insufficient. The authoritative lifecycle readiness path verifies a disposable leased surface through the descriptor-provided Node/Electron Node browser helper and releases that lease cleanly.
+The direct turn-token MCP schema is attached only through the `Codex Native2` connector identity.
+The pre-v4 `Codex Native` connector is treated as legacy and is never selected as a fallback. This
+prevents a cached legacy schema from being mistaken for the current capability contract.
 
 ## Principal risks
 
 ### Prompt injection and destructive tool use
 
-ChatGPT sees untrusted repository/tool content. In full mode it can request write/command actions only if Goose exposes them. Keep Goose's sandbox/approval policy appropriate for the workspace and task. The connector must not widen authority beyond the active Goose turn.
+ChatGPT sees repository content and tool results that may contain hostile instructions. Full mode
+can invoke write and command tools. Use a trusted workspace, keep Codex sandbox/approval settings
+appropriate, and grant only intended connector actions. Automatic per-call approval is off by
+default.
 
 ### Browser session theft
 
-The Electron BrowserHost partition authorizes ChatGPT access. Keep it in private local application state; never copy it into prompts, diagnostics, Git, uploads, or shared artifacts. Revoke/sign out the ChatGPT session after suspected exposure.
+The launcher's persistent Electron partition can authorize ChatGPT access. It remains in the
+current OS user's private application-data directory and is never copied into a daemon prompt or
+runtime descriptor. Never sync, upload, attach, or commit it. On suspected exposure, sign out or
+revoke the ChatGPT session from the launcher.
 
-### Tunnel/runtime credential theft
+### Tunnel credential theft
 
-Tunnel/runtime credentials are sensitive. Keep them in user-private storage and out of command-line arguments, logs, prompts, generated public profiles, and Git. Rotate after suspected exposure.
+The runtime key needs only Tunnels Read + Use. It is accepted through a hidden prompt or copied
+from a file, stored with user-only permissions, referenced by file, and never placed in a command
+argument or generated profile. Rotate it after suspected exposure.
 
 ### Same-user local process
 
-Responses, BrowserHost control, CDP, and planned ACP client surfaces are loopback/private. Loopback does not defend against another malicious process running as the same OS user. Treat same-user local code execution as inside the trust boundary.
+The Responses endpoint is loopback-only, but it has no independent bearer secret because the
+built-in Codex OpenAI provider cannot be configured with a bridge-specific credential while
+preserving the native provider/task identity. Another process under the same OS user can reach the
+port. Run on a trusted single-user account and treat local code execution as inside the trust
+boundary.
+
+The lifecycle endpoints are separate from the Responses surface. `/admin/drain`, `/admin/resume`,
+`/admin/cancel-turn`, `/admin/cancel-turns`, and `/admin/shutdown` require a random bearer token stored in the
+user-only application config. The launcher uses them to reject new work, prove that both the HTTP
+request and long-lived browser/tool loop are idle, flush response state, and stop a process. The
+token does not turn loopback into a hostile-local-process security boundary; it prevents accidental
+or unauthenticated lifecycle control through ordinary requests.
 
 ### Browser/UI drift
 
-ChatGPT DOM/page behavior is not a stable API. Automation must use bounded evidence and fail closed on drift. Do not silently switch model, reasoning mode, browser transport, or provider.
+ChatGPT DOM and labels are not a stable API. Selectors are narrow; Full-mode completion requires
+stable completed-turn evidence and, after tools, a new final-answer projection. UI drift fails the
+turn; it never chooses another model, starts another transport, or returns a fabricated success.
+
+### Login-state isolation
+
+The launcher keeps ChatGPT login, identity-provider navigation, and model turns in one private
+Electron partition. Allowed login popups are adopted into an in-launcher `WebContentsView` that
+shares that partition; unrelated external links remain outside it. A visible composer alone is not
+authentication evidence: the launcher also requires a valid server session and an exact Temporary
+Chat URL before setup can continue. No cookies, local storage, or browser profile are copied from an
+external browser.
 
 ### Cross-turn data leakage
 
-Goose is the durable conversation source of truth. Browser surfaces and Temporary Chats are transport state. The authenticated partition is shared only for login/session state; turn surfaces must remain independently leased/released. Bounded daemon replay state exists only to resume the same logical provider response across tool-result rounds and must not become a second durable conversation store.
-
-### Lifecycle self-interference
-
-An active BrowserHost-backed turn can disrupt itself if it stops/restarts the runtime carrying that turn. Lifecycle/autostart qualification must be performed from an external/operator-safe boundary. A self-interfering failed proof is not evidence of a general BrowserHost regression.
-
-## Goose Control — active design security boundary
-
-The first Goose Control proof is deliberately narrower than the existing Goose Native tool surface:
-
-```text
-ChatGPT Planner
-  → private custom GPT Action
-  → authenticated HTTPS REST/OpenAPI facade
-  → authenticated loopback goose serve ACP
-  → one server-approved persisted Goose session
-```
-
-Required boundaries:
-
-- raw ACP remains loopback/private;
-- the Goose server secret never reaches ChatGPT;
-- the ChatGPT-reachable HTTPS facade is authenticated and exposes only the documented narrow OpenAPI operation;
-- first proof targets exactly one server-approved persisted session;
-- no Planner-supplied cwd/provider/model/session creation;
-- no arbitrary shell/file/browser/process/tunnel/lifecycle APIs;
-- Goose Native `turn_token` authority remains separate and is not reused for Goose Control;
-- Goose remains the normal tool/approval/execution authority inside the receiving session;
-- `request_id` idempotency prevents ambiguous network/Action retries from appending duplicate Goose turns.
-
-Later async jobs, cancellation, multiple targets, fresh-session profiles, and Orchestrator/Palmate must preserve the same least-authority boundary.
+Browser turns use at most five independent task-bound tabs in one private login partition. Every
+outer Codex task owns an exact launcher surface lease and retains its Temporary Chat only across
+sequential messages in the same model/effort/compaction epoch; chats are never reused across tasks.
+Closing a running tab destroys its page and terminates that turn. The five-tab limit bounds parallel
+account traffic. Tool calls remain in the same ChatGPT response. The
+bounded local continuation cache is private, expires, and exists only to implement Codex
+`previous_response_id` replay. Full-mode context compaction accepts a checkpoint only through its
+one-shot MCP control capability in the exact retained source chat. If that chat no longer exists, a
+fresh tool-free Temporary Chat receives the canonical Codex history; the bridge never parses ordinary
+assistant prose as a structured handoff.
 
 ## Network exposure
 
-- Existing Responses/health and BrowserHost control/CDP listeners are loopback-only.
-- Full mode uses an outbound Secure MCP Tunnel; it does not require an inbound public listener or router port-forward.
-- Goose Control's first proof adds a deliberately narrow authenticated HTTPS facade because GPT Actions require a reachable web surface; raw ACP stays on authenticated loopback behind that facade.
+- Responses and health listeners bind to `127.0.0.1` only.
+- Full mode uses OpenAI's outbound HTTPS Secure MCP Tunnel; it opens no public listener or inbound
+  firewall rule.
+- The embedded browser connects to ChatGPT, the selected identity provider during explicit sign-in,
+  and user-authorized attachment URLs through normal browser networking.
 
 ## Non-goals
 
-- Defending against a compromised local OS account or compromised trusted runtime binary.
-- Bypassing ChatGPT plan, workspace, usage, connector/action, or model restrictions.
-- Making consumer browser automation equivalent to a supported OpenAI model API contract.
+- Defending against a compromised local OS user or compromised Codex/Electron binary.
+- Bypassing ChatGPT plan, workspace, usage, action-control, or model restrictions.
+- Making consumer browser automation equivalent to a supported OpenAI API contract.

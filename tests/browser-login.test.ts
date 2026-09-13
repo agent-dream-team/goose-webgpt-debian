@@ -1,17 +1,18 @@
 import { expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   browserLoginStateExists,
+  captureSystemBrowserLogin,
   loginToChatGpt,
   loginVerificationMarkerPath,
-  tryDetectChatGptProCapability,
+  sanitizeBrowserLoginStorageState,
 } from "../src/browser-login";
 import { CHATGPT_TEMPORARY_CHAT_URL } from "../src/chatgpt-session";
 import { defaultConfig } from "../src/config";
 
-test("login uses one normal Chrome on a non-automation loopback port and never launches a verifier browser", async () => {
+test("login starts with normal Chrome and captures state in a headed Keychain-aware context", async () => {
   if (process.platform === "win32") return;
   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-login-"));
   const executable = join(root, "fake-chrome");
@@ -24,37 +25,15 @@ test("login uses one normal Chrome on a non-automation loopback port and never l
     const config = defaultConfig("browser-only");
     config.chromeExecutablePath = executable;
     config.storageStatePath = join(root, "browser", "storage-state.json");
-    const loginError = await loginToChatGpt(config, { timeoutMs: 5_000 }).then(
-      () => undefined,
-      error => error,
-    );
-    if (!existsSync(argsLog)) throw loginError;
-    expect(loginError).toBeInstanceOf(Error);
-    expect((loginError as Error).message).toContain("closed before its private login session became inspectable");
+    await loginToChatGpt(config, { timeoutMs: 100 }).catch(() => {});
 
     const launches = readFileSync(argsLog, "utf8").trim().split("\n");
     const firstLaunch = launches[0] ?? "";
     expect(firstLaunch).toContain("--new-window");
     expect(firstLaunch).toContain("--user-data-dir=");
-    expect(firstLaunch).toContain("--remote-debugging-address=127.0.0.1");
-    const portMatch = firstLaunch.match(/--remote-debugging-port=(\d+)/);
-    expect(portMatch).not.toBeNull();
-    expect(Number(portMatch?.[1])).toBeGreaterThan(0);
     expect(firstLaunch).toContain(CHATGPT_TEMPORARY_CHAT_URL);
     expect(firstLaunch).not.toContain("--remote-debugging-pipe");
-    expect(launches).toHaveLength(1);
-
-    const source = readFileSync(new URL("../src/browser-login.ts", import.meta.url), "utf8");
-    const loginSource = source.slice(
-      source.indexOf("export async function loginToChatGpt"),
-      source.indexOf("export function browserLoginStateExists"),
-    );
-    expect(source).toContain("chromium.connectOverCDP(transport");
-    expect(source).toContain('session.send("Browser.close")');
-    expect(source).not.toContain("launchPersistentContext(profileDir");
-    expect(source).toContain("browser.newContext({ storageState })");
-    expect(loginSource).not.toContain("chromium.launch(");
-    expect(loginSource).not.toContain("AutomationControlled");
+    expect(launches[1]).not.toContain("--headless");
   } finally {
     if (previousLog === undefined) delete process.env.CODEX_LOGIN_ARG_LOG;
     else process.env.CODEX_LOGIN_ARG_LOG = previousLog;
@@ -62,7 +41,95 @@ test("login uses one normal Chrome on a non-automation loopback port and never l
   }
 });
 
-test("stored login accepts legacy verification evidence and the new authenticated-capture marker only", () => {
+test("passkey login authenticates in normal Chrome before isolated offline pipe capture", async () => {
+  if (process.platform !== "darwin") return;
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-passkey-login-"));
+  const executable = join(root, "fake-chrome");
+  const argsLog = join(root, "args.log");
+  const pidLog = join(root, "pid.log");
+  writeFileSync(executable, [
+    "#!/bin/sh",
+    "printf '%s\\n' \"$*\" >> \"$CODEX_LOGIN_ARG_LOG\"",
+    "case \"$*\" in",
+    "  *--remote-debugging-pipe*) exit 0 ;;",
+    "esac",
+    "printf '%s\\n' \"$$\" > \"$CODEX_LOGIN_PID_LOG\"",
+    "trap 'exit 0' TERM INT HUP",
+    "while :; do sleep 1; done",
+    "",
+  ].join("\n"), { mode: 0o700 });
+  chmodSync(executable, 0o700);
+  const previousArgs = process.env.CODEX_LOGIN_ARG_LOG;
+  const previousPid = process.env.CODEX_LOGIN_PID_LOG;
+  process.env.CODEX_LOGIN_ARG_LOG = argsLog;
+  process.env.CODEX_LOGIN_PID_LOG = pidLog;
+  try {
+    const config = defaultConfig("browser-only");
+    config.chromeExecutablePath = executable;
+    config.storageStatePath = join(root, "transfer", "storage-state.json");
+    let continueLogin!: () => void;
+    const continuation = new Promise<void>(resolve => { continueLogin = resolve; });
+    const capture = captureSystemBrowserLogin(config, { continuation, timeoutMs: 5_000 });
+    for (let attempt = 0; attempt < 100 && !existsSync(pidLog); attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    expect(existsSync(pidLog)).toBe(true);
+    continueLogin();
+    const error = await capture.then(() => undefined, caught => caught as Error);
+    expect(error).toBeInstanceOf(Error);
+
+    const launches = readFileSync(argsLog, "utf8").trim().split("\n");
+    expect(launches).toHaveLength(2);
+    expect(launches[0]).toContain("--new-window");
+    expect(launches[0]).toContain("--user-data-dir=");
+    expect(launches[0]).not.toContain("--remote-debugging-pipe");
+    expect(launches[0]).not.toContain("--enable-automation");
+    expect(launches[1]).toContain("--remote-debugging-pipe");
+    expect(launches[1]).toContain("--headless");
+    expect(launches[1]).toContain("--restore-last-session");
+    expect(launches[1]).toContain("--disable-background-networking");
+    expect(readdirSync(join(root, "transfer")).filter(name => name.startsWith("login-profile-"))).toEqual([]);
+  } finally {
+    if (previousArgs === undefined) delete process.env.CODEX_LOGIN_ARG_LOG;
+    else process.env.CODEX_LOGIN_ARG_LOG = previousArgs;
+    if (previousPid === undefined) delete process.env.CODEX_LOGIN_PID_LOG;
+    else process.env.CODEX_LOGIN_PID_LOG = previousPid;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("passkey storage capture excludes identity-provider and partitioned state", () => {
+  const cookie = (name: string, domain: string, extra = {}) => ({
+    name,
+    value: name,
+    domain,
+    path: "/",
+    expires: -1,
+    httpOnly: true,
+    secure: true,
+    sameSite: "Lax" as const,
+    ...extra,
+  });
+  const state = sanitizeBrowserLoginStorageState({
+    cookies: [
+      cookie("chatgpt", ".chatgpt.com"),
+      cookie("openai", "auth.openai.com"),
+      cookie("partitioned", ".chatgpt.com", { partitionKey: "https://accounts.google.com" }),
+      cookie("google", ".accounts.google.com"),
+      cookie("lookalike", ".chatgpt.com.attacker.example"),
+    ],
+    origins: [
+      { origin: "https://chatgpt.com", localStorage: [{ name: "chat", value: "kept" }] },
+      { origin: "https://accounts.google.com", localStorage: [{ name: "idp", value: "removed" }] },
+    ],
+  });
+  expect(state.cookies.map(value => value.name)).toEqual(["chatgpt", "openai"]);
+  expect(state.origins).toEqual([
+    { origin: "https://chatgpt.com", localStorage: [{ name: "chat", value: "kept" }] },
+  ]);
+});
+
+test("a storage-state file is not trusted without a verification marker", () => {
   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-login-state-"));
   try {
     const config = defaultConfig("browser-only");
@@ -76,45 +143,7 @@ test("stored login accepts legacy verification evidence and the new authenticate
       { mode: 0o600 },
     );
     expect(browserLoginStateExists(config)).toBe(true);
-
-    writeFileSync(
-      loginVerificationMarkerPath(config.storageStatePath),
-      `${JSON.stringify({
-        version: 2,
-        authenticated: true,
-        source: "authenticated-system-browser",
-        capturedAt: "2026-08-10T00:00:00.000Z",
-      })}\n`,
-      { mode: 0o600 },
-    );
-    expect(browserLoginStateExists(config)).toBe(true);
-
-    writeFileSync(
-      loginVerificationMarkerPath(config.storageStatePath),
-      `${JSON.stringify({ version: 2, authenticated: true, capturedAt: "2026-08-10T00:00:00.000Z" })}\n`,
-      { mode: 0o600 },
-    );
-    expect(browserLoginStateExists(config)).toBe(false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
-});
-
-test("capability probing is optional and inconclusive detection does not become false", async () => {
-  const locator = {
-    locator: () => locator,
-    last: () => locator,
-    isVisible: async () => true,
-    waitFor: async () => { throw new Error("timeout"); },
-    getAttribute: async () => null,
-    click: async () => {},
-    first: () => locator,
-    count: async () => 1,
-  };
-  const page = {
-    locator: () => locator,
-    keyboard: { press: async () => {} },
-  } as never;
-
-  expect(await tryDetectChatGptProCapability(page)).toBeUndefined();
 });

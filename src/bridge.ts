@@ -57,21 +57,26 @@ function adapterFailureFromEvent(event: Extract<AdapterEvent, { type: "error" }>
 
 export { adapterFailureFromMessage } from "./lib/errors";
 
-/**
- * Build the native `WebSearchAction::Search` payload from the queries that ran. codex-rs prefers a
- * non-empty `query` over `queries` for the cell label, and only renders "<first> ..." when `query`
- * is absent and `queries.len() > 1`. So a single query → `{ query }`; multiple → `{ queries }` with
- * no singular `query`, so Codex shows the native plural ellipsis. Empty → `{ query: "" }`.
- */
-function webSearchAction(queries: string[]): Record<string, unknown> {
-  if (queries.length <= 1) return { type: "search", query: queries[0] ?? "" };
-  return { type: "search", queries };
-}
-
 interface OutputItem {
   type: string;
   id: string;
   [key: string]: unknown;
+}
+
+const PLAINTEXT_COLLABORATION_CALLS = new Set([
+  "spawn_agent",
+  "send_message",
+  "followup_task",
+]);
+
+/**
+ * Codex MultiAgent V2 normally treats collaboration message arguments as backend ciphertext.
+ * An empty encrypted_function_args list is the protocol's explicit plaintext-delivery marker.
+ */
+function plaintextCollaborationFields(namespace: string | undefined, name: string): Record<string, unknown> {
+  return namespace === "collaboration" && PLAINTEXT_COLLABORATION_CALLS.has(name)
+    ? { encrypted_function_args: [] }
+    : {};
 }
 
 export type ResponsesTerminalStatus = "completed" | "failed" | "incomplete";
@@ -100,6 +105,8 @@ export function bridgeToResponsesSSE(
     onCompletedResponse?: (response: Record<string, unknown>, providerState?: CodexProviderContinuationState) => void;
     /** Test seam for the platform-specific Bun stream transport. */
     streamPlatform?: NodeJS.Platform;
+    /** Test seam for the monotonic upstream-silence clock. */
+    now?: () => number;
   },
 ): ReadableStream<Uint8Array> {
   // Freeform/custom tools (apply_patch) carry their body in `input`; the model is given a
@@ -158,7 +165,6 @@ export function bridgeToResponsesSSE(
   // eventsource_stream; ANY received event re-arms it, while an unknown type is ignored
   // (responses.rs `_ => Ok(None)`). We emit a real, parser-ignored `response.heartbeat` only during
   // upstream silence so a stalled routed provider never trips "idle timeout waiting for SSE".
-  let activity = false;
   let beat: ReturnType<typeof setInterval> | undefined;
   let controller: ReadableStreamDefaultController<Uint8Array>;
   let emittedFrames = 0;
@@ -166,7 +172,6 @@ export function bridgeToResponsesSSE(
   let stepping = false;
   const emit = (name: string, data: Record<string, unknown>) => {
         if (closed) return;
-        activity = true;
         try {
           controller.enqueue(encoder.encode(sseEvent(name, { type: name, sequence_number: seq++, ...data })));
           emittedFrames++;
@@ -188,21 +193,21 @@ export function bridgeToResponsesSSE(
       let outputIndex = 0;
       const finishedItems: OutputItem[] = [];
 
-      // The OpenAI Responses API always includes `error` on the response object (null when there
-      // is none). Some client-side Responses parsers deserialize it as a required (non-optional)
-      // field, so omitting the key entirely on non-failure statuses breaks their stream decode
-      // even before a real failure ever occurs. Failure call sites below override this with the
-      // real error by spreading this snapshot first.
       const responseSnapshot = (status: string, output: OutputItem[], endTurn?: boolean) => ({
         id: responseId, object: "response", created_at: createdAt,
-        status, model: modelId, output, usage: null, error: null,
+        status, model: modelId, output, usage: null,
         ...(endTurn !== undefined ? { end_turn: endTurn } : {}),
       });
 
       const heartbeatFrame = encoder.encode('event: response.heartbeat\ndata: {"type":"response.heartbeat"}\n\n');
-      let stallTicks = 0;
+      let stallWarned = false;
+      const now = options?.now ?? (() => performance.now());
+      let lastAdapterEventAt = now();
+      let lastAdapterEventType = "<none>";
+      let adapterEventCount = 0;
+      const streamStartedAt = lastAdapterEventAt;
       const stallSec = resolveStallTimeoutSec(options?.stallTimeoutSec);
-      const maxStallTicks = Math.ceil((stallSec * 1000) / heartbeatMs);
+      const stallTimeoutMs = stallSec * 1000;
 
       let currentMsg: { itemId: string; outputIndex: number; text: string; phase?: CodexMessagePhase } | null = null;
       let currentReasoning: { itemId: string; outputIndex: number; text: string } | null = null;
@@ -258,26 +263,8 @@ export function bridgeToResponsesSSE(
       // synthetic compaction item's payload on done.
       let compactionText = "";
       let currentToolCall: { itemId: string; outputIndex: number; callId: string; name: string; args: string; namespace?: string; freeform?: boolean; toolSearch?: boolean; inputEmitted?: string } | null = null;
-      // Open native web-search cell (between begin and end). Holds the output index allocated on
-      // begin so the matching done reuses it; closed as `failed` if the stream terminates early.
-      let currentWebSearch: { itemId: string; eventId: string; outputIndex: number } | null = null;
-      // Sources from completed web searches, awaiting the next assistant message. Attached as
-      // url_citation annotations on that message (the desktop app's Sources chip), then cleared so
-      // they bind to exactly one message. Deduped by URL across multiple searches in the turn.
-      let pendingWebSources: { url: string; title?: string }[] = [];
-      const takeWebAnnotations = (): { type: string; url: string; title?: string; start_index: number; end_index: number }[] => {
-        if (pendingWebSources.length === 0) return [];
-        const anns = pendingWebSources.map(s => ({
-          type: "url_citation", url: s.url, ...(s.title ? { title: s.title } : {}), start_index: 0, end_index: 0,
-        }));
-        pendingWebSources = [];
-        return anns;
-      };
-
       const closeCurrentMessage = () => {
         if (!currentMsg) return;
-        // Bind any pending web-search citations to this assistant message (then they clear).
-        const annotations = takeWebAnnotations();
         // Finalize the text part (Responses protocol). Without these .done events Codex never
         // commits the content part and renders the message as truncated / cut off.
         emit("response.output_text.done", {
@@ -285,11 +272,11 @@ export function bridgeToResponsesSSE(
         });
         emit("response.content_part.done", {
           item_id: currentMsg.itemId, output_index: currentMsg.outputIndex, content_index: 0,
-          part: { type: "output_text", text: currentMsg.text, annotations },
+          part: { type: "output_text", text: currentMsg.text, annotations: [] },
         });
         const item = {
           type: "message", id: currentMsg.itemId, status: "completed", role: "assistant",
-          content: [{ type: "output_text", text: currentMsg.text, annotations }],
+          content: [{ type: "output_text", text: currentMsg.text, annotations: [] }],
           ...(currentMsg.phase ? { phase: currentMsg.phase } : {}),
         };
         emit("response.output_item.done", { output_index: currentMsg.outputIndex, item });
@@ -366,29 +353,12 @@ export function bridgeToResponsesSSE(
               call_id: currentToolCall.callId, name: currentToolCall.name,
               arguments: argsStr, status: "completed",
               ...(currentToolCall.namespace ? { namespace: currentToolCall.namespace } : {}),
+              ...plaintextCollaborationFields(currentToolCall.namespace, currentToolCall.name),
             };
         emit("response.output_item.done", { output_index: currentToolCall.outputIndex, item });
         finishedItems.push(item as OutputItem);
         outputIndex++;
         currentToolCall = null;
-      };
-
-      // Finalize an open web-search cell. `status` is "completed" on a normal end, or "failed" when
-      // the stream terminates (error/incomplete) while a search was still in flight, so Codex never
-      // leaves a "Searching the web" spinner spinning forever.
-      // `sources` rides on the done item (additive field; codex-rs serde ignores unknown fields) so
-      // downstream Responses consumers can fill web_search_tool_result content.
-      const closeCurrentWebSearch = (status: "completed" | "failed", queries: string[], sources?: { url: string; title?: string }[]) => {
-        if (!currentWebSearch) return;
-        const item = {
-          type: "web_search_call", id: currentWebSearch.itemId, status,
-          action: webSearchAction(queries),
-          ...(sources && sources.length > 0 ? { sources } : {}),
-        };
-        emit("response.output_item.done", { output_index: currentWebSearch.outputIndex, item });
-        finishedItems.push(item as OutputItem);
-        outputIndex++;
-        currentWebSearch = null;
       };
 
       // RC1: guarantee the Responses stream always ends with exactly one terminal event. Set true
@@ -450,8 +420,10 @@ export function bridgeToResponsesSSE(
           if (next.done) { upstreamDone = true; break; }
           const event = next.value;
           let terminalEvent = false;
-          activity = true;
-          stallTicks = 0;
+          lastAdapterEventAt = now();
+          lastAdapterEventType = event.type;
+          adapterEventCount += 1;
+          stallWarned = false;
           reportFirstOutput(event);
           // Compaction turns emit ONLY the synthetic compaction item + response.completed. The
           // summary text is accumulated silently: emitting it as a normal assistant message would
@@ -570,7 +542,11 @@ export function bridgeToResponsesSSE(
                 ? { type: "tool_search_call", id: itemId, call_id: event.id, execution: "client", arguments: {}, status: "in_progress" }
                 : freeform
                 ? { type: "custom_tool_call", id: itemId, call_id: event.id, name: realName, input: "", status: "in_progress" }
-                : { type: "function_call", id: itemId, call_id: event.id, name: realName, arguments: "", status: "in_progress", ...(ns ? { namespace: ns } : {}) };
+                : {
+                    type: "function_call", id: itemId, call_id: event.id, name: realName,
+                    arguments: "", status: "in_progress", ...(ns ? { namespace: ns } : {}),
+                    ...plaintextCollaborationFields(ns, realName),
+                  };
               emit("response.output_item.added", { output_index: outputIndex, item });
               currentToolCall = { itemId, outputIndex, callId: event.id, name: realName, args: "", namespace: ns, freeform, toolSearch };
               break;
@@ -606,53 +582,12 @@ export function bridgeToResponsesSSE(
               closeCurrentToolCall();
               break;
             }
-            case "web_search_call_begin": {
-              // Open the native search cell so Codex shows the "Searching the web" spinner WHILE the
-              // sidecar runs. Close any other open item first, allocate this item's output index, and
-              // hold it open until the matching `web_search_call_end` (or a terminal close).
-              if (currentMsg) closeCurrentMessage();
-              if (currentReasoning) closeCurrentReasoning();
-              if (currentRawReasoning) closeCurrentRawReasoning();
-              flushHiddenRawReasoning();
-              if (currentToolCall) closeCurrentToolCall();
-              if (currentWebSearch) closeCurrentWebSearch("completed", []);
-              const wsItemId = `ws_${uuid()}`;
-              emit("response.output_item.added", {
-                output_index: outputIndex,
-                item: { type: "web_search_call", id: wsItemId, status: "in_progress" },
-              });
-              currentWebSearch = { itemId: wsItemId, eventId: event.id, outputIndex };
-              break;
-            }
-            case "web_search_call_end": {
-              // The sidecar resolved — finalize the cell as "Searched <query>". If no begin opened
-              // (defensive), synthesize the added frame first so the done has a matching item.
-              if (!currentWebSearch || currentWebSearch.eventId !== event.id) {
-                if (currentWebSearch) closeCurrentWebSearch("completed", []);
-                const wsItemId2 = `ws_${uuid()}`;
-                emit("response.output_item.added", {
-                  output_index: outputIndex,
-                  item: { type: "web_search_call", id: wsItemId2, status: "in_progress" },
-                });
-                currentWebSearch = { itemId: wsItemId2, eventId: event.id, outputIndex };
-              }
-              closeCurrentWebSearch(event.status ?? "completed", event.queries, event.sources);
-              // Queue this search's sources for the next assistant message (dedup by URL).
-              if (event.sources) {
-                const seen = new Set(pendingWebSources.map(s => s.url));
-                for (const s of event.sources) {
-                  if (!seen.has(s.url)) { seen.add(s.url); pendingWebSources.push(s); }
-                }
-              }
-              break;
-            }
             case "done": {
               if (currentMsg) closeCurrentMessage();
               if (currentReasoning) closeCurrentReasoning();
               if (currentRawReasoning) closeCurrentRawReasoning();
               flushHiddenRawReasoning();
               if (currentToolCall) closeCurrentToolCall();
-              if (currentWebSearch) closeCurrentWebSearch("completed", []);
               // Redacted-only turns (or hidden thinking without a trailing signature event) still
               // need their envelope-only reasoning item so the blocks replay next turn.
               flushHiddenReasoningEnvelope();
@@ -698,7 +633,6 @@ export function bridgeToResponsesSSE(
               if (currentRawReasoning) closeCurrentRawReasoning();
               flushHiddenRawReasoning();
               if (currentToolCall) closeCurrentToolCall();
-              if (currentWebSearch) closeCurrentWebSearch("failed", []);
               flushHiddenReasoningEnvelope();
               emit("response.incomplete", {
                 response: {
@@ -721,12 +655,8 @@ export function bridgeToResponsesSSE(
               if (currentRawReasoning) closeCurrentRawReasoning();
               flushHiddenRawReasoning();
               if (currentToolCall) closeCurrentToolCall();
-              if (currentWebSearch) closeCurrentWebSearch("failed", []);
               const failure = adapterFailureFromEvent(event);
               emit("response.failed", {
-                // Goose deserializes response.failed.error at the event top level. Preserve the
-                // response snapshot as well for Responses clients that consume that shape.
-                error: failure.error,
                 response: {
                   ...responseSnapshot("failed", finishedItems),
                   // Partial consumption from a mid-stream upstream failure: surfaced so the request
@@ -752,14 +682,11 @@ export function bridgeToResponsesSSE(
       } catch (err) {
         if (!terminated) {
           flushHiddenRawReasoning();
-          if (currentWebSearch) closeCurrentWebSearch("failed", []);
-          const error = responseError(500, "proxy_error", err instanceof Error ? err.message : String(err));
           emit("response.failed", {
-            error,
             response: {
               ...responseSnapshot("failed", finishedItems),
-              error,
-              last_error: error,
+              error: responseError(500, "proxy_error", err instanceof Error ? err.message : String(err)),
+              last_error: responseError(500, "proxy_error", err instanceof Error ? err.message : String(err)),
             },
           });
           reportTerminal("failed");
@@ -784,7 +711,6 @@ export function bridgeToResponsesSSE(
         if (currentRawReasoning) closeCurrentRawReasoning();
         flushHiddenRawReasoning();
         if (currentToolCall) closeCurrentToolCall();
-        if (currentWebSearch) closeCurrentWebSearch("failed", []);
         emit("response.incomplete", {
           response: {
             ...responseSnapshot("incomplete", finishedItems),
@@ -812,14 +738,32 @@ export function bridgeToResponsesSSE(
         gated = true;
         beat = setInterval(() => {
           if (closed || gated) return;
-          if (activity) { activity = false; stallTicks = 0; return; }
-          if (++stallTicks >= maxStallTicks) {
+          const checkedAt = now();
+          const silenceMs = checkedAt - lastAdapterEventAt;
+          if (silenceMs >= stallTimeoutMs / 2 && !stallWarned) {
+            // Halfway to cancelling the turn. A healthy adapter heartbeats far more often than
+            // this, so reaching here at all means a keep-alive gap that should be found before it
+            // costs a user their turn.
+            stallWarned = true;
+            console.warn(
+              `[bridge] upstream silence halfway to the stall budget model=${modelId}`
+              + ` response=${responseId} stallSec=${stallSec} adapterEvents=${adapterEventCount}`
+              + ` lastEvent=${lastAdapterEventType} sinceLastEventMs=${silenceMs}`,
+            );
+          }
+          if (silenceMs >= stallTimeoutMs) {
+            console.error(
+              `[bridge] upstream_stall_timeout model=${modelId} response=${responseId}`
+              + ` stallSec=${stallSec} adapterEvents=${adapterEventCount}`
+              + ` lastEvent=${lastAdapterEventType} sinceLastEventMs=${silenceMs}`
+              + ` sinceStreamStartMs=${checkedAt - streamStartedAt}`
+              + ` iteratorStarted=${iteratorStarted} upstreamDone=${upstreamDone} emittedFrames=${emittedFrames}`,
+            );
             if (currentMsg) closeCurrentMessage();
             if (currentReasoning) closeCurrentReasoning();
             if (currentRawReasoning) closeCurrentRawReasoning();
             flushHiddenRawReasoning();
             if (currentToolCall) closeCurrentToolCall();
-            if (currentWebSearch) closeCurrentWebSearch("failed", []);
             emit("response.incomplete", {
               response: {
                 ...responseSnapshot("incomplete", finishedItems),
@@ -935,9 +879,6 @@ export function buildResponseJSON(
   let currentToolCallId = "";
   let currentToolCallName = "";
   let currentToolCallArgs = "";
-  // Web-search citations awaiting the next assistant message (attached as url_citation annotations).
-  let pendingWebSources: { url: string; title?: string }[] = [];
-
   const freeformInput = (args: string): string => {
     try { const o = JSON.parse(args); if (o && typeof o.input === "string") return o.input; } catch { /* raw */ }
     return args;
@@ -948,13 +889,9 @@ export function buildResponseJSON(
 
   const flushText = () => {
     if (!currentText) return;
-    const annotations = pendingWebSources.map(s => ({
-      type: "url_citation", url: s.url, ...(s.title ? { title: s.title } : {}), start_index: 0, end_index: 0,
-    }));
-    pendingWebSources = [];
     output.push({
       type: "message", id: `msg_${uuid()}`, role: "assistant", status: "completed",
-      content: [{ type: "output_text", text: currentText, annotations }],
+      content: [{ type: "output_text", text: currentText, annotations: [] }],
       ...(currentTextPhase ? { phase: currentTextPhase } : {}),
     });
     currentText = "";
@@ -1020,6 +957,7 @@ export function buildResponseJSON(
         call_id: currentToolCallId, name: realName,
         arguments: currentToolCallArgs || "{}", status: "completed",
         ...(ns ? { namespace: ns } : {}),
+        ...plaintextCollaborationFields(ns, realName),
       });
     }
     currentToolCallId = "";
@@ -1084,27 +1022,6 @@ export function buildResponseJSON(
       case "tool_call_end":
         flushToolCall();
         break;
-      case "web_search_call_begin":
-        // Batch/non-streaming output has no in_progress phase to animate — the search cell is a
-        // single finalized item, emitted on `end`. Begin is a no-op here.
-        break;
-      case "web_search_call_end":
-        if (currentText) flushText();
-        if (currentSummaryReasoning) flushSummaryReasoning();
-        if (currentRawReasoning) flushRawReasoning();
-        flushToolCall();
-        output.push({
-          type: "web_search_call", id: `ws_${uuid()}`, status: e.status ?? "completed",
-          action: webSearchAction(e.queries),
-          ...(e.sources && e.sources.length > 0 ? { sources: e.sources } : {}),
-        });
-        if (e.sources) {
-          const seen = new Set(pendingWebSources.map(s => s.url));
-          for (const s of e.sources) {
-            if (!seen.has(s.url)) { seen.add(s.url); pendingWebSources.push(s); }
-          }
-        }
-        break;
       case "error":
         errorEvent = e;
         usage = e.usage ?? usage;
@@ -1126,8 +1043,8 @@ export function buildResponseJSON(
   flushSummaryReasoning();
   flushRawReasoning();
   flushToolCall();
-  // A truncated turn must never be installed as replacement history: emit the
-  // compaction item only when the turn actually completed (#422).
+  // A truncated turn must never become replacement history. Emit a compaction item only after
+  // authoritative turn completion.
   if (options?.compaction && !errorEvent && !incompleteEvent && stopReason !== "max_tokens") {
     output.push({ type: "compaction", id: `cmp_${uuid()}`, encrypted_content: encodeCompactionSummary(compactionText) });
   }
@@ -1143,7 +1060,6 @@ export function buildResponseJSON(
     created_at: Math.floor(Date.now() / 1000),
     status,
     model: modelId, output,
-    error: null,
     ...(endTurn !== undefined ? { end_turn: endTurn } : {}),
     ...(failure ? { error: failure.error, last_error: failure.error } : {}),
     ...(errorEvent?.retryable !== undefined ? { retryable: errorEvent.retryable } : {}),

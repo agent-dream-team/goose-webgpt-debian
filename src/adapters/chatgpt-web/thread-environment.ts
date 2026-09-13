@@ -1,14 +1,24 @@
 import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { atomicWriteFile } from "../../config";
+import { getCodexHome } from "../../codex-integration-shared";
 import type { CodexParsedRequest } from "../../types";
 import {
   extractChatGptTurnEnvironment,
+  extractChatGptCompactionSourceRevision,
+  extractChatGptContinuationEnvironmentClaim,
   extractChatGptTurnIdentity,
+  extractChatGptThreadSpawnLineage,
+  extractChatGptRootThreadMetadata,
+  hasCurrentChatGptEnvironmentContext,
+  hasRawChatGptEnvironmentContext,
+  unattributedChatGptEnvironmentMessages,
+  isChatGptCompactionContinuation,
   MissingTrustedCodexEnvironmentError,
   type ChatGptSandboxPolicy,
   type ChatGptTurnEnvironment,
 } from "./environment";
+import { resolveCurrentCodexRolloutEnvironment } from "./codex-rollout-environment";
 
 interface StoredThreadEnvironment {
   cwd: string;
@@ -98,11 +108,6 @@ function validateStoredEnvironment(value: unknown): StoredThreadEnvironment {
 }
 
 function authority(environment: ChatGptTurnEnvironment, updatedAt: number): StoredThreadEnvironment {
-  if (environment.cwd === undefined || environment.sandboxPolicy === undefined) {
-    // This store only ever carries trusted native Codex authority (see class doc comment); a
-    // standalone Goose environment, which supplies neither field, must never reach here.
-    throw new Error("ChatGPT thread environment store requires a trusted cwd and sandboxPolicy");
-  }
   return {
     cwd: environment.cwd,
     roots: environment.roots,
@@ -110,6 +115,19 @@ function authority(environment: ChatGptTurnEnvironment, updatedAt: number): Stor
     sandboxPolicy: environment.sandboxPolicy,
     updatedAt,
   };
+}
+
+function sameAuthority(left: ChatGptTurnEnvironment, right: ChatGptTurnEnvironment): boolean {
+  const samePaths = (a: string[], b: string[]): boolean => {
+    const expected = new Set(b.map(pathIdentity));
+    return a.length === expected.size && a.every(path => expected.has(pathIdentity(path)));
+  };
+  return pathIdentity(left.cwd) === pathIdentity(right.cwd)
+    && samePaths(left.roots, right.roots)
+    && samePaths(left.writableRoots, right.writableRoots)
+    && left.sandboxPolicy.type === right.sandboxPolicy.type
+    && (left.sandboxPolicy.type === "dangerFullAccess" || (right.sandboxPolicy.type !== "dangerFullAccess"
+      && left.sandboxPolicy.networkAccess === right.sandboxPolicy.networkAccess));
 }
 
 /**
@@ -124,6 +142,8 @@ export class ChatGptThreadEnvironmentStore {
   constructor(
     private readonly path?: string,
     private readonly now: () => number = Date.now,
+    private readonly codexHome: string = getCodexHome(),
+    private readonly sqliteHome?: string,
   ) {}
 
   resolve(parsed: CodexParsedRequest): ChatGptTurnEnvironment {
@@ -134,15 +154,71 @@ export class ChatGptThreadEnvironmentStore {
       return environment;
     } catch (error) {
       if (!(error instanceof MissingTrustedCodexEnvironmentError) || !identity.threadId) throw error;
-      const stored = this.get(identity.threadId);
-      if (!stored) throw error;
-      return {
-        cwd: stored.cwd,
-        roots: stored.roots,
-        writableRoots: stored.writableRoots,
-        sandboxPolicy: stored.sandboxPolicy,
+      const hasCurrentContext = hasCurrentChatGptEnvironmentContext(parsed);
+      const lineage = extractChatGptThreadSpawnLineage(parsed);
+      const currentCompaction = hasCurrentContext && isChatGptCompactionContinuation(parsed);
+      const historicalMessages = hasCurrentContext && !currentCompaction && lineage
+        ? unattributedChatGptEnvironmentMessages(parsed) : undefined;
+      if (hasCurrentContext && !currentCompaction && !historicalMessages) throw error;
+      const currentClaim = currentCompaction ? extractChatGptContinuationEnvironmentClaim(parsed) : undefined;
+      const rolloutIdentity = lineage ?? extractChatGptRootThreadMetadata(parsed);
+      // Automatic compaction has a current turn_context; standalone compaction has only its
+      // source turn_context. Either must be the latest native record, never an arbitrary ancestor.
+      const compactionSourceTurnId = parsed._compactionRequest
+        ? extractChatGptCompactionSourceRevision(parsed).turnId : undefined;
+      if (rolloutIdentity && identity.turnId) {
+        const rolloutEnvironment = resolveCurrentCodexRolloutEnvironment({
+          codexHome: this.codexHome,
+          ...(this.sqliteHome ? { sqliteHome: this.sqliteHome } : {}),
+          lineage: rolloutIdentity,
+          turnId: identity.turnId,
+          ...(compactionSourceTurnId ? { compactionSourceTurnId } : {}),
+          ...(historicalMessages ? { historicalEnvironmentMessages: historicalMessages } : {}),
+          tools: parsed.context.tools,
+        });
+        if (rolloutEnvironment) {
+          if (currentClaim && !sameAuthority(currentClaim, rolloutEnvironment)) {
+            throw new Error("Compaction continuation environment conflicts with its current Codex rollout");
+          }
+          this.set(rolloutIdentity.threadId, rolloutEnvironment);
+          return rolloutEnvironment;
+        }
+      }
+      // Only a current native rollout can supersede an unrecognized historical envelope. Without
+      // that proof, do not turn arbitrary history or an invalid update into cached authority.
+      if (hasRawChatGptEnvironmentContext(parsed)) throw error;
+      const sameThread = this.get(identity.threadId);
+      if (sameThread) return {
+        cwd: sameThread.cwd,
+        roots: sameThread.roots,
+        writableRoots: sameThread.writableRoots,
+        sandboxPolicy: sameThread.sandboxPolicy,
         tools: parsed.context.tools ?? [],
       };
+
+      if (!lineage) throw error;
+      const parent = this.get(lineage.parentThreadId);
+      if (!parent) throw error;
+      if (lineage.sandboxType !== parent.sandboxPolicy.type) {
+        throw new Error("ChatGPT Web subagent sandbox metadata conflicts with its trusted parent thread");
+      }
+      if (lineage.workspaceRoots.length > 0 && !lineage.workspaceRoots.some(root => contains(root, parent.cwd))) {
+        throw new Error("ChatGPT Web subagent workspace metadata does not contain its trusted parent cwd");
+      }
+      if (lineage.workspaceRoots.some(root => !parent.roots.some(parentRoot => (
+        contains(parentRoot, root) || contains(root, parentRoot)
+      )))) {
+        throw new Error("ChatGPT Web subagent workspace metadata conflicts with its trusted parent roots");
+      }
+      const inherited: ChatGptTurnEnvironment = {
+        cwd: parent.cwd,
+        roots: parent.roots,
+        writableRoots: parent.writableRoots,
+        sandboxPolicy: parent.sandboxPolicy,
+        tools: parsed.context.tools ?? [],
+      };
+      this.set(lineage.threadId, inherited);
+      return inherited;
     }
   }
 

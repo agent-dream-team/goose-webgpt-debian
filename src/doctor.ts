@@ -6,8 +6,12 @@ import { inspectCodexIntegration } from "./codex-integration";
 import { browserLoginStateExists, loginVerificationMarkerPath } from "./browser-login";
 import { getServiceStatus } from "./service";
 import { tunnelStatus } from "./tunnel";
-import { getTunnelServiceRuntimeStatus, getTunnelServiceStatus } from "./tunnel-service";
-import { inspectLauncherBrowserHost, readLauncherBrowserHostDescriptor } from "./launcher-browser-host";
+import { getTunnelServiceStatus } from "./tunnel-service";
+import {
+  inspectLauncherBrowserHost,
+  inspectLauncherBrowserHostLiveness,
+  readLauncherBrowserHostDescriptor,
+} from "./launcher-browser-host";
 import { processRunning } from "./process";
 
 export type CheckStatus = "ok" | "warning" | "error";
@@ -106,12 +110,18 @@ export async function runDoctor(): Promise<DoctorReport> {
 
   if (config.browserHost === "launcher") {
     try {
-      const descriptor = readLauncherBrowserHostDescriptor(config.browserHostDescriptorPath!);
-      await inspectLauncherBrowserHost(config.browserHostDescriptorPath!, { timeoutMs: 30_000 });
+      const descriptor = config.browserInteractionMode === "manual"
+        ? await inspectLauncherBrowserHostLiveness(config.browserHostDescriptorPath!, { timeoutMs: 5_000 })
+        : readLauncherBrowserHostDescriptor(config.browserHostDescriptorPath!);
+      if (config.browserInteractionMode === "automatic") {
+        await inspectLauncherBrowserHost(config.browserHostDescriptorPath!, { timeoutMs: 30_000 });
+      }
       checks.push({
         id: "browser-host",
         status: "ok",
-        message: `Embedded launcher browser is authenticated and reachable (pid ${descriptor.pid})`,
+        message: config.browserInteractionMode === "manual"
+          ? `Embedded launcher browser is reachable for Zero Risk (pid ${descriptor.pid})`
+          : `Embedded launcher browser is authenticated and reachable (pid ${descriptor.pid})`,
       });
     } catch (error) {
       checks.push({
@@ -134,7 +144,7 @@ export async function runDoctor(): Promise<DoctorReport> {
     } else if (!secureFile(loginVerificationMarkerPath(config.storageStatePath))) {
       checks.push({ id: "login", status: "error", message: "ChatGPT login verification marker is readable by other users" });
     } else {
-      checks.push({ id: "login", status: "ok", message: "ChatGPT login state was verified in a fresh runtime context" });
+      checks.push({ id: "login", status: "ok", message: "ChatGPT login state has authenticated browser evidence" });
     }
   }
 
@@ -195,9 +205,7 @@ export async function runDoctor(): Promise<DoctorReport> {
         ? { id: "tunnel-service", status: "ok", message: "macOS tunnel service is installed, loaded, and running" }
         : { id: "tunnel-service", status: "error", message: "macOS tunnel service is not fully running", detail: JSON.stringify(tunnelService) });
     }
-    const runtime = config.browserHost === "launcher"
-      ? tunnelStatus(config)
-      : await getTunnelServiceRuntimeStatus(config, tunnelService);
+    const runtime = tunnelStatus(config);
     checks.push(runtime.ok
       ? { id: "tunnel-runtime", status: "ok", message: "Tunnel runtime reports healthy and ready" }
       : { id: "tunnel-runtime", status: "error", message: "Tunnel runtime is not ready", detail: runtime.detail });
@@ -205,7 +213,7 @@ export async function runDoctor(): Promise<DoctorReport> {
       id: "connector",
       status: "warning",
       message: `Local checks cannot prove that ChatGPT connector ${JSON.stringify(config.appName)} is attached to this tunnel`,
-      detail: "Verify it once at https://chatgpt.com/#settings/Connectors while the tunnel is ready.",
+      detail: "Verify it once at https://chatgpt.com/#settings/Plugins while the tunnel is ready.",
     });
   } else {
     checks.push({ id: "tools", status: "warning", message: "Browser-only mode intentionally has no local tools or MCP tunnel" });

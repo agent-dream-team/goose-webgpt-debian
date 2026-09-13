@@ -1,1055 +1,168 @@
-import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname } from "node:path";
 import type { AppConfig } from "./config";
-import { atomicWriteFile, expandUserPath, getConfigDir } from "./config";
+import { getConfigPath, loadConfig, saveConfig } from "./config";
+import { installCodexInterruptHook, installCodexInterruptHookCommand } from "./codex-interrupt-hook";
 import {
-  CHATGPT_WEB_MODEL_ROUTES,
-  requireChatGptWebModelRoute,
-  resolveChatGptWebContextWindow,
-  type ChatGptWebModelRoute,
-} from "./chatgpt-web-models";
+  CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
+  getCodexConfigPath,
+  getCodexJournalPath,
+  getCodexJournalRecoveryPath,
+  getCodexModelsCachePath,
+  restoreFileSnapshot,
+  routeUrl,
+  sha256,
+  snapshotFile,
+  writeFileSnapshot,
+  writeIntegrationState,
+} from "./codex-integration-shared";
+import type {
+  AnyCodexIntegrationJournal,
+  CodexIntegrationJournal,
+  InstallCodexIntegrationOptions,
+  LegacyCodexIntegrationJournalV4,
+  LegacyCodexIntegrationJournalV5,
+  LegacyCodexIntegrationJournalV6,
+  LegacyCodexIntegrationJournalV7,
+  LegacyCodexIntegrationJournalV8,
+  LegacyCodexIntegrationJournalV9,
+  SetCodexIntegrationActiveResult,
+  UninstallCodexIntegrationResult,
+} from "./codex-integration-shared";
+import { assertJournalTargetsConfig, readJournal } from "./codex-integration-journal";
+import {
+  findTopLevelAssignment,
+  installCompatibilityV1Features,
+  splitLines,
+  textFormat,
+} from "./codex-integration-document";
+import {
+  assertPreservedPreviousAssignments,
+  assertPreservedPreviousRealtimeAssignment,
+  installRoute,
+  managedJournalIsActive,
+  replacementBaseline,
+  restoreLegacyV2,
+  restoreManagedRoute,
+  verifyInstalledRoute,
+  verifyManagedJournalState,
+  verifyRestoredRoute,
+} from "./codex-integration-route";
 
-const MANAGED_COMMENT = "# Managed by codex-chatgpt-web; `codex-chatgpt-web uninstall` restores prior values.";
-const MANAGED_REMOTE_COMPACTION_LINE =
-  "remote_compaction_v2 = false # Managed by codex-chatgpt-web: bounds retained Web image history.";
-const MANAGED_MULTI_AGENT_LINE =
-  "multi_agent = true # Managed by codex-chatgpt-web: enables routed Web subagents.";
-const MANAGED_MULTI_AGENT_V2_LINE =
-  "multi_agent_v2 = false # Managed by codex-chatgpt-web: keeps routed Web subagent payloads readable.";
-const MANAGED_MULTI_AGENT_V2_TABLE_LINE =
-  "enabled = false # Managed by codex-chatgpt-web: keeps routed Web subagent payloads readable.";
-const GOOSE_CUSTOM_PROVIDER_NAME = "custom_chatgpt_web__local_1";
-
-interface PreviousAssignment {
-  present: boolean;
-  rawLine?: string;
-  value?: string;
-  index?: number;
+function installConfiguredRoute(
+  baseline: string,
+  installedUrl: string,
+  config: Pick<AppConfig, "subagentProtocol"> & (
+    Pick<AppConfig, "runtimeCommand"> | { interruptHookCommand: string }
+  ),
+  replaceExistingRoute: boolean,
+  replaceExistingRealtimeRoute: boolean,
+): {
+  text: string;
+  previous: CodexIntegrationJournal["previous"];
+  previousRealtimeWebrtcCallBaseUrl: CodexIntegrationJournal["previousRealtimeWebrtcCallBaseUrl"];
+  previousMultiAgent?: CodexIntegrationJournal["previousMultiAgent"];
+  previousMultiAgentV2?: CodexIntegrationJournal["previousMultiAgentV2"];
+  previousAgentMaxDepth?: CodexIntegrationJournal["previousAgentMaxDepth"];
+  installedAgentMaxDepth?: number;
+  interruptHook: CodexIntegrationJournal["interruptHook"];
+} {
+  const route = installRoute(
+    baseline,
+    installedUrl,
+    replaceExistingRoute,
+    replaceExistingRealtimeRoute,
+  );
+  const configured = config.subagentProtocol === "compatibility-v1"
+    ? (() => {
+        const features = installCompatibilityV1Features(route.text);
+        return {
+          text: features.text,
+          previous: route.previous,
+          previousRealtimeWebrtcCallBaseUrl: route.previousRealtimeWebrtcCallBaseUrl,
+          previousMultiAgent: features.previousMultiAgent,
+          previousMultiAgentV2: features.previousMultiAgentV2,
+          previousAgentMaxDepth: features.previousAgentMaxDepth,
+          installedAgentMaxDepth: features.installedAgentMaxDepth,
+        };
+      })()
+    : route;
+  const hook = "interruptHookCommand" in config
+    ? installCodexInterruptHookCommand(configured.text, getCodexConfigPath(), config.interruptHookCommand)
+    : installCodexInterruptHook(configured.text, getCodexConfigPath(), config);
+  return { ...configured, text: hook.text, interruptHook: hook.installed };
 }
 
-type ManagedAssignmentKey = "openai_base_url" | "model_provider" | "model_catalog_json";
-
-interface PreviousFeatureAssignment extends PreviousAssignment {
-  tablePresent: boolean;
-  tableName?: "features" | "features.multi_agent_v2";
+function journalProtocol(journal: Exclude<AnyCodexIntegrationJournal, { version: 2 }>): AppConfig["subagentProtocol"] {
+  return journal.version === 8 || journal.version === 9 || journal.version === 10
+    ? journal.installed.subagent_protocol
+    : "native";
 }
 
-export interface CodexIntegrationJournal {
-  version: 6;
-  active: boolean;
-  configPath: string;
-  installed: {
-    openai_base_url: string;
-    remote_compaction_v2: false;
-    multi_agent: true;
-    multi_agent_v2: false;
-  };
-  previous: Record<ManagedAssignmentKey, PreviousAssignment>;
-  previousRemoteCompactionV2: PreviousFeatureAssignment;
-  previousMultiAgent: PreviousFeatureAssignment;
-  previousMultiAgentV2: PreviousFeatureAssignment;
-  gooseCustomProvider?: GooseProviderSnapshot;
-  format?: {
-    lineEnding: "\n" | "\r\n";
-    trailingNewline: boolean;
-  };
+export {
+  getCodexConfigPath,
+  getCodexHome,
+  getCodexJournalPath,
+  getCodexJournalRecoveryPath,
+  getCodexModelsCachePath,
+} from "./codex-integration-shared";
+export { readCodexModelContextOverride } from "./codex-integration-document";
+export type {
+  CodexIntegrationJournal,
+  CodexModelContextOverride,
+  InstallCodexIntegrationOptions,
+  SetCodexIntegrationActiveResult,
+  UninstallCodexIntegrationResult,
+} from "./codex-integration-shared";
+
+export function readCodexSubagentProtocol(
+  fallback: AppConfig["subagentProtocol"] = "compatibility-v1",
+): AppConfig["subagentProtocol"] {
+  const journal = readJournal();
+  return journal?.version === 8 || journal?.version === 9 || journal?.version === 10
+    ? journal.installed.subagent_protocol
+    : fallback;
 }
 
-interface LegacyCodexIntegrationJournalV5 {
-  version: 5;
-  active: boolean;
-  configPath: string;
-  installed: {
-    openai_base_url: string;
-    remote_compaction_v2: false;
-    multi_agent: true;
-  };
-  previous: Record<ManagedAssignmentKey, PreviousAssignment>;
-  previousRemoteCompactionV2: PreviousFeatureAssignment;
-  previousMultiAgent: PreviousFeatureAssignment;
-  gooseCustomProvider?: GooseProviderSnapshot;
-  format?: {
-    lineEnding: "\n" | "\r\n";
-    trailingNewline: boolean;
-  };
-}
-
-interface LegacyCodexIntegrationJournalV4 {
-  version: 4;
-  active: boolean;
-  configPath: string;
-  installed: {
-    openai_base_url: string;
-  };
-  previous: Record<ManagedAssignmentKey, PreviousAssignment>;
-  gooseCustomProvider?: GooseProviderSnapshot;
-  format?: {
-    lineEnding: "\n" | "\r\n";
-    trailingNewline: boolean;
-  };
-}
-
-interface LegacyCodexIntegrationJournalV3 {
-  version: 3;
-  configPath: string;
-  installed: {
-    openai_base_url: string;
-  };
-  previous: Record<ManagedAssignmentKey, PreviousAssignment>;
-  gooseCustomProvider?: GooseProviderSnapshot;
-  format?: {
-    lineEnding: "\n" | "\r\n";
-    trailingNewline: boolean;
-  };
-}
-
-interface LegacyCodexIntegrationJournal {
-  version: 2;
-  configPath: string;
-  catalogPath: string;
-  catalogSha256: string;
-  providerBlock: string;
-  installed: {
-    model_provider: string;
-    model_catalog_json: string;
-  };
-  previous: {
-    model_provider: PreviousAssignment;
-    model_catalog_json: PreviousAssignment;
-  };
-  gooseCustomProvider?: GooseProviderSnapshot;
-}
-
-type ManagedRouteJournal =
-  | CodexIntegrationJournal
-  | LegacyCodexIntegrationJournalV5
-  | LegacyCodexIntegrationJournalV4
-  | LegacyCodexIntegrationJournalV3;
-type AnyCodexIntegrationJournal = ManagedRouteJournal | LegacyCodexIntegrationJournal;
-
-interface FileSnapshot {
-  path: string;
-  exists: boolean;
-  data?: Buffer;
-}
-
-interface GooseProviderSnapshot {
-  present: boolean;
-  rawText?: string;
-}
-
-interface GooseCustomProviderModel {
-  name: string;
-  context_limit: number;
-  input_token_cost: null;
-  output_token_cost: null;
-  currency: null;
-  supports_cache_control: null;
-  reasoning: boolean;
-}
-
-interface GooseCustomProviderConfig {
-  name: string;
-  engine: "openai";
-  display_name: string;
-  description: string;
-  api_key_env: string;
-  base_url: string;
-  models: GooseCustomProviderModel[];
-  headers: null;
-  timeout_seconds: null;
-  supports_streaming: true;
-  requires_auth: false;
-  catalog_provider_id: null;
-  base_path: string;
-  env_vars: null;
-  dynamic_models: null;
-  skip_canonical_filtering: false;
-  model_doc_link: null;
-  setup_steps: [];
-  fast_model: null;
-  preserves_thinking: false;
-}
-
-export interface InstallCodexIntegrationOptions {
-  replaceExistingRoute?: boolean;
-}
-
-export interface UninstallCodexIntegrationResult {
-  changed: boolean;
-}
-
-export interface SetCodexIntegrationActiveResult {
-  changed: boolean;
-  active: boolean;
-}
-
-export interface CodexModelContextOverride {
-  model: string;
-  contextWindow: number;
-}
-
-export function getCodexHome(): string {
-  const configured = process.env.CODEX_HOME?.trim();
-  return resolve(expandUserPath(configured || join(homedir(), ".codex")));
-}
-
-export function getCodexConfigPath(): string {
-  return join(getCodexHome(), "config.toml");
-}
-
-export function getCodexModelsCachePath(): string {
-  return join(getCodexHome(), "models_cache.json");
-}
-
-export function getCodexJournalPath(): string {
-  return join(getConfigDir(), "codex", "integration-journal.json");
-}
-
-function getGooseConfigDir(): string {
-  const configured = process.env.GOOSE_CONFIG_HOME?.trim();
-  return resolve(expandUserPath(configured || join(homedir(), ".config/goose")));
-}
-
-function getGooseCustomProviderPath(): string {
-  return join(getGooseConfigDir(), "custom_providers", `${GOOSE_CUSTOM_PROVIDER_NAME}.json`);
-}
-
-function routeUrl(config: AppConfig): string {
-  return `http://${config.host}:${config.port}/v1`;
-}
-
-function sha256(value: string | Uint8Array): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-function snapshotFile(path: string): FileSnapshot {
-  return existsSync(path)
-    ? { path, exists: true, data: readFileSync(path) }
-    : { path, exists: false };
-}
-
-function restoreFileSnapshot(snapshot: FileSnapshot): void {
-  if (snapshot.exists) {
-    if (!snapshot.data) throw new Error(`File snapshot is missing data: ${snapshot.path}`);
-    atomicWriteFile(snapshot.path, snapshot.data);
-  } else {
-    rmSync(snapshot.path, { force: true });
+export function setCodexSubagentProtocol(
+  config: AppConfig,
+  protocol: AppConfig["subagentProtocol"],
+): CodexIntegrationJournal {
+  const status = inspectCodexIntegration();
+  if (!status.installed) throw new Error("Codex integration is not installed; run setup first");
+  if (!status.active) {
+    throw new Error("Codex integration is disconnected; reconnect it before changing the subagent protocol");
   }
-}
-
-function snapshotGooseCustomProviderConfig(): GooseProviderSnapshot {
-  const path = getGooseCustomProviderPath();
-  return existsSync(path)
-    ? { present: true, rawText: readFileSync(path, "utf8") }
-    : { present: false };
-}
-
-function gooseCustomProviderModels(): GooseCustomProviderModel[] {
-  return CHATGPT_WEB_MODEL_ROUTES.map(route => ({
-    name: route.slug,
-    context_limit: resolveChatGptWebContextWindow(route.adapterEffort),
-    input_token_cost: null,
-    output_token_cost: null,
-    currency: null,
-    supports_cache_control: null,
-    reasoning: false,
-  }));
-}
-
-function gooseCustomProviderConfig(): GooseCustomProviderConfig {
-  return {
-    name: GOOSE_CUSTOM_PROVIDER_NAME,
-    engine: "openai",
-    display_name: "ChatGPT Web (local)",
-    description: "Custom ChatGPT Web (local) provider",
-    api_key_env: "",
-    base_url: "http://127.0.0.1:17841",
-    models: gooseCustomProviderModels(),
-    headers: null,
-    timeout_seconds: null,
-    supports_streaming: true,
-    requires_auth: false,
-    catalog_provider_id: null,
-    base_path: "v1/responses",
-    env_vars: null,
-    dynamic_models: null,
-    skip_canonical_filtering: false,
-    model_doc_link: null,
-    setup_steps: [],
-    fast_model: null,
-    preserves_thinking: false,
-  };
-}
-
-function writeGooseCustomProviderConfig(): void {
-  const path = getGooseCustomProviderPath();
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  atomicWriteFile(path, `${JSON.stringify(gooseCustomProviderConfig(), null, 2)}\n`);
-}
-
-function restoreGooseCustomProviderConfig(snapshot: GooseProviderSnapshot): void {
-  const path = getGooseCustomProviderPath();
-  if (snapshot.present) {
-    if (snapshot.rawText === undefined) throw new Error("Goose provider snapshot is missing data");
-    atomicWriteFile(path, snapshot.rawText);
-    return;
-  }
-  rmSync(path, { force: true });
-}
-
-function journalGooseCustomProviderSnapshot(
-  journal: { gooseCustomProvider?: GooseProviderSnapshot },
-  fallback: GooseProviderSnapshot,
-): GooseProviderSnapshot {
-  return journal.gooseCustomProvider ?? fallback;
-}
-
-function writeFilesWithCompensation(
-  writes: Array<{ path: string; data: string | Uint8Array }>,
-  removals: string[] = [],
-): void {
-  const paths = [...new Set([...writes.map(write => write.path), ...removals])];
-  const snapshots = paths.map(snapshotFile);
+  const nextConfig = { ...config, subagentProtocol: protocol };
+  // The runtime catalog and Codex feature surface are two halves of one protocol selection. If
+  // either write fails, restore every participant so the next launcher/Codex restart cannot load a
+  // split V1/V2 state.
+  const snapshots = [
+    getConfigPath(),
+    getCodexConfigPath(),
+    getCodexModelsCachePath(),
+    getCodexJournalPath(),
+    getCodexJournalRecoveryPath(),
+  ].map(path => snapshotFile(path, { followSymlink: path === getCodexConfigPath() }));
   try {
-    for (const write of writes) atomicWriteFile(write.path, write.data);
-    for (const removal of removals) rmSync(removal, { force: true });
+    const journal = installCodexIntegration(nextConfig);
+    saveConfig(nextConfig);
+    return journal;
   } catch (error) {
     const rollbackFailures: string[] = [];
     for (const snapshot of [...snapshots].reverse()) {
       try {
         restoreFileSnapshot(snapshot);
       } catch (rollbackError) {
-        rollbackFailures.push(`${snapshot.path}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`);
-      }
-    }
-    const primary = error instanceof Error ? error.message : String(error);
-    throw new Error(
-      rollbackFailures.length > 0
-        ? `${primary}; Codex integration rollback also failed: ${rollbackFailures.join("; ")}`
-        : primary,
-    );
-  }
-}
-
-function firstTableIndex(lines: string[]): number {
-  const index = lines.findIndex(line => /^\s*\[\[?[^\]]+\]\]?\s*(?:#.*)?$/.test(line));
-  return index < 0 ? lines.length : index;
-}
-
-function assignmentRegex(key: string): RegExp {
-  return new RegExp(`^\\s*${key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=\\s*(.+?)\\s*$`);
-}
-
-function stripTomlComment(value: string): string {
-  let quote: "'" | '"' | undefined;
-  let escaped = false;
-  for (let index = 0; index < value.length; index += 1) {
-    const char = value[index]!;
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (quote === '"' && char === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = undefined;
-      continue;
-    }
-    if (char === '"' || char === "'") {
-      quote = char;
-      continue;
-    }
-    if (char === "#") return value.slice(0, index).trimEnd();
-  }
-  return value.trimEnd();
-}
-
-function decodeTomlString(raw: string, key: string): string {
-  const value = stripTomlComment(raw).trim();
-  if (value.startsWith('"') && value.endsWith('"')) {
-    try {
-      return JSON.parse(value) as string;
-    } catch {
-      throw new Error(`Could not parse ${key} in Codex config`);
-    }
-  }
-  if (value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1);
-  throw new Error(`${key} in Codex config must be a quoted string`);
-}
-
-function findTopLevelAssignment(lines: string[], key: string): PreviousAssignment {
-  const regex = assignmentRegex(key);
-  const matches: PreviousAssignment[] = [];
-  for (let index = 0; index < firstTableIndex(lines); index += 1) {
-    const line = lines[index]!;
-    if (/^\s*#/.test(line)) continue;
-    const match = regex.exec(line);
-    if (match) matches.push({ present: true, rawLine: line, value: decodeTomlString(match[1]!, key), index });
-  }
-  if (matches.length > 1) throw new Error(`Codex config contains duplicate top-level ${key} assignments`);
-  return matches[0] ?? { present: false };
-}
-
-function findTopLevelPositiveInteger(lines: string[], key: string): number | undefined {
-  const regex = assignmentRegex(key);
-  const matches: string[] = [];
-  for (let index = 0; index < firstTableIndex(lines); index += 1) {
-    const line = lines[index]!;
-    if (/^\s*#/.test(line)) continue;
-    const match = regex.exec(line);
-    if (match) matches.push(stripTomlComment(match[1]!).trim());
-  }
-  if (matches.length > 1) throw new Error(`Codex config contains duplicate top-level ${key} assignments`);
-  if (matches.length === 0) return undefined;
-  const normalized = matches[0]!.replaceAll("_", "");
-  if (!/^\d+$/.test(normalized)) throw new Error(`${key} in Codex config must be a positive integer`);
-  const value = Number(normalized);
-  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${key} in Codex config must be a positive integer`);
-  return value;
-}
-
-export function readCodexModelContextOverride(): CodexModelContextOverride | undefined {
-  const path = getCodexConfigPath();
-  if (!existsSync(path)) return undefined;
-  const text = readFileSync(path, "utf8");
-  const lines = splitLines(text);
-  const contextWindow = findTopLevelPositiveInteger(lines, "model_context_window");
-  const model = findTopLevelAssignment(lines, "model").value;
-  if (model && model.startsWith("chatgpt-web/")) {
-    const route = requireChatGptWebModelRoute(model, true);
-    return { model, contextWindow: resolveChatGptWebContextWindow(route.adapterEffort) };
-  }
-  if (contextWindow === undefined || !model) return undefined;
-  return { model, contextWindow };
-}
-
-function assignments(lines: string[]): Record<ManagedAssignmentKey, PreviousAssignment> {
-  return {
-    openai_base_url: findTopLevelAssignment(lines, "openai_base_url"),
-    model_provider: findTopLevelAssignment(lines, "model_provider"),
-    model_catalog_json: findTopLevelAssignment(lines, "model_catalog_json"),
-  };
-}
-
-function textFormat(text: string): NonNullable<CodexIntegrationJournal["format"]> {
-  return {
-    lineEnding: text.includes("\r\n") ? "\r\n" : "\n",
-    trailingNewline: /\r?\n$/.test(text),
-  };
-}
-
-function splitLines(text: string): string[] {
-  return text.length > 0 ? text.replace(/\r?\n$/, "").split(/\r?\n/) : [];
-}
-
-/**
- * The Codex config belongs to the user. Every edit keeps each untouched line byte-for-byte,
- * including its own terminator, so a file with mixed line endings is never normalized.
- */
-interface CodexConfigDocument {
-  lines: string[];
-  endings: string[];
-}
-
-function parseDocument(text: string): CodexConfigDocument {
-  const lines: string[] = [];
-  const endings: string[] = [];
-  const lineBreak = /\r\n|\n|\r/g;
-  let start = 0;
-  let match: RegExpExecArray | null;
-  while ((match = lineBreak.exec(text)) !== null) {
-    lines.push(text.slice(start, match.index));
-    endings.push(match[0]);
-    start = match.index + match[0].length;
-  }
-  if (start < text.length) {
-    lines.push(text.slice(start));
-    endings.push("");
-  }
-  return { lines, endings };
-}
-
-function renderDocument(document: CodexConfigDocument): string {
-  return document.lines.map((line, index) => `${line}${document.endings[index] ?? ""}`).join("");
-}
-
-function dominantLineEnding(document: CodexConfigDocument): string {
-  return document.endings.find(ending => ending.length > 0) ?? "\n";
-}
-
-function insertDocumentLine(document: CodexConfigDocument, index: number, line: string): void {
-  const position = Math.max(0, Math.min(index, document.lines.length));
-  const ending = dominantLineEnding(document);
-  if (position === document.lines.length) {
-    const lastIndex = document.lines.length - 1;
-    const trailing = lastIndex >= 0 ? document.endings[lastIndex]! : ending;
-    if (lastIndex >= 0) document.endings[lastIndex] = ending;
-    document.lines.push(line);
-    document.endings.push(trailing);
-    return;
-  }
-  document.lines.splice(position, 0, line);
-  document.endings.splice(position, 0, document.endings[position] ?? ending);
-}
-
-function removeDocumentLine(document: CodexConfigDocument, index: number): void {
-  if (index < 0 || index >= document.lines.length) return;
-  const wasLast = index === document.lines.length - 1;
-  const trailing = document.endings[index] ?? "";
-  document.lines.splice(index, 1);
-  document.endings.splice(index, 1);
-  if (wasLast && document.endings.length > 0) document.endings[document.endings.length - 1] = trailing;
-}
-
-function removeManagedComment(document: CodexConfigDocument): void {
-  for (let index = document.lines.length - 1; index >= 0; index -= 1) {
-    if (document.lines[index] === MANAGED_COMMENT) removeDocumentLine(document, index);
-  }
-}
-
-interface TomlTableRange {
-  headerIndex: number;
-  endIndex: number;
-}
-
-function findTomlTable(lines: string[], tableName: string): TomlTableRange | undefined {
-  const escaped = tableName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const header = new RegExp(`^\\s*\\[${escaped}\\]\\s*(?:#.*)?$`);
-  const matches = lines
-    .map((line, index) => header.test(line) ? index : -1)
-    .filter(index => index >= 0);
-  if (matches.length > 1) throw new Error(`Codex config contains duplicate [${tableName}] tables`);
-  const headerIndex = matches[0];
-  if (headerIndex === undefined) return undefined;
-  const relativeEnd = lines
-    .slice(headerIndex + 1)
-    .findIndex(line => /^\s*\[\[?[^\]]+\]\]?\s*(?:#.*)?$/.test(line));
-  return {
-    headerIndex,
-    endIndex: relativeEnd < 0 ? lines.length : headerIndex + 1 + relativeEnd,
-  };
-}
-
-function findBooleanAssignmentInTable(
-  lines: string[],
-  tableName: "features" | "features.multi_agent_v2",
-  key: string,
-): PreviousFeatureAssignment {
-  const table = findTomlTable(lines, tableName);
-  if (!table) return { present: false, tablePresent: false, tableName };
-  const regex = assignmentRegex(key);
-  const matches: PreviousAssignment[] = [];
-  for (let index = table.headerIndex + 1; index < table.endIndex; index += 1) {
-    const line = lines[index]!;
-    if (/^\s*#/.test(line)) continue;
-    const match = regex.exec(line);
-    if (!match) continue;
-    const value = stripTomlComment(match[1]!).trim();
-    if (value !== "true" && value !== "false") {
-      throw new Error(`${key} in Codex [${tableName}] must be a boolean`);
-    }
-    matches.push({ present: true, rawLine: line, value, index });
-  }
-  if (matches.length > 1) {
-    throw new Error(`Codex config contains duplicate [${tableName}].${key} assignments`);
-  }
-  return { ...(matches[0] ?? { present: false }), tablePresent: true, tableName };
-}
-
-function findFeatureAssignment(lines: string[], key: string): PreviousFeatureAssignment {
-  return findBooleanAssignmentInTable(lines, "features", key);
-}
-
-function findMultiAgentV2Assignment(lines: string[]): PreviousFeatureAssignment {
-  const scalar = findFeatureAssignment(lines, "multi_agent_v2");
-  const table = findTomlTable(lines, "features.multi_agent_v2");
-  if (scalar.present && table) {
-    throw new Error(
-      "Codex config defines multi_agent_v2 as both [features] scalar and [features.multi_agent_v2] table",
-    );
-  }
-  return table
-    ? findBooleanAssignmentInTable(lines, "features.multi_agent_v2", "enabled")
-    : scalar;
-}
-
-function installBooleanFeature(
-  text: string,
-  key: string,
-  managedLine: string,
-): {
-  text: string;
-  previous: PreviousFeatureAssignment;
-} {
-  const document = parseDocument(text);
-  const previous = findFeatureAssignment(document.lines, key);
-  let table = findTomlTable(document.lines, "features");
-  if (!table) {
-    insertDocumentLine(document, document.lines.length, "[features]");
-    table = findTomlTable(document.lines, "features")!;
-  }
-  const current = findFeatureAssignment(document.lines, key);
-  if (current.index !== undefined) {
-    document.lines[current.index] = managedLine;
-  } else {
-    insertDocumentLine(document, table.endIndex, managedLine);
-  }
-  return { text: renderDocument(document), previous };
-}
-
-function installMultiAgentV2Feature(text: string): {
-  text: string;
-  previous: PreviousFeatureAssignment;
-} {
-  const document = parseDocument(text);
-  const previous = findMultiAgentV2Assignment(document.lines);
-  if (previous.tableName !== "features.multi_agent_v2") {
-    return installBooleanFeature(text, "multi_agent_v2", MANAGED_MULTI_AGENT_V2_LINE);
-  }
-  const table = findTomlTable(document.lines, "features.multi_agent_v2");
-  if (!table) throw new Error("Codex [features.multi_agent_v2] table disappeared during setup");
-  const current = findBooleanAssignmentInTable(
-    document.lines,
-    "features.multi_agent_v2",
-    "enabled",
-  );
-  if (current.index !== undefined) {
-    document.lines[current.index] = MANAGED_MULTI_AGENT_V2_TABLE_LINE;
-  } else {
-    insertDocumentLine(document, table.endIndex, MANAGED_MULTI_AGENT_V2_TABLE_LINE);
-  }
-  return { text: renderDocument(document), previous };
-}
-
-function verifyInstalledBooleanFeature(
-  text: string,
-  key: string,
-  expectedValue: "true" | "false",
-  managedLine: string,
-): void {
-  const current = findFeatureAssignment(splitLines(text), key);
-  if (current.value !== expectedValue || current.rawLine !== managedLine) {
-    throw new Error(
-      `Codex [features].${key} changed after setup; refusing to overwrite the user's newer value`,
-    );
-  }
-}
-
-function verifyInstalledMultiAgentV2Feature(
-  text: string,
-  previous: PreviousFeatureAssignment,
-): void {
-  if (previous.tableName !== "features.multi_agent_v2") {
-    const current = findMultiAgentV2Assignment(splitLines(text));
-    if (current.tableName !== "features"
-      || current.value !== "false"
-      || current.rawLine !== MANAGED_MULTI_AGENT_V2_LINE) {
-      throw new Error(
-        "Codex [features].multi_agent_v2 changed after setup; refusing to overwrite the user's newer value",
-      );
-    }
-    return;
-  }
-  const lines = splitLines(text);
-  if (findFeatureAssignment(lines, "multi_agent_v2").present) {
-    throw new Error(
-      "Codex [features].multi_agent_v2 changed after setup; refusing to overwrite the user's newer value",
-    );
-  }
-  const current = findBooleanAssignmentInTable(lines, "features.multi_agent_v2", "enabled");
-  if (current.value !== "false" || current.rawLine !== MANAGED_MULTI_AGENT_V2_TABLE_LINE) {
-    throw new Error(
-      "Codex [features.multi_agent_v2].enabled changed after setup; refusing to overwrite the user's newer value",
-    );
-  }
-}
-
-function restoreBooleanFeature(
-  text: string,
-  key: string,
-  expectedValue: "true" | "false",
-  managedLine: string,
-  previous: PreviousFeatureAssignment,
-): string {
-  verifyInstalledBooleanFeature(text, key, expectedValue, managedLine);
-  const document = parseDocument(text);
-  const current = findFeatureAssignment(document.lines, key);
-  if (current.index === undefined) throw new Error(`Managed Codex ${key} is missing`);
-  if (previous.present) {
-    if (!previous.rawLine) {
-      throw new Error(`Codex integration journal is missing the prior ${key} line`);
-    }
-    document.lines[current.index] = previous.rawLine;
-  } else {
-    removeDocumentLine(document, current.index);
-    if (!previous.tablePresent) {
-      const table = findTomlTable(document.lines, "features");
-      if (!table) throw new Error("Managed Codex [features] table is missing");
-      const remaining = document.lines
-        .slice(table.headerIndex + 1, table.endIndex)
-        .filter(line => line.trim().length > 0);
-      if (remaining.length === 0) removeDocumentLine(document, table.headerIndex);
-    }
-  }
-  return renderDocument(document);
-}
-
-function restoreMultiAgentV2Feature(
-  text: string,
-  previous: PreviousFeatureAssignment,
-): string {
-  if (previous.tableName !== "features.multi_agent_v2") {
-    return restoreBooleanFeature(
-      text,
-      "multi_agent_v2",
-      "false",
-      MANAGED_MULTI_AGENT_V2_LINE,
-      previous,
-    );
-  }
-  verifyInstalledMultiAgentV2Feature(text, previous);
-  const document = parseDocument(text);
-  const current = findBooleanAssignmentInTable(
-    document.lines,
-    "features.multi_agent_v2",
-    "enabled",
-  );
-  if (current.index === undefined) throw new Error("Managed Codex multi_agent_v2.enabled is missing");
-  if (previous.present) {
-    if (!previous.rawLine) {
-      throw new Error("Codex integration journal is missing the prior multi_agent_v2.enabled line");
-    }
-    document.lines[current.index] = previous.rawLine;
-  } else {
-    removeDocumentLine(document, current.index);
-  }
-  return renderDocument(document);
-}
-
-function installManagedFeatures(text: string): {
-  text: string;
-  previousRemoteCompactionV2: PreviousFeatureAssignment;
-  previousMultiAgent: PreviousFeatureAssignment;
-  previousMultiAgentV2: PreviousFeatureAssignment;
-} {
-  const compaction = installBooleanFeature(
-    text,
-    "remote_compaction_v2",
-    MANAGED_REMOTE_COMPACTION_LINE,
-  );
-  const multiAgent = installBooleanFeature(
-    compaction.text,
-    "multi_agent",
-    MANAGED_MULTI_AGENT_LINE,
-  );
-  const multiAgentV2 = installMultiAgentV2Feature(multiAgent.text);
-  return {
-    text: multiAgentV2.text,
-    previousRemoteCompactionV2: compaction.previous,
-    previousMultiAgent: multiAgent.previous,
-    previousMultiAgentV2: multiAgentV2.previous,
-  };
-}
-
-function verifyInstalledFeatures(
-  text: string,
-  journal: CodexIntegrationJournal | LegacyCodexIntegrationJournalV5,
-): void {
-  verifyInstalledBooleanFeature(
-    text,
-    "remote_compaction_v2",
-    "false",
-    MANAGED_REMOTE_COMPACTION_LINE,
-  );
-  verifyInstalledBooleanFeature(text, "multi_agent", "true", MANAGED_MULTI_AGENT_LINE);
-  if (journal.version === 6) {
-    verifyInstalledMultiAgentV2Feature(text, journal.previousMultiAgentV2);
-  }
-}
-
-function restoreManagedFeatures(
-  text: string,
-  journal: CodexIntegrationJournal | LegacyCodexIntegrationJournalV5,
-): string {
-  const withoutMultiAgentV2 = journal.version === 6
-    ? restoreMultiAgentV2Feature(text, journal.previousMultiAgentV2)
-    : text;
-  const withoutMultiAgent = restoreBooleanFeature(
-    withoutMultiAgentV2,
-    "multi_agent",
-    "true",
-    MANAGED_MULTI_AGENT_LINE,
-    journal.previousMultiAgent,
-  );
-  return restoreBooleanFeature(
-    withoutMultiAgent,
-    "remote_compaction_v2",
-    "false",
-    MANAGED_REMOTE_COMPACTION_LINE,
-    journal.previousRemoteCompactionV2,
-  );
-}
-
-function installIntegrationConfig(
-  text: string,
-  installedUrl: string,
-  replaceExistingRoute: boolean,
-): {
-  text: string;
-  previous: CodexIntegrationJournal["previous"];
-  previousRemoteCompactionV2: PreviousFeatureAssignment;
-  previousMultiAgent: PreviousFeatureAssignment;
-  previousMultiAgentV2: PreviousFeatureAssignment;
-} {
-  const route = installRoute(text, installedUrl, replaceExistingRoute);
-  const features = installManagedFeatures(route.text);
-  return {
-    text: features.text,
-    previous: route.previous,
-    previousRemoteCompactionV2: features.previousRemoteCompactionV2,
-    previousMultiAgent: features.previousMultiAgent,
-    previousMultiAgentV2: features.previousMultiAgentV2,
-  };
-}
-
-function installRoute(
-  text: string,
-  installedUrl: string,
-  replaceExistingRoute: boolean,
-): { text: string; previous: CodexIntegrationJournal["previous"] } {
-  const document = parseDocument(text);
-  const previous = assignments(document.lines);
-  const conflicts = (Object.entries(previous) as Array<[ManagedAssignmentKey, PreviousAssignment]>)
-    .filter(([key, assignment]) => assignment.present
-      && !(key === "model_provider" && assignment.value === "openai"))
-    .map(([key, assignment]) => `${key}=${JSON.stringify(assignment.value)}`);
-  if (conflicts.length > 0 && !replaceExistingRoute) {
-    throw new Error(
-      `Codex already configures model routing (${conflicts.join(", ")}). `
-      + "Rerun with --replace-codex-route to replace it reversibly.",
-    );
-  }
-
-  for (const key of ["model_provider", "model_catalog_json"] as const) {
-    const location = findTopLevelAssignment(document.lines, key);
-    if (location.index !== undefined) removeDocumentLine(document, location.index);
-  }
-  const currentBaseUrl = findTopLevelAssignment(document.lines, "openai_base_url");
-  if (currentBaseUrl.index !== undefined) {
-    document.lines[currentBaseUrl.index] = `openai_base_url = ${JSON.stringify(installedUrl)}`;
-  } else {
-    insertDocumentLine(document, firstTableIndex(document.lines), `openai_base_url = ${JSON.stringify(installedUrl)}`);
-  }
-  removeManagedComment(document);
-  const installedBaseUrl = findTopLevelAssignment(document.lines, "openai_base_url");
-  insertDocumentLine(document, installedBaseUrl.index!, MANAGED_COMMENT);
-  return { text: renderDocument(document), previous };
-}
-
-function verifyInstalledRoute(text: string, journal: ManagedRouteJournal): void {
-  const lines = splitLines(text);
-  const current = assignments(lines);
-  if (current.openai_base_url.value !== journal.installed.openai_base_url) {
-    throw new Error("Codex openai_base_url changed after setup; refusing to overwrite the user's newer value");
-  }
-  if (current.model_provider.present || current.model_catalog_json.present) {
-    throw new Error("Codex model_provider or model_catalog_json changed after setup; refusing to overwrite the user's newer value");
-  }
-  if (!lines.includes(MANAGED_COMMENT)) {
-    throw new Error("Managed Codex route marker changed after setup; refusing to overwrite it");
-  }
-  if (journal.version === 5 || journal.version === 6) verifyInstalledFeatures(text, journal);
-}
-
-function previousAssignmentMatches(current: PreviousAssignment, previous: PreviousAssignment): boolean {
-  return current.present === previous.present
-    && (!current.present || current.value === previous.value);
-}
-
-function verifyRestoredRoute(
-  text: string,
-  journal: CodexIntegrationJournal | LegacyCodexIntegrationJournalV5 | LegacyCodexIntegrationJournalV4,
-): void {
-  const lines = splitLines(text);
-  const current = assignments(lines);
-  for (const key of ["openai_base_url", "model_provider", "model_catalog_json"] as const) {
-    if (!previousAssignmentMatches(current[key], journal.previous[key])) {
-      throw new Error(`Codex ${key} changed while the bridge was disconnected; refusing to overwrite the user's newer value`);
-    }
-  }
-  if (lines.includes(MANAGED_COMMENT)) {
-    throw new Error("Managed Codex route marker is present while the bridge is disconnected");
-  }
-  if (journal.version === 5 || journal.version === 6) {
-    const previousFeatures: Array<readonly [string, PreviousFeatureAssignment]> = [
-      ["remote_compaction_v2", journal.previousRemoteCompactionV2],
-      ["multi_agent", journal.previousMultiAgent],
-    ];
-    if (journal.version === 6) {
-      previousFeatures.push(["multi_agent_v2", journal.previousMultiAgentV2]);
-    }
-    for (const [key, previous] of previousFeatures) {
-      const current = key === "multi_agent_v2"
-        ? findMultiAgentV2Assignment(lines)
-        : findFeatureAssignment(lines, key);
-      const matches = current.present === previous.present
-        && (current.tableName ?? "features") === (previous.tableName ?? "features")
-        && (!current.present || current.rawLine === previous.rawLine);
-      if (!matches) {
-        throw new Error(
-          `Codex [features].${key} changed while the bridge was disconnected; refusing to overwrite the user's newer value`,
+        rollbackFailures.push(
+          `${snapshot.path}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
         );
       }
     }
-  }
-}
-
-function assertPreservedPreviousAssignments(
-  actual: CodexIntegrationJournal["previous"],
-  expected: CodexIntegrationJournal["previous"],
-): void {
-  for (const key of ["openai_base_url", "model_provider", "model_catalog_json"] as const) {
-    if (!previousAssignmentMatches(actual[key], expected[key])) {
-      throw new Error(`Codex ${key} changed while the bridge was disconnected; refusing to replace it`);
-    }
-  }
-}
-
-function assertPreservedPreviousFeature(
-  actual: PreviousFeatureAssignment,
-  expected: PreviousFeatureAssignment,
-  key: string,
-): void {
-  const matches = actual.present === expected.present
-    && (actual.tableName ?? "features") === (expected.tableName ?? "features")
-    && (!actual.present || actual.rawLine === expected.rawLine);
-  if (!matches) {
-    throw new Error(
-      `Codex [features].${key} changed while the bridge was disconnected; refusing to replace it`,
-    );
-  }
-}
-
-function updateManagedRouteUrl(text: string, journal: ManagedRouteJournal, installedUrl: string): string {
-  verifyInstalledRoute(text, journal);
-  const document = parseDocument(text);
-  const current = findTopLevelAssignment(document.lines, "openai_base_url");
-  if (current.index === undefined) throw new Error("Managed Codex openai_base_url is missing");
-  document.lines[current.index] = `openai_base_url = ${JSON.stringify(installedUrl)}`;
-  return renderDocument(document);
-}
-
-function restoreManagedRoute(text: string, journal: ManagedRouteJournal): string {
-  verifyInstalledRoute(text, journal);
-  const document = parseDocument(text);
-  removeManagedComment(document);
-  const currentBaseUrl = findTopLevelAssignment(document.lines, "openai_base_url");
-  if (currentBaseUrl.index === undefined) throw new Error("Managed Codex openai_base_url is missing");
-  const previousBaseUrl = journal.previous.openai_base_url;
-  if (previousBaseUrl.present) {
-    if (!previousBaseUrl.rawLine) throw new Error("Codex integration journal is missing the prior openai_base_url line");
-    document.lines[currentBaseUrl.index] = previousBaseUrl.rawLine;
-  } else {
-    removeDocumentLine(document, currentBaseUrl.index);
-  }
-  const removedAssignments = (["model_provider", "model_catalog_json"] as const)
-    .map(key => ({ key, previous: journal.previous[key] }))
-    .filter(item => item.previous.present)
-    .sort((left, right) => (left.previous.index ?? Number.MAX_SAFE_INTEGER) - (right.previous.index ?? Number.MAX_SAFE_INTEGER));
-  for (const item of removedAssignments) {
-    if (!item.previous.rawLine) throw new Error(`Codex integration journal is missing the prior ${item.key} line`);
-    const index = Math.min(item.previous.index ?? firstTableIndex(document.lines), firstTableIndex(document.lines));
-    insertDocumentLine(document, index, item.previous.rawLine);
-  }
-  const restoredRoute = renderDocument(document);
-  return journal.version === 5 || journal.version === 6
-    ? restoreManagedFeatures(restoredRoute, journal)
-    : restoredRoute;
-}
-
-function restoreLegacyV2(text: string, journal: LegacyCodexIntegrationJournal): string {
-  if (!text.includes(journal.providerBlock)) {
-    throw new Error("Managed legacy Codex provider block changed after setup; refusing migration");
-  }
-  const withoutProvider = text.replace(journal.providerBlock, "").replace(/\n{3,}/g, "\n\n");
-  const document = parseDocument(withoutProvider);
-  for (const key of ["model_provider", "model_catalog_json"] as const) {
-    const current = findTopLevelAssignment(document.lines, key);
-    if (current.value !== journal.installed[key] || current.index === undefined) {
-      throw new Error(`Managed legacy Codex ${key} changed after setup; refusing migration`);
-    }
-    const previous = journal.previous[key];
-    if (previous.present) {
-      if (!previous.rawLine) throw new Error(`Legacy Codex integration journal is missing the prior ${key} line`);
-      document.lines[current.index] = previous.rawLine;
-    } else {
-      removeDocumentLine(document, current.index);
-    }
-  }
-  removeManagedComment(document);
-  const restoredCatalog = findTopLevelAssignment(document.lines, "model_catalog_json");
-  if (restoredCatalog.index !== undefined && restoredCatalog.value && !existsSync(resolve(restoredCatalog.value))) {
-    removeDocumentLine(document, restoredCatalog.index);
-  }
-  return renderDocument(document);
-}
-
-function readJournal(): AnyCodexIntegrationJournal | undefined {
-  const path = getCodexJournalPath();
-  if (!existsSync(path)) return undefined;
-  const value = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-  if (value.version === 6
-    && typeof value.active === "boolean"
-    && value.installed
-    && value.previous
-    && value.previousRemoteCompactionV2
-    && value.previousMultiAgent
-    && value.previousMultiAgentV2
-    && typeof value.configPath === "string") {
-    return value as unknown as CodexIntegrationJournal;
-  }
-  if (value.version === 5
-    && typeof value.active === "boolean"
-    && value.installed
-    && value.previous
-    && value.previousRemoteCompactionV2
-    && value.previousMultiAgent
-    && typeof value.configPath === "string") {
-    return value as unknown as LegacyCodexIntegrationJournalV5;
-  }
-  if (value.version === 4
-    && typeof value.active === "boolean"
-    && value.installed
-    && value.previous
-    && typeof value.configPath === "string") {
-    return value as unknown as LegacyCodexIntegrationJournalV4;
-  }
-  if (value.version === 3 && value.installed && value.previous && typeof value.configPath === "string") {
-    return value as unknown as LegacyCodexIntegrationJournalV3;
-  }
-  if (value.version === 2 && value.installed && value.previous && typeof value.providerBlock === "string") {
-    return value as unknown as LegacyCodexIntegrationJournal;
-  }
-  throw new Error(`Invalid Codex integration journal: ${path}`);
-}
-
-function assertJournalTargetsConfig(
-  journal: AnyCodexIntegrationJournal,
-  configPath: string,
-): void {
-  const pathIdentity = (value: string): string => {
-    const normalized = resolve(value);
-    return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-  };
-  if (pathIdentity(journal.configPath) !== pathIdentity(configPath)) {
-    throw new Error(
-      `Codex integration journal belongs to ${journal.configPath}, not the active config ${configPath}`,
-    );
+    const primary = error instanceof Error ? error.message : String(error);
+    throw new Error(rollbackFailures.length > 0
+      ? `${primary}; subagent protocol rollback also failed: ${rollbackFailures.join("; ")}`
+      : primary);
   }
 }
 
@@ -1058,15 +171,44 @@ export function preflightCodexIntegration(
   options: InstallCodexIntegrationOptions = {},
 ): void {
   const configPath = getCodexConfigPath();
-  const currentText = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
+  const configSnapshot = snapshotFile(configPath, { followSymlink: true });
+  const configExists = configSnapshot.exists;
+  const currentText = configSnapshot.data?.toString("utf8") ?? "";
   const existing = readJournal();
   const installedUrl = routeUrl(config);
   if (existing) assertJournalTargetsConfig(existing, configPath);
-  if (existing?.version === 3 || existing?.version === 4 || existing?.version === 5 || existing?.version === 6) {
-    if ((existing.version === 4 || existing.version === 5 || existing.version === 6) && !existing.active) {
-      verifyRestoredRoute(currentText, existing);
+  if (existing && existing.version !== 2) {
+    if (!configExists) {
+      if (options.replaceExistingRoute !== true) {
+        throw new Error(`Codex config is missing: ${configPath}`);
+      }
+      installConfiguredRoute("", installedUrl, config, true, true);
+      return;
     }
-    else verifyInstalledRoute(currentText, existing);
+    try {
+      verifyManagedJournalState(currentText, existing);
+    } catch (error) {
+      if (options.replaceExistingRoute !== true) throw error;
+      installConfiguredRoute(
+        replacementBaseline(currentText, configExists, existing),
+        installedUrl,
+        config,
+        true,
+        true,
+      );
+      return;
+    }
+    if (existing.version === 10) return;
+    const baseline = managedJournalIsActive(existing)
+      ? restoreManagedRoute(currentText, existing)
+      : currentText;
+    installConfiguredRoute(
+      baseline,
+      installedUrl,
+      config,
+      true,
+      options.replaceExistingRoute === true,
+    );
     return;
   }
   let baseline = currentText;
@@ -1076,163 +218,85 @@ export function preflightCodexIntegration(
     }
     baseline = restoreLegacyV2(currentText, existing);
   }
-  installIntegrationConfig(baseline, installedUrl, options.replaceExistingRoute === true);
+  installConfiguredRoute(
+    baseline,
+    installedUrl,
+    config,
+    options.replaceExistingRoute === true,
+    options.replaceExistingRoute === true,
+  );
 }
-
 export function installCodexIntegration(
   config: AppConfig,
   options: InstallCodexIntegrationOptions = {},
 ): CodexIntegrationJournal {
   const configPath = getCodexConfigPath();
   mkdirSync(dirname(configPath), { recursive: true, mode: 0o700 });
-  const currentText = existsSync(configPath) ? readFileSync(configPath, "utf8") : "";
-  const gooseCustomProvider = snapshotGooseCustomProviderConfig();
+  const configExists = existsSync(configPath);
+  const currentText = configExists ? readFileSync(configPath, "utf8") : "";
   const existing = readJournal();
   const installedUrl = routeUrl(config);
   if (existing) assertJournalTargetsConfig(existing, configPath);
 
-  if (existing?.version === 6) {
-    let installedText: string;
-    let previousRemoteCompactionV2 = existing.previousRemoteCompactionV2;
-    let previousMultiAgent = existing.previousMultiAgent;
-    let previousMultiAgentV2 = existing.previousMultiAgentV2;
-    if (!existing.active) {
-      verifyRestoredRoute(currentText, existing);
-      const patched = installIntegrationConfig(currentText, installedUrl, true);
-      assertPreservedPreviousAssignments(patched.previous, existing.previous);
-      assertPreservedPreviousFeature(
-        patched.previousRemoteCompactionV2,
-        existing.previousRemoteCompactionV2,
-        "remote_compaction_v2",
-      );
-      assertPreservedPreviousFeature(
-        patched.previousMultiAgent,
-        existing.previousMultiAgent,
-        "multi_agent",
-      );
-      assertPreservedPreviousFeature(
-        patched.previousMultiAgentV2,
-        existing.previousMultiAgentV2,
-        "multi_agent_v2",
-      );
-      installedText = patched.text;
-      // Preserve unrelated [features] edits made while disconnected by remembering whether the
-      // table itself now belongs to the user's baseline.
-      previousRemoteCompactionV2 = patched.previousRemoteCompactionV2;
-      previousMultiAgent = patched.previousMultiAgent;
-      previousMultiAgentV2 = patched.previousMultiAgentV2;
-    } else {
-      installedText = updateManagedRouteUrl(currentText, existing, installedUrl);
-    }
-    const updated: CodexIntegrationJournal = {
-      ...existing,
-      active: true,
-      gooseCustomProvider: journalGooseCustomProviderSnapshot(existing, gooseCustomProvider),
-      installed: {
-        openai_base_url: installedUrl,
-        remote_compaction_v2: false,
-        multi_agent: true,
-        multi_agent_v2: false,
-      },
-      previousRemoteCompactionV2,
-      previousMultiAgent,
-      previousMultiAgentV2,
-    };
-    writeFilesWithCompensation([
-      { path: configPath, data: installedText },
-      { path: getCodexJournalPath(), data: `${JSON.stringify(updated, null, 2)}\n` },
-    ], [getCodexModelsCachePath()]);
-    writeGooseCustomProviderConfig();
-    return updated;
+  const hasManagedJournal = Boolean(existing && existing.version !== 2);
+  if (hasManagedJournal && !configExists && options.replaceExistingRoute !== true) {
+    throw new Error(`Codex config is missing: ${configPath}`);
   }
 
-  if (existing?.version === 5) {
-    let installedText: string;
-    let previousRemoteCompactionV2 = existing.previousRemoteCompactionV2;
-    let previousMultiAgent = existing.previousMultiAgent;
-    let previousMultiAgentV2: PreviousFeatureAssignment;
-    if (!existing.active) {
-      verifyRestoredRoute(currentText, existing);
-      const patched = installIntegrationConfig(currentText, installedUrl, true);
+  if (hasManagedJournal && existing && existing.version !== 2) {
+    let baseline: string;
+    let preservePrevious = true;
+    try {
+      verifyManagedJournalState(currentText, existing);
+      baseline = managedJournalIsActive(existing)
+        ? restoreManagedRoute(currentText, existing)
+        : currentText;
+    } catch (error) {
+      if (options.replaceExistingRoute !== true) throw error;
+      baseline = replacementBaseline(currentText, configExists, existing);
+      preservePrevious = false;
+    }
+    const patched = installConfiguredRoute(
+      baseline,
+      installedUrl,
+      config,
+      true,
+      !preservePrevious || existing.version === 9 || existing.version === 10 || options.replaceExistingRoute === true,
+    );
+    if (preservePrevious) {
       assertPreservedPreviousAssignments(patched.previous, existing.previous);
-      assertPreservedPreviousFeature(
-        patched.previousRemoteCompactionV2,
-        existing.previousRemoteCompactionV2,
-        "remote_compaction_v2",
-      );
-      assertPreservedPreviousFeature(
-        patched.previousMultiAgent,
-        existing.previousMultiAgent,
-        "multi_agent",
-      );
-      installedText = patched.text;
-      previousRemoteCompactionV2 = patched.previousRemoteCompactionV2;
-      previousMultiAgent = patched.previousMultiAgent;
-      previousMultiAgentV2 = patched.previousMultiAgentV2;
-    } else {
-      const routedText = updateManagedRouteUrl(currentText, existing, installedUrl);
-      const multiAgentV2 = installMultiAgentV2Feature(routedText);
-      installedText = multiAgentV2.text;
-      previousMultiAgentV2 = multiAgentV2.previous;
+      if (existing.version === 9 || existing.version === 10) {
+        assertPreservedPreviousRealtimeAssignment(
+          patched.previousRealtimeWebrtcCallBaseUrl,
+          existing.previousRealtimeWebrtcCallBaseUrl,
+        );
+      }
     }
     const updated: CodexIntegrationJournal = {
-      version: 6,
+      version: 10,
       active: true,
-      configPath: existing.configPath,
-      gooseCustomProvider: journalGooseCustomProviderSnapshot(existing, gooseCustomProvider),
+      configPath,
       installed: {
         openai_base_url: installedUrl,
-        remote_compaction_v2: false,
-        multi_agent: true,
-        multi_agent_v2: false,
+        experimental_realtime_webrtc_call_base_url: CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
+        subagent_protocol: config.subagentProtocol,
+        ...(config.subagentProtocol === "compatibility-v1" ? {
+          agent_max_depth: patched.installedAgentMaxDepth,
+        } : {}),
       },
-      previous: existing.previous,
-      previousRemoteCompactionV2,
-      previousMultiAgent,
-      previousMultiAgentV2,
+      previous: preservePrevious ? existing.previous : patched.previous,
+      previousRealtimeWebrtcCallBaseUrl: preservePrevious && (existing.version === 9 || existing.version === 10)
+        ? existing.previousRealtimeWebrtcCallBaseUrl
+        : patched.previousRealtimeWebrtcCallBaseUrl,
+      interruptHook: patched.interruptHook,
+      ...(config.subagentProtocol === "compatibility-v1" ? {
+        previousMultiAgent: patched.previousMultiAgent,
+        previousMultiAgentV2: patched.previousMultiAgentV2,
+        previousAgentMaxDepth: patched.previousAgentMaxDepth,
+      } : {}),
       ...(existing.format ? { format: existing.format } : {}),
     };
-    writeFilesWithCompensation([
-      { path: configPath, data: installedText },
-      { path: getCodexJournalPath(), data: `${JSON.stringify(updated, null, 2)}\n` },
-    ], [getCodexModelsCachePath()]);
-    writeGooseCustomProviderConfig();
-    return updated;
-  }
-
-  if (existing?.version === 3 || existing?.version === 4) {
-    let routedText: string;
-    if (existing.version === 4 && !existing.active) {
-      verifyRestoredRoute(currentText, existing);
-      const patched = installRoute(currentText, installedUrl, true);
-      assertPreservedPreviousAssignments(patched.previous, existing.previous);
-      routedText = patched.text;
-    } else {
-      routedText = updateManagedRouteUrl(currentText, existing, installedUrl);
-    }
-    const features = installManagedFeatures(routedText);
-    const updated: CodexIntegrationJournal = {
-      version: 6,
-      active: true,
-      configPath: existing.configPath,
-      gooseCustomProvider: journalGooseCustomProviderSnapshot(existing, gooseCustomProvider),
-      installed: {
-        openai_base_url: installedUrl,
-        remote_compaction_v2: false,
-        multi_agent: true,
-        multi_agent_v2: false,
-      },
-      previous: existing.previous,
-      previousRemoteCompactionV2: features.previousRemoteCompactionV2,
-      previousMultiAgent: features.previousMultiAgent,
-      previousMultiAgentV2: features.previousMultiAgentV2,
-      ...(existing.format ? { format: existing.format } : {}),
-    };
-    writeFilesWithCompensation([
-      { path: configPath, data: features.text },
-      { path: getCodexJournalPath(), data: `${JSON.stringify(updated, null, 2)}\n` },
-    ], [getCodexModelsCachePath()]);
-    writeGooseCustomProviderConfig();
+    writeIntegrationState(updated, { path: configPath, data: patched.text }, [getCodexModelsCachePath()]);
     return updated;
   }
 
@@ -1243,29 +307,36 @@ export function installCodexIntegration(
     }
     baseline = restoreLegacyV2(currentText, existing);
   }
-  const patched = installIntegrationConfig(baseline, installedUrl, options.replaceExistingRoute === true);
+  const patched = installConfiguredRoute(
+    baseline,
+    installedUrl,
+    config,
+    options.replaceExistingRoute === true,
+    options.replaceExistingRoute === true,
+  );
   const journal: CodexIntegrationJournal = {
-    version: 6,
+    version: 10,
     active: true,
     configPath,
-    gooseCustomProvider,
     installed: {
       openai_base_url: installedUrl,
-      remote_compaction_v2: false,
-      multi_agent: true,
-      multi_agent_v2: false,
+      experimental_realtime_webrtc_call_base_url: CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
+      subagent_protocol: config.subagentProtocol,
+      ...(config.subagentProtocol === "compatibility-v1" ? {
+        agent_max_depth: patched.installedAgentMaxDepth,
+      } : {}),
     },
     previous: patched.previous,
-    previousRemoteCompactionV2: patched.previousRemoteCompactionV2,
-    previousMultiAgent: patched.previousMultiAgent,
-    previousMultiAgentV2: patched.previousMultiAgentV2,
+    previousRealtimeWebrtcCallBaseUrl: patched.previousRealtimeWebrtcCallBaseUrl,
+    interruptHook: patched.interruptHook,
+    ...(config.subagentProtocol === "compatibility-v1" ? {
+      previousMultiAgent: patched.previousMultiAgent,
+      previousMultiAgentV2: patched.previousMultiAgentV2,
+      previousAgentMaxDepth: patched.previousAgentMaxDepth,
+    } : {}),
     format: textFormat(baseline),
   };
-  writeFilesWithCompensation([
-    { path: configPath, data: patched.text },
-    { path: getCodexJournalPath(), data: `${JSON.stringify(journal, null, 2)}\n` },
-  ], [getCodexModelsCachePath()]);
-  writeGooseCustomProviderConfig();
+  writeIntegrationState(journal, { path: configPath, data: patched.text }, [getCodexModelsCachePath()]);
   if (existing?.version === 2 && existsSync(existing.catalogPath)) rmSync(existing.catalogPath);
   return journal;
 }
@@ -1279,22 +350,23 @@ export function deactivateCodexIntegration(): SetCodexIntegrationActiveResult {
   assertJournalTargetsConfig(existing, getCodexConfigPath());
   if (!existsSync(existing.configPath)) throw new Error(`Codex config is missing: ${existing.configPath}`);
   const current = readFileSync(existing.configPath, "utf8");
-  if ((existing.version === 4 || existing.version === 5 || existing.version === 6) && !existing.active) {
+  if ((existing.version === 4 || existing.version === 5 || existing.version === 6 || existing.version === 7 || existing.version === 8 || existing.version === 9 || existing.version === 10) && !existing.active) {
     verifyRestoredRoute(current, existing);
     return { changed: false, active: false };
   }
   const restored = restoreManagedRoute(current, existing);
   const disconnected:
     | CodexIntegrationJournal
+    | LegacyCodexIntegrationJournalV9
+    | LegacyCodexIntegrationJournalV8
+    | LegacyCodexIntegrationJournalV6
+    | LegacyCodexIntegrationJournalV7
     | LegacyCodexIntegrationJournalV5
     | LegacyCodexIntegrationJournalV4 = existing.version === 6 || existing.version === 5
+      || existing.version === 7 || existing.version === 8 || existing.version === 9 || existing.version === 10
       ? { ...existing, active: false }
       : { ...existing, version: 4, active: false };
-  writeFilesWithCompensation([
-    { path: existing.configPath, data: restored },
-    { path: getCodexJournalPath(), data: `${JSON.stringify(disconnected, null, 2)}\n` },
-  ], [getCodexModelsCachePath()]);
-  restoreGooseCustomProviderConfig(journalGooseCustomProviderSnapshot(existing, { present: false }));
+  writeIntegrationState(disconnected, { path: existing.configPath, data: restored }, [getCodexModelsCachePath()]);
   return { changed: true, active: false };
 }
 
@@ -1307,87 +379,61 @@ export function activateCodexIntegration(): SetCodexIntegrationActiveResult {
   assertJournalTargetsConfig(existing, getCodexConfigPath());
   if (!existsSync(existing.configPath)) throw new Error(`Codex config is missing: ${existing.configPath}`);
   const current = readFileSync(existing.configPath, "utf8");
-  if (existing.version === 6 && existing.active) {
+  if (existing.version === 10 && existing.active) {
     verifyInstalledRoute(current, existing);
     return { changed: false, active: true };
   }
-  if (existing.version === 5 && existing.active) {
-    verifyInstalledRoute(current, existing);
-    const multiAgentV2 = installMultiAgentV2Feature(current);
-    const connected: CodexIntegrationJournal = {
-      version: 6,
-      active: true,
-      configPath: existing.configPath,
-      installed: {
-        openai_base_url: existing.installed.openai_base_url,
-        remote_compaction_v2: false,
-        multi_agent: true,
-        multi_agent_v2: false,
-      },
-      previous: existing.previous,
-      previousRemoteCompactionV2: existing.previousRemoteCompactionV2,
-      previousMultiAgent: existing.previousMultiAgent,
-      previousMultiAgentV2: multiAgentV2.previous,
-      ...(existing.format ? { format: existing.format } : {}),
-    };
-    writeFilesWithCompensation([
-      { path: existing.configPath, data: multiAgentV2.text },
-      { path: getCodexJournalPath(), data: `${JSON.stringify(connected, null, 2)}\n` },
-    ], [getCodexModelsCachePath()]);
-    writeGooseCustomProviderConfig();
-    return { changed: true, active: true };
-  }
-  let routedText: string;
-  if ((existing.version === 4 || existing.version === 5 || existing.version === 6) && !existing.active) {
+  let baseline: string;
+  if ((existing.version === 4 || existing.version === 5 || existing.version === 6 || existing.version === 7 || existing.version === 8 || existing.version === 9 || existing.version === 10) && !existing.active) {
     verifyRestoredRoute(current, existing);
-    const patched = installRoute(current, existing.installed.openai_base_url, true);
-    assertPreservedPreviousAssignments(patched.previous, existing.previous);
-    routedText = patched.text;
+    baseline = current;
   } else {
     verifyInstalledRoute(current, existing);
-    routedText = current;
+    baseline = restoreManagedRoute(current, existing);
   }
-  const features = installManagedFeatures(routedText);
-  if (existing.version === 5 || existing.version === 6) {
-    assertPreservedPreviousFeature(
-      features.previousRemoteCompactionV2,
-      existing.previousRemoteCompactionV2,
-      "remote_compaction_v2",
+  const protocol = journalProtocol(existing);
+  const hookConfig = existing.version === 10
+    ? { interruptHookCommand: existing.interruptHook.command }
+    : { runtimeCommand: loadConfig().runtimeCommand };
+  const route = installConfiguredRoute(
+    baseline,
+    existing.installed.openai_base_url,
+    { subagentProtocol: protocol, ...hookConfig },
+    true,
+    existing.version === 9 || existing.version === 10,
+  );
+  assertPreservedPreviousAssignments(route.previous, existing.previous);
+  if (existing.version === 9 || existing.version === 10) {
+    assertPreservedPreviousRealtimeAssignment(
+      route.previousRealtimeWebrtcCallBaseUrl,
+      existing.previousRealtimeWebrtcCallBaseUrl,
     );
-    assertPreservedPreviousFeature(
-      features.previousMultiAgent,
-      existing.previousMultiAgent,
-      "multi_agent",
-    );
-    if (existing.version === 6) {
-      assertPreservedPreviousFeature(
-        features.previousMultiAgentV2,
-        existing.previousMultiAgentV2,
-        "multi_agent_v2",
-      );
-    }
   }
   const connected: CodexIntegrationJournal = {
-    version: 6,
+    version: 10,
     active: true,
     configPath: existing.configPath,
     installed: {
       openai_base_url: existing.installed.openai_base_url,
-      remote_compaction_v2: false,
-      multi_agent: true,
-      multi_agent_v2: false,
+      experimental_realtime_webrtc_call_base_url: CODEX_REALTIME_WEBRTC_CALL_BASE_URL,
+      subagent_protocol: protocol,
+      ...(protocol === "compatibility-v1" ? {
+        agent_max_depth: route.installedAgentMaxDepth,
+      } : {}),
     },
     previous: existing.previous,
-    previousRemoteCompactionV2: features.previousRemoteCompactionV2,
-    previousMultiAgent: features.previousMultiAgent,
-    previousMultiAgentV2: features.previousMultiAgentV2,
+    previousRealtimeWebrtcCallBaseUrl: existing.version === 9 || existing.version === 10
+      ? existing.previousRealtimeWebrtcCallBaseUrl
+      : route.previousRealtimeWebrtcCallBaseUrl,
+    interruptHook: route.interruptHook,
+    ...(protocol === "compatibility-v1" ? {
+      previousMultiAgent: route.previousMultiAgent,
+      previousMultiAgentV2: route.previousMultiAgentV2,
+      previousAgentMaxDepth: route.previousAgentMaxDepth,
+    } : {}),
     ...(existing.format ? { format: existing.format } : {}),
   };
-  writeFilesWithCompensation([
-    { path: existing.configPath, data: features.text },
-    { path: getCodexJournalPath(), data: `${JSON.stringify(connected, null, 2)}\n` },
-  ], [getCodexModelsCachePath()]);
-  writeGooseCustomProviderConfig();
+  writeIntegrationState(connected, { path: existing.configPath, data: route.text }, [getCodexModelsCachePath()]);
   return { changed: true, active: true };
 }
 
@@ -1402,24 +448,26 @@ export function uninstallCodexIntegration(): UninstallCodexIntegrationResult {
       throw new Error(`Managed legacy catalog changed after setup: ${journal.catalogPath}`);
     }
     restored = restoreLegacyV2(current, journal);
-  } else if ((journal.version === 4 || journal.version === 5 || journal.version === 6) && !journal.active) {
+  } else if ((journal.version === 4 || journal.version === 5 || journal.version === 6 || journal.version === 7 || journal.version === 8 || journal.version === 9 || journal.version === 10) && !journal.active) {
     verifyRestoredRoute(current, journal);
     restored = current;
   } else {
     restored = restoreManagedRoute(current, journal);
   }
-  const configSnapshot = snapshotFile(journal.configPath);
+  const configSnapshot = snapshotFile(journal.configPath, { followSymlink: true });
   const catalogSnapshot = journal.version === 2 ? snapshotFile(journal.catalogPath) : undefined;
   const modelsCacheSnapshot = snapshotFile(getCodexModelsCachePath());
+  const journalSnapshot = snapshotFile(getCodexJournalPath());
+  const recoverySnapshot = snapshotFile(getCodexJournalRecoveryPath());
   try {
-    atomicWriteFile(journal.configPath, restored);
+    writeFileSnapshot(configSnapshot, restored);
     if (catalogSnapshot?.exists) rmSync(catalogSnapshot.path);
     rmSync(modelsCacheSnapshot.path, { force: true });
     rmSync(getCodexJournalPath(), { force: true });
-    restoreGooseCustomProviderConfig(journalGooseCustomProviderSnapshot(journal, { present: false }));
+    rmSync(getCodexJournalRecoveryPath(), { force: true });
   } catch (error) {
     const rollbackFailures: string[] = [];
-    for (const snapshot of [modelsCacheSnapshot, catalogSnapshot, configSnapshot]) {
+    for (const snapshot of [recoverySnapshot, journalSnapshot, modelsCacheSnapshot, catalogSnapshot, configSnapshot]) {
       if (!snapshot) continue;
       try {
         restoreFileSnapshot(snapshot);
@@ -1449,10 +497,10 @@ export function inspectCodexIntegration(): {
     try {
       assertJournalTargetsConfig(journal, getCodexConfigPath());
       const text = readFileSync(journal.configPath, "utf8");
-      if ((journal.version === 4 || journal.version === 5 || journal.version === 6) && !journal.active) {
+      if ((journal.version === 4 || journal.version === 5 || journal.version === 6 || journal.version === 7 || journal.version === 8 || journal.version === 9 || journal.version === 10) && !journal.active) {
         verifyRestoredRoute(text, journal);
       }
-      else if (journal.version === 3 || journal.version === 4 || journal.version === 5 || journal.version === 6) {
+      else if (journal.version === 3 || journal.version === 4 || journal.version === 5 || journal.version === 6 || journal.version === 7 || journal.version === 8 || journal.version === 9 || journal.version === 10) {
         verifyInstalledRoute(text, journal);
       }
       else {
@@ -1470,11 +518,11 @@ export function inspectCodexIntegration(): {
   }
   return {
     installed: Boolean(journal),
-    active: journal?.version === 4 || journal?.version === 5 || journal?.version === 6
+    active: journal?.version === 4 || journal?.version === 5 || journal?.version === 6 || journal?.version === 7 || journal?.version === 8 || journal?.version === 9 || journal?.version === 10
       ? journal.active
       : Boolean(journal),
     configPath: getCodexConfigPath(),
-    ...(journal?.version === 3 || journal?.version === 4 || journal?.version === 5 || journal?.version === 6
+    ...(journal?.version === 3 || journal?.version === 4 || journal?.version === 5 || journal?.version === 6 || journal?.version === 7 || journal?.version === 8 || journal?.version === 9 || journal?.version === 10
       ? { routeUrl: journal.installed.openai_base_url }
       : {}),
     ...(journal ? { journal } : {}),

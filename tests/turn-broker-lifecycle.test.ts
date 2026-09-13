@@ -13,6 +13,7 @@ test("explicit browser-turn cancellation aborts and removes every registered ses
   const replayable = sessions.getOrCreate("turn-a", () => ({
     mode: "read-only",
     browser: Promise.resolve("done"),
+    physicalSettlement: Promise.resolve(),
     trace: new ChatGptTraceFeed(),
     text: new ChatGptTextFeed(),
     cancel: () => { cancelled += 1; },
@@ -21,6 +22,7 @@ test("explicit browser-turn cancellation aborts and removes every registered ses
   sessions.getOrCreate("turn-b", () => ({
     mode: "read-only",
     browser: new Promise<string>(() => {}),
+    physicalSettlement: Promise.resolve(),
     trace: new ChatGptTraceFeed(),
     text: new ChatGptTextFeed(),
     cancel: () => { cancelled += 1; },
@@ -32,12 +34,99 @@ test("explicit browser-turn cancellation aborts and removes every registered ses
   expect(sessions.activeCount()).toBe(0);
 });
 
+test("targeted tab cancellation settles one trace and keeps a terminal replay tombstone", async () => {
+  const sessions = new ChatGptTurnSessions();
+  let rejectTarget!: (error: Error) => void;
+  let targetCancelled = 0;
+  let otherCancelled = 0;
+  const target = sessions.getOrCreate("target", () => ({
+    mode: "read-only",
+    browser: new Promise<string>((_resolve, reject) => { rejectTarget = reject; }),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel: () => {
+      targetCancelled += 1;
+      rejectTarget(new Error("browser tab closed by user"));
+    },
+  }), "trace_target");
+  sessions.getOrCreate("other", () => ({
+    mode: "read-only",
+    browser: new Promise<string>(() => {}),
+    physicalSettlement: Promise.resolve(),
+    trace: new ChatGptTraceFeed(),
+    text: new ChatGptTextFeed(),
+    cancel: () => { otherCancelled += 1; },
+  }), "trace_other");
+
+  expect(await sessions.cancelTrace("trace_target")).toBe(1);
+  expect(targetCancelled).toBe(1);
+  expect(otherCancelled).toBe(0);
+  expect(target.settledOutcome()).toMatchObject({ type: "error" });
+  expect(sessions.activeCount()).toBe(1);
+  expect(sessions.getOrCreate("target", () => {
+    throw new Error("a cancelled continuation must not open a new browser tab");
+  }, "trace_target")).toBe(target);
+  expect(await sessions.cancelTrace("trace_target")).toBe(0);
+  sessions.clear();
+});
+
+test("native interruption retires only the exact browser turn identity", async () => {
+  const sessions = new ChatGptTurnSessions();
+  const cancelled: string[] = [];
+  const runtime = (name: string) => {
+    let rejectBrowser!: (error: Error) => void;
+    const browser = new Promise<string>((_resolve, reject) => { rejectBrowser = reject; });
+    return {
+      mode: "read-only" as const,
+      browser,
+      physicalSettlement: browser.then(() => undefined, () => undefined),
+      trace: new ChatGptTraceFeed(),
+      text: new ChatGptTextFeed(),
+      cancel: (reason?: Error) => {
+        cancelled.push(name);
+        rejectBrowser(reason ?? new Error("cancelled"));
+      },
+    };
+  };
+  sessions.getOrCreate(
+    "target",
+    () => runtime("target"),
+    "trace_target",
+    "owner_target",
+    "turn_shared",
+    "thread_target",
+  );
+  sessions.getOrCreate(
+    "other-thread",
+    () => runtime("other-thread"),
+    "trace_other",
+    "owner_other",
+    "turn_shared",
+    "thread_other",
+  );
+
+  const cancellation = sessions.cancelNativeTurn(
+    "thread_target",
+    "turn_shared",
+    new DOMException("Codex turn interrupted", "AbortError"),
+  );
+  expect(cancellation.cancelled).toBe(1);
+  await cancellation.settlement;
+  expect(cancelled).toEqual(["target"]);
+  expect(sessions.find("target")).toBeUndefined();
+  expect(sessions.find("other-thread")?.nativeThreadId).toBe("thread_other");
+  expect(sessions.activeCount()).toBe(1);
+  sessions.clear();
+});
+
 test("session cache expiry never cancels a still-active long browser turn", async () => {
   const sessions = new ChatGptTurnSessions(1);
   let cancelled = 0;
   const active = sessions.getOrCreate("long-turn", () => ({
     mode: "read-only",
     browser: new Promise<string>(() => {}),
+    physicalSettlement: Promise.resolve(),
     trace: new ChatGptTraceFeed(),
     text: new ChatGptTextFeed(),
     cancel: () => { cancelled += 1; },
@@ -58,6 +147,7 @@ test("five active turns coexist and a sixth fails closed", () => {
   const runtime = () => ({
     mode: "read-only" as const,
     browser: new Promise<string>(() => {}),
+    physicalSettlement: Promise.resolve(),
     trace: new ChatGptTraceFeed(),
     text: new ChatGptTextFeed(),
     cancel: () => { cancelled += 1; },
@@ -86,6 +176,7 @@ test("settled replay sessions expire from their last use instead of their creati
     return {
       mode: "read-only" as const,
       browser: Promise.resolve("done"),
+      physicalSettlement: Promise.resolve(),
       trace: new ChatGptTraceFeed(),
       text: new ChatGptTextFeed(),
       cancel: () => {},
@@ -125,6 +216,18 @@ test("turn broker creates its private runtime directory on a cold start", async 
   }
 });
 
+test("turn broker rejects a Unix socket path that leaves no room for sun_path's NUL terminator", async () => {
+  if (process.platform === "win32") return;
+  const socketPath = `/tmp/${"x".repeat(99)}`;
+  expect(Buffer.byteLength(socketPath)).toBe(104);
+  const broker = TurnBroker.forSocket(socketPath);
+  try {
+    await expect(broker.listen()).rejects.toThrow("103-byte limit");
+  } finally {
+    await broker.close();
+  }
+});
+
 test("turn broker tokens do not expire while their browser turn is still alive", async () => {
   const root = mkdtempSync(join(tmpdir(), "cgw-broker-unbounded-"));
   const socketPath = defaultBrokerEndpoint(root);
@@ -139,6 +242,31 @@ test("turn broker tokens do not expire while their browser turn is still alive",
     });
     await Bun.sleep(5);
     await expect(callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token }))
+      .resolves.toMatchObject({ bindingId: expect.any(String) });
+  } finally {
+    await broker.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("turn broker revokes only channels owned by the closed browser trace", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-broker-targeted-"));
+  const socketPath = defaultBrokerEndpoint(root);
+  const broker = TurnBroker.forSocket(socketPath);
+  try {
+    const environment = {
+      cwd: root,
+      roots: [root],
+      writableRoots: [root],
+      sandboxPolicy: { type: "dangerFullAccess" as const },
+      tools: [],
+    };
+    const target = await broker.register(environment, 60_000, "trace_target");
+    const other = await broker.register(environment, 60_000, "trace_other");
+    expect(broker.revokeTrace("trace_target")).toBe(1);
+    await expect(callTurnBroker(socketPath, { method: "claim", token: target }))
+      .rejects.toThrow("already finished");
+    await expect(callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token: other }))
       .resolves.toMatchObject({ bindingId: expect.any(String) });
   } finally {
     await broker.close();
@@ -201,6 +329,8 @@ test("turn broker names the finished turn that owns a replayed handle", async ()
       sandboxPolicy: { type: "dangerFullAccess" },
       tools: [],
     }, 60_000, "turn-alpha");
+    await expect(callTurnBroker(socketPath, { method: "claim", token: ` ${token}` }))
+      .rejects.toThrow("turn token is invalid, expired, or revoked");
     const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
     broker.revoke(token);
 
@@ -219,18 +349,20 @@ test("turn broker names the finished turn that owns a replayed handle", async ()
       wireName: "exec_command",
     });
     expect(replayedBinding).toContain("turn-alpha");
-    expect(replayedBinding).toContain("Retry the tool call with the turn_token");
+    expect(replayedBinding).toContain("has already finished");
+    expect(replayedBinding).not.toContain("codex_bind_turn");
 
     const replayedToken = await rejection({ method: "claim", token });
     expect(replayedToken).toContain("turn-alpha");
-    expect(replayedToken).toContain("current task context");
+    expect(replayedToken).toContain("can no longer run");
+    expect(replayedToken).not.toContain("current task context");
 
     const unknownBinding = await rejection({
       method: "invoke",
       bindingId: "binding_never-issued",
       wireName: "exec_command",
     });
-    expect(unknownBinding).toBe("binding id is invalid or expired");
+    expect(unknownBinding).toBe("internal Codex turn binding is invalid or expired");
   } finally {
     await broker.close();
     rmSync(root, { recursive: true, force: true });
