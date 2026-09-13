@@ -29,7 +29,7 @@ type WorkerMessage =
   | { type: "lifecycle"; event: "accepted"; evidence: RebuildBrowserAcceptedEvidence }
   | { type: "candidate"; evidence: RebuildBrowserFinalEvidence }
   | { type: "confirmed"; evidence: RebuildBrowserFinalEvidence }
-  | { type: "boundary"; requestId: number; boundaryJson: string }
+  | { type: "boundary"; requestId: number; boundaryJson?: string; error?: string }
   | { type: "error"; message: string };
 
 interface Deferred<T> {
@@ -161,6 +161,13 @@ export function createRebuildNodeBrowserDriver(
           const pending = boundaries.get(message.requestId);
           if (!pending) throw new Error("Node browser worker returned an unknown boundary request");
           boundaries.delete(message.requestId);
+          if (message.error !== undefined) {
+            pending.reject(new Error(message.error));
+            return;
+          }
+          if (typeof message.boundaryJson !== "string") {
+            throw new Error("Node browser worker returned an invalid boundary response");
+          }
           pending.resolve(message.boundaryJson);
           return;
         }

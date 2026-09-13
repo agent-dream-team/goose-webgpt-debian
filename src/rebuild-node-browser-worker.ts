@@ -133,9 +133,16 @@ async function handle(message: InputMessage): Promise<void> {
     return;
   }
   if (message.type === "boundary") {
-    if (!execution) throw new Error("Node browser worker has no active execution for answer-boundary capture");
-    const boundaryJson = await execution.captureAnswerBoundary(message.opRef);
-    write({ type: "boundary", requestId: message.requestId, boundaryJson });
+    try {
+      if (!execution) throw new Error("Node browser worker has no active execution for answer-boundary capture");
+      const boundaryJson = await execution.captureAnswerBoundary(message.opRef);
+      write({ type: "boundary", requestId: message.requestId, boundaryJson });
+    } catch (error) {
+      // Boundary observation is pre-side-effect work. A transient identity/DOM failure belongs only
+      // to this boundary request; the parent connector will return BOUNDARY_REQUIRED and may retry.
+      // Do not turn that local refusal into a global browser-turn failure.
+      write({ type: "boundary", requestId: message.requestId, error: errorMessage(error) });
+    }
     return;
   }
   if (message.type === "confirm") {
