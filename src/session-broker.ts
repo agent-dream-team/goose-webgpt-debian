@@ -435,19 +435,7 @@ export class SessionBroker {
   }): RemoteEpoch {
     if (!input.conversationId) this.fail("INVALID_CONVERSATION", "conversationId must not be empty");
     return this.transaction(() => {
-      const row = this.epochRowRequired(input.gooseSessionId, input.epoch);
-      if (row.is_current !== 1) this.fail("STALE_EPOCH", "Only the current epoch may bind a conversation");
-      if (row.conversation_id && row.conversation_id !== input.conversationId) {
-        this.fail("CONVERSATION_CONFLICT", "Remote epoch is already bound to another canonical conversation");
-      }
-      const existing = this.db.query("SELECT goose_session_id, epoch FROM remote_epochs WHERE conversation_id = ?")
-        .get(input.conversationId) as { goose_session_id: string; epoch: number } | null;
-      if (existing && (existing.goose_session_id !== input.gooseSessionId || existing.epoch !== input.epoch)) {
-        this.fail("CONVERSATION_CONFLICT", "Canonical conversation is already bound to another epoch");
-      }
-      this.db.query(`UPDATE remote_epochs SET conversation_id = ?, updated_at = ?
-        WHERE goose_session_id = ? AND epoch = ?`)
-        .run(input.conversationId, this.now(), input.gooseSessionId, input.epoch);
+      this.bindConversationInside(input);
       return this.getEpochRequired(input.gooseSessionId, input.epoch);
     });
   }
@@ -682,14 +670,6 @@ export class SessionBroker {
     return this.transaction(() => {
       const turn = this.turnRowRequired(turnRef);
       if (turn.state !== "UNRECONCILED") this.fail("TURN_STATE", "Only an unreconciled turn can be quarantined with its slot released");
-      const epoch = this.epochRowRequired(turn.goose_session_id, turn.epoch);
-      if (epoch.conversation_id !== evidence.canonicalConversationId
-        || turn.accepted_user_turn_id !== evidence.acceptedUserTurnId) {
-        this.fail("POSITIVE_TERMINAL_REQUIRED", "Positive-terminal identity evidence does not match the durable conversation/turn binding");
-      }
-      if (turn.final_digest) this.fail("POSITIVE_TERMINAL_REQUIRED", "Accepted final content must use normal completion reconciliation");
-      if (turn.completion_claim_revision !== null) this.fail("COMPLETION_IN_FLIGHT", "Cannot release account slot while a completion claim exists");
-      if (this.hasUnresolvedOperation(turnRef)) this.fail("UNRESOLVED_OPERATION", "Cannot release account slot with claimed or uncertain operations");
       if (this.accountSlotHolder() !== turnRef) {
         const recorded = this.recordedSlotDemotionEvidence(turnRef);
         if (recorded !== null) {
@@ -699,6 +679,33 @@ export class SessionBroker {
           return turnFromRow(turn);
         }
         this.fail("ACCOUNT_SLOT", "Unreconciled turn lost its account slot without durable demotion evidence");
+      }
+
+      const epoch = this.epochRowRequired(turn.goose_session_id, turn.epoch);
+      if (turn.final_digest) this.fail("POSITIVE_TERMINAL_REQUIRED", "Accepted final content must use normal completion reconciliation");
+      if (turn.completion_claim_revision !== null) this.fail("COMPLETION_IN_FLIGHT", "Cannot release account slot while a completion claim exists");
+      if (this.hasUnresolvedOperation(turnRef)) this.fail("UNRESOLVED_OPERATION", "Cannot release account slot with claimed or uncertain operations");
+
+      // The same positive-terminal proof that permits slot release may also close the crash window
+      // between irreversible send and durable remote identity capture. Bind only missing identity;
+      // any pre-existing conflict still fails the whole transaction closed.
+      if (epoch.conversation_id) {
+        if (epoch.conversation_id !== evidence.canonicalConversationId) {
+          this.fail("POSITIVE_TERMINAL_REQUIRED", "Positive-terminal conversation identity does not match the durable binding");
+        }
+      } else {
+        this.bindConversationInside({
+          gooseSessionId: turn.goose_session_id,
+          epoch: turn.epoch,
+          conversationId: evidence.canonicalConversationId,
+        });
+      }
+      if (turn.accepted_user_turn_id) {
+        if (turn.accepted_user_turn_id !== evidence.acceptedUserTurnId) {
+          this.fail("POSITIVE_TERMINAL_REQUIRED", "Positive-terminal user identity does not match the durable binding");
+        }
+      } else {
+        this.bindAcceptedUserTurnId(turn, evidence.acceptedUserTurnId);
       }
       const result = this.db.query(`UPDATE turns SET positive_terminal_evidence_json = ?, slot_held = 0,
         revision = revision + 1, updated_at = ? WHERE turn_ref = ? AND slot_held = 1`)
@@ -1387,6 +1394,28 @@ export class SessionBroker {
       revision = revision + 1, updated_at = ? WHERE turn_ref = ?`)
       .run(reason, this.now(), turnRef);
     return this.getTurnRequired(turnRef);
+  }
+
+  private bindConversationInside(input: {
+    gooseSessionId: string;
+    epoch: number;
+    conversationId: string;
+  }): void {
+    const row = this.epochRowRequired(input.gooseSessionId, input.epoch);
+    if (row.is_current !== 1) this.fail("STALE_EPOCH", "Only the current epoch may bind a conversation");
+    if (row.conversation_id && row.conversation_id !== input.conversationId) {
+      this.fail("CONVERSATION_CONFLICT", "Remote epoch is already bound to another canonical conversation");
+    }
+    const existing = this.db.query("SELECT goose_session_id, epoch FROM remote_epochs WHERE conversation_id = ?")
+      .get(input.conversationId) as { goose_session_id: string; epoch: number } | null;
+    if (existing && (existing.goose_session_id !== input.gooseSessionId || existing.epoch !== input.epoch)) {
+      this.fail("CONVERSATION_CONFLICT", "Canonical conversation is already bound to another epoch");
+    }
+    if (!row.conversation_id) {
+      this.db.query(`UPDATE remote_epochs SET conversation_id = ?, updated_at = ?
+        WHERE goose_session_id = ? AND epoch = ?`)
+        .run(input.conversationId, this.now(), input.gooseSessionId, input.epoch);
+    }
   }
 
   private bindAcceptedUserTurnId(turn: TurnRow, acceptedUserTurnId: string): void {

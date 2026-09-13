@@ -779,13 +779,23 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
           return jsonError(400, "invalid_recovery_request", "Abandon request requires turn_ref and positive_terminal_evidence");
         }
         const rawEvidence = evidenceValue as Record<string, unknown>;
-        const evidence: PositiveTerminalEvidence = {
-          canonicalConversationId: typeof rawEvidence.canonical_conversation_id === "string" ? rawEvidence.canonical_conversation_id : "",
-          acceptedUserTurnId: typeof rawEvidence.accepted_user_turn_id === "string" ? rawEvidence.accepted_user_turn_id : "",
-          remoteUiNonRunningAcrossQualifiedSettle: rawEvidence.remote_ui_non_running_across_qualified_settle === true,
-          noUnresolvedGooseWork: rawEvidence.no_unresolved_goose_work === true,
-          noContradictoryActivity: rawEvidence.no_contradictory_activity === true,
-        };
+        let evidence: PositiveTerminalEvidence;
+        try {
+          evidence = {
+            canonicalConversationId: normalizeCanonicalChatGptConversationId(
+              typeof rawEvidence.canonical_conversation_id === "string" ? rawEvidence.canonical_conversation_id : "",
+            ),
+            acceptedUserTurnId: validatePersistentChatTurnIdentity(
+              typeof rawEvidence.accepted_user_turn_id === "string" ? rawEvidence.accepted_user_turn_id : "",
+              "accepted user turn",
+            ),
+            remoteUiNonRunningAcrossQualifiedSettle: rawEvidence.remote_ui_non_running_across_qualified_settle === true,
+            noUnresolvedGooseWork: rawEvidence.no_unresolved_goose_work === true,
+            noContradictoryActivity: rawEvidence.no_contradictory_activity === true,
+          };
+        } catch {
+          return jsonError(400, "invalid_recovery_request", "Positive-terminal recovery identity is invalid");
+        }
         if (executions.has(turnRef) || toolActivityByTurn.has(turnRef)) {
           return jsonError(409, "recovery_owner_active", "Process-local turn/tool ownership must be gone before abandonment");
         }

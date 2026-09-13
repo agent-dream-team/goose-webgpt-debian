@@ -994,7 +994,7 @@ test("authenticated recovery reconciles only post-owner known operation evidence
   expect(admitted.turn.turnRef).toBe(queued.turnRef);
   first.broker.markSendActivated(admitted.turn.turnRef);
   first.broker.markAccepted(admitted.turn.turnRef, "user-recovery");
-  first.broker.bindConversation({ gooseSessionId: "goose-recovery", epoch: 1, conversationId: "conversation-recovery" });
+  first.broker.bindConversation({ gooseSessionId: "goose-recovery", epoch: 1, conversationId: "87654321-4321-4abc-8def-1234567890ab" });
   first.broker.recordAnswerBoundary(admitted.turn.turnRef, admitted.initialOpRef, '{"chars":12}');
   const originalInputHash = connectorOperationInputHash("developer__tree", { path: ".qualification" });
   expect(first.broker.claimOperation({
@@ -1051,7 +1051,7 @@ test("authenticated recovery reconciles only post-owner known operation evidence
     body: JSON.stringify({
       turn_ref: admitted.turn.turnRef,
       positive_terminal_evidence: {
-        canonical_conversation_id: "conversation-recovery", accepted_user_turn_id: "user-recovery",
+        canonical_conversation_id: "87654321-4321-4abc-8def-1234567890ab", accepted_user_turn_id: "user-recovery",
         remote_ui_non_running_across_qualified_settle: true, no_unresolved_goose_work: false, no_contradictory_activity: true,
       },
     }),
@@ -1065,7 +1065,7 @@ test("authenticated recovery reconciles only post-owner known operation evidence
     body: JSON.stringify({
       turn_ref: admitted.turn.turnRef,
       positive_terminal_evidence: {
-        canonical_conversation_id: "conversation-recovery", accepted_user_turn_id: "user-recovery",
+        canonical_conversation_id: "87654321-4321-4abc-8def-1234567890ab", accepted_user_turn_id: "user-recovery",
         remote_ui_non_running_across_qualified_settle: true, no_unresolved_goose_work: true, no_contradictory_activity: true,
       },
     }),
@@ -1073,6 +1073,93 @@ test("authenticated recovery reconciles only post-owner known operation evidence
   expect(abandoned.status).toBe(200);
   expect(await abandoned.json()).toMatchObject({ status: "ok", turn_state: "ABANDONED", account_slot_holder: null });
   expect(restarted.broker.getCurrentEpoch("goose-recovery")).toBeNull();
+});
+
+test("authenticated abandonment can retire a verified pre-identity orphan without a separate recovery API", async () => {
+  const driver: RebuildPersistentBrowserDriver = {
+    createTurn() { throw new Error("orphan abandonment test must not create browser work"); },
+  };
+  const { runtime } = setup(driver);
+  const sessionId = "goose-pre-identity-orphan";
+  runtime.broker.createEpoch({ gooseSessionId: sessionId });
+  const turn = runtime.broker.enqueueTurn({
+    gooseSessionId: sessionId,
+    requestHash: "orphan-request",
+    budgetPromptTokens: () => 1,
+  });
+  runtime.broker.admitNext();
+  runtime.broker.markSendActivated(turn.turnRef);
+  runtime.broker.markUnreconciled(turn.turnRef, "browser_lost_before_identity_capture");
+
+  const abandoned = await fetch(`${runtime.origin}/admin/abandon-unreconciled`, {
+    method: "POST",
+    headers: { authorization: "Bearer control-token", "content-type": "application/json" },
+    body: JSON.stringify({
+      turn_ref: turn.turnRef,
+      positive_terminal_evidence: {
+        canonical_conversation_id: "12345678-1234-4abc-8def-1234567890ab",
+        accepted_user_turn_id: "user-recovered-orphan",
+        remote_ui_non_running_across_qualified_settle: true,
+        no_unresolved_goose_work: true,
+        no_contradictory_activity: true,
+      },
+    }),
+  });
+  expect(abandoned.status).toBe(200);
+  expect(await abandoned.json()).toMatchObject({
+    status: "ok", turn_state: "ABANDONED", account_slot_holder: null,
+  });
+  expect(runtime.broker.getTurn(turn.turnRef)?.acceptedUserTurnId).toBe("user-recovered-orphan");
+  expect(runtime.broker.getCurrentEpoch(sessionId)).toBeNull();
+});
+
+test("authenticated orphan abandonment rejects malformed recovery identity before broker mutation", async () => {
+  const driver: RebuildPersistentBrowserDriver = {
+    createTurn() { throw new Error("malformed orphan recovery test must not create browser work"); },
+  };
+  const { runtime } = setup(driver);
+  const sessionId = "goose-malformed-orphan";
+  runtime.broker.createEpoch({ gooseSessionId: sessionId });
+  const turn = runtime.broker.enqueueTurn({
+    gooseSessionId: sessionId,
+    requestHash: "malformed-orphan-request",
+    budgetPromptTokens: () => 1,
+  });
+  runtime.broker.admitNext();
+  runtime.broker.markSendActivated(turn.turnRef);
+  runtime.broker.markUnreconciled(turn.turnRef, "browser_lost_before_identity_capture");
+
+  const recover = async (canonicalConversationId: string, acceptedUserTurnId: string) => await fetch(
+    `${runtime.origin}/admin/abandon-unreconciled`,
+    {
+      method: "POST",
+      headers: { authorization: "Bearer control-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        turn_ref: turn.turnRef,
+        positive_terminal_evidence: {
+          canonical_conversation_id: canonicalConversationId,
+          accepted_user_turn_id: acceptedUserTurnId,
+          remote_ui_non_running_across_qualified_settle: true,
+          no_unresolved_goose_work: true,
+          no_contradictory_activity: true,
+        },
+      }),
+    },
+  );
+
+  const badConversation = await recover("https://chatgpt.com/c/not-a-uuid", "user-recovered-orphan");
+  expect(badConversation.status).toBe(400);
+  expect(await badConversation.json()).toMatchObject({ error: { code: "invalid_recovery_request" } });
+  expect(runtime.broker.getCurrentEpoch(sessionId)?.conversationId).toBeNull();
+  expect(runtime.broker.getTurn(turn.turnRef)?.acceptedUserTurnId).toBeNull();
+  expect(runtime.broker.getAccountSlotHolder()).toBe(turn.turnRef);
+
+  const badUser = await recover("12345678-1234-4abc-8def-1234567890ab", "bad user\nturn");
+  expect(badUser.status).toBe(400);
+  expect(await badUser.json()).toMatchObject({ error: { code: "invalid_recovery_request" } });
+  expect(runtime.broker.getCurrentEpoch(sessionId)?.conversationId).toBeNull();
+  expect(runtime.broker.getTurn(turn.turnRef)?.acceptedUserTurnId).toBeNull();
+  expect(runtime.broker.getAccountSlotHolder()).toBe(turn.turnRef);
 });
 
 test("abandoned current epoch forces the next Goose turn onto a fresh seeded conversation", async () => {

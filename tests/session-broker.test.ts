@@ -361,6 +361,66 @@ test("timeout or silence alone never releases account slot; positive terminal ev
   }
 });
 
+test("positive-terminal recovery atomically binds a missing orphan identity before slot release", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    broker.admitNext();
+    broker.markSendActivated("turn-a");
+    broker.markUnreconciled("turn-a", "browser_lost_before_identity_capture");
+
+    const released = broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
+    expect(released.acceptedUserTurnId).toBe("user-turn-a");
+    expect(broker.getCurrentEpoch("goose-a")?.conversationId).toBe("conversation-a");
+    expect(broker.getAccountSlotHolder()).toBeNull();
+    expect(broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal).acceptedUserTurnId)
+      .toBe("user-turn-a");
+  } finally {
+    broker.close();
+  }
+});
+
+test("positive-terminal orphan identity conflict rolls back a partial recovery binding", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    broker.admitNext();
+    broker.markSendActivated("turn-a");
+    broker.markAccepted("turn-a", "different-user-turn");
+    broker.markUnreconciled("turn-a", "browser_lost_before_conversation_capture");
+
+    expect(() => broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal))
+      .toThrow(SessionBrokerError);
+    expect(broker.getCurrentEpoch("goose-a")?.conversationId).toBeNull();
+    expect(broker.getTurn("turn-a")?.acceptedUserTurnId).toBe("different-user-turn");
+    expect(broker.getAccountSlotHolder()).toBe("turn-a");
+  } finally {
+    broker.close();
+  }
+});
+
+test("positive-terminal recovery checks final-state guards before binding a missing orphan identity", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    broker.admitNext();
+    broker.markSendActivated("turn-a");
+    broker.markUnreconciled("turn-a", "browser_lost_before_identity_capture");
+    broker.recordFinalDigest("turn-a", "digest-before-recovery");
+
+    expect(() => broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal))
+      .toThrow(SessionBrokerError);
+    expect(broker.getCurrentEpoch("goose-a")?.conversationId).toBeNull();
+    expect(broker.getTurn("turn-a")?.acceptedUserTurnId).toBeNull();
+    expect(broker.getAccountSlotHolder()).toBe("turn-a");
+  } finally {
+    broker.close();
+  }
+});
+
 test("positive-terminal demotion fails while an operation remains unresolved", () => {
   const { broker } = fixture();
   try {
