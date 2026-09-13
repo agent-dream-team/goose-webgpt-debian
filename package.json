@@ -52,9 +52,7 @@
     "launcher:typecheck": "bun run --cwd launcher typecheck",
     "launcher:build": "bun run --cwd launcher build",
     "launcher:test": "bun run --cwd launcher test",
-    "verify": "bun run scripts/verify.ts",
-    "baseline:rebuild": "node scripts/rebuild-baseline-manifest.ts",
-    "baseline:rebuild:check": "node scripts/rebuild-baseline-manifest.ts --check"
+    "verify": "bun run scripts/verify.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",

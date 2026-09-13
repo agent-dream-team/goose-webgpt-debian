@@ -2,6 +2,8 @@
 
 This checkout contains the qualified Goose ChatGPT Web V1. Read `docs/persistent-chat-rebuild-plan.md` before architecture, browser, connector, lifecycle, security, or recovery work; it is now the durable qualification ledger and follow-up-gate authority rather than a pre-V1 design proposal. The exact deployed non-reboot V1 code checkpoint is `2ac2f561a674482d8eccf0e0cc690edc095b7806`; later repository commits may be documentation/closeout only.
 
+DreamBook repository authority: `origin` must be `agent-dream-team/goose-webgpt-debian`. Do not point this checkout at `luke-m-selway/goose-chatgpt-web`; that repository is reserved for later cross-platform/macOS adaptation of the V1 design.
+
 Baseline: `miuuyy/codex-chatgpt-web@e85e3693fdb4e3e033348c08df0298c20fcdb612` (v5.0.6 lineage). Inspect current upstream before diagnosing browser/UI/authentication behavior and reuse proven upstream mechanisms where their semantics fit.
 
 ## Authority and boundaries
