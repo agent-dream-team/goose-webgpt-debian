@@ -316,33 +316,15 @@ test("persistent rebuild configuration is explicit and legacy-safe", () => {
     rebuild: config.rebuild,
   });
 
-  const budgeted = {
+  const retiredBudget = {
     ...config,
     rebuild: {
       ...config.rebuild!,
-      conversationBudget: {
-        softLimitTokens: 400_000,
-        baseAllowanceTokens: 20_000,
-        recoveryReserveTokens: 40_000,
-        turnGrowthReserveTokens: 200_000,
-        finalResponseReserveTokens: 32_000,
-      },
+      conversationBudget: { turnGrowthReserveTokens: 384_000 },
     },
   };
-  writeFileSync(join(root, "config.json"), `${JSON.stringify(budgeted)}\n`);
-  expect(loadConfig().rebuild?.conversationBudget).toEqual(budgeted.rebuild.conversationBudget);
-
-  writeFileSync(join(root, "config.json"), `${JSON.stringify({
-    ...budgeted,
-    rebuild: { ...budgeted.rebuild, conversationBudget: { ...budgeted.rebuild.conversationBudget, mysteryLimit: 1 } },
-  })}\n`);
-  expect(() => loadConfig()).toThrow("conversationBudget contains an unknown field");
-
-  writeFileSync(join(root, "config.json"), `${JSON.stringify({
-    ...budgeted,
-    rebuild: { ...budgeted.rebuild, conversationBudget: { ...budgeted.rebuild.conversationBudget, softLimitTokens: 1 } },
-  })}\n`);
-  expect(() => loadConfig()).toThrow("conversationBudget policy is invalid");
+  writeFileSync(join(root, "config.json"), `${JSON.stringify(retiredBudget)}\n`);
+  expect(() => loadConfig()).toThrow("conversationBudget is retired");
 
   writeFileSync(join(root, "config.json"), `${JSON.stringify({ ...config, mode: "browser-only" })}\n`);
   expect(() => loadConfig()).toThrow("requires full automatic launcher mode");

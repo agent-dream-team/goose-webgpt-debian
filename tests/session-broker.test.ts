@@ -3,7 +3,6 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
-import type { ConversationBudgetPolicy } from "../src/conversation-budget";
 import {
   SessionBroker,
   SessionBrokerError,
@@ -356,6 +355,66 @@ test("timeout or silence alone never releases account slot; positive terminal ev
     expect(broker.getAccountSlotHolder()).toBeNull();
     expect(broker.admitNext()?.turn.turnRef).toBe("turn-b");
     expect(broker.getCurrentEpoch("goose-a")?.leaseState).toBe("UNRECONCILED");
+  } finally {
+    broker.close();
+  }
+});
+
+test("positive-terminal recovery atomically binds a missing orphan identity before slot release", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    broker.admitNext();
+    broker.markSendActivated("turn-a");
+    broker.markUnreconciled("turn-a", "browser_lost_before_identity_capture");
+
+    const released = broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
+    expect(released.acceptedUserTurnId).toBe("user-turn-a");
+    expect(broker.getCurrentEpoch("goose-a")?.conversationId).toBe("conversation-a");
+    expect(broker.getAccountSlotHolder()).toBeNull();
+    expect(broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal).acceptedUserTurnId)
+      .toBe("user-turn-a");
+  } finally {
+    broker.close();
+  }
+});
+
+test("positive-terminal orphan identity conflict rolls back a partial recovery binding", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    broker.admitNext();
+    broker.markSendActivated("turn-a");
+    broker.markAccepted("turn-a", "different-user-turn");
+    broker.markUnreconciled("turn-a", "browser_lost_before_conversation_capture");
+
+    expect(() => broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal))
+      .toThrow(SessionBrokerError);
+    expect(broker.getCurrentEpoch("goose-a")?.conversationId).toBeNull();
+    expect(broker.getTurn("turn-a")?.acceptedUserTurnId).toBe("different-user-turn");
+    expect(broker.getAccountSlotHolder()).toBe("turn-a");
+  } finally {
+    broker.close();
+  }
+});
+
+test("positive-terminal recovery checks final-state guards before binding a missing orphan identity", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    broker.admitNext();
+    broker.markSendActivated("turn-a");
+    broker.markUnreconciled("turn-a", "browser_lost_before_identity_capture");
+    broker.recordFinalDigest("turn-a", "digest-before-recovery");
+
+    expect(() => broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal))
+      .toThrow(SessionBrokerError);
+    expect(broker.getCurrentEpoch("goose-a")?.conversationId).toBeNull();
+    expect(broker.getTurn("turn-a")?.acceptedUserTurnId).toBeNull();
+    expect(broker.getAccountSlotHolder()).toBe("turn-a");
   } finally {
     broker.close();
   }
@@ -1648,236 +1707,35 @@ test("ordinary pre-send cancellation remains terminal for exact request replay",
   }
 });
 
-const gateFBudgetPolicy: Partial<ConversationBudgetPolicy> = {
-  softLimitTokens: 450,
-  baseAllowanceTokens: 100,
-  recoveryReserveTokens: 50,
-  turnGrowthReserveTokens: 200,
-  finalResponseReserveTokens: 50,
-  toolOperationReserveTokens: 100,
-  budgetFailureReserveTokens: 20,
-};
-
-function budgetFixture(
-  policy: Partial<ConversationBudgetPolicy> = {},
-  now = () => 1_000,
-) {
-  const root = mkdtempSync(join(tmpdir(), "cgw-session-broker-budget-"));
-  roots.push(root);
-  const path = join(root, "broker.sqlite");
-  let op = 0;
-  let turn = 0;
-  const broker = new SessionBroker(path, {
-    projectId: "project",
-    terminalReplayWindowMs: 60_000,
-    conversationBudgetPolicy: { ...gateFBudgetPolicy, ...policy },
-    instanceId: "budget-broker-a",
-    now,
-    makeTurnRef: () => `budget-turn-${String.fromCharCode(97 + turn++)}`,
-    makeSubmitNonce: () => `budget-nonce-${turn}`,
-    makeOpRef: () => `budget-op-${++op}`,
-  });
-  return { broker, path };
-}
-
-function openBudget(path: string, instanceId: string, now = () => 1_000) {
-  let op = 100;
-  return new SessionBroker(path, {
-    projectId: "project",
-    terminalReplayWindowMs: 60_000,
-    conversationBudgetPolicy: gateFBudgetPolicy,
-    instanceId,
-    now,
-    makeOpRef: () => `budget-op-${++op}`,
-  });
-}
-
-test("reserve-first budget admits the exact boundary, settles once, and requires rollover before the next queued turn", () => {
-  const { broker } = budgetFixture();
+test("serial tool work is never pre-rejected by a local conversation-growth budget", () => {
+  const { broker } = fixture();
   try {
-    const epoch = broker.createEpoch({ gooseSessionId: "budget-session" });
-    expect(epoch.budgetConsumedTokens).toBe(100);
-    const first = broker.enqueueTurn({
-      gooseSessionId: "budget-session",
-      requestHash: "budget-request-1",
-      budgetPromptTokens: () => 100,
-    });
-    expect(first.budgetReservedTokens).toBe(300);
-    expect(first.budgetPromptTokens).toBe(100);
-    // 100 consumed + 300 reserved + 50 recovery reserve === 450 soft limit.
-    expect(broker.enqueueTurn({
-      gooseSessionId: "budget-session",
-      requestHash: "budget-request-1",
-      budgetPromptTokens: () => { throw new Error("exact replay must reuse the reservation"); },
-    }).turnRef).toBe(first.turnRef);
-
-    const admitted = broker.admitNext()!;
-    broker.markSendActivated(first.turnRef);
-    broker.bindConversation({ gooseSessionId: "budget-session", epoch: 1, conversationId: "budget-conversation" });
-    broker.markAccepted(first.turnRef, "budget-user-1");
-    broker.recordFinalDigest(first.turnRef, "budget-digest-1");
-    const claim = broker.beginCompletion(first.turnRef);
-    broker.commitCompletion(claim, {
-      connectorFinal: "ACKNOWLEDGED",
-      canonicalConversationId: "budget-conversation",
-      acceptedUserTurnId: "budget-user-1",
-      noUnresolvedGooseWork: true,
-      remoteNonRunning: true,
-      observedFinalDigest: "budget-digest-1",
-      canonicalHistoryWatermark: "budget-watermark-1",
-      budgetFinalTokens: 40,
-      answerBoundary: null,
-    });
-    expect(admitted.initialOpRef).toBe("budget-op-1");
-    expect(broker.getCurrentEpoch("budget-session")?.budgetConsumedTokens).toBe(240);
-    expect(broker.getTurn(first.turnRef)?.budgetReservedTokens).toBe(0);
-
-    let rollover: unknown;
-    try {
-      broker.enqueueTurn({
-        gooseSessionId: "budget-session",
-        requestHash: "budget-request-2",
-        budgetPromptTokens: () => 100,
-      });
-    } catch (error) { rollover = error; }
-    expect(rollover).toBeInstanceOf(SessionBrokerError);
-    expect((rollover as SessionBrokerError).code).toBe("BUDGET_ROLLOVER_REQUIRED");
-    expect(broker.getOpenTurnForSession("budget-session")).toBeNull();
-
-    const secondEpoch = broker.createEpoch({ gooseSessionId: "budget-session" });
-    expect(secondEpoch.epoch).toBe(2);
-    expect(secondEpoch.budgetConsumedTokens).toBe(100);
-    expect(broker.enqueueTurn({
-      gooseSessionId: "budget-session",
-      requestHash: "budget-request-2",
-      budgetPromptTokens: () => 100,
-    }).epoch).toBe(2);
-  } finally {
-    broker.close();
-  }
-});
-
-test("budget reservation is released only by pre-send cancellation and survives restart/ambiguous remote state", () => {
-  const { broker, path } = budgetFixture({ softLimitTokens: 1_000 });
-  broker.createEpoch({ gooseSessionId: "budget-restart" });
-  const queued = broker.enqueueTurn({
-    gooseSessionId: "budget-restart",
-    requestHash: "budget-restart-request",
-    budgetPromptTokens: () => 25,
-  });
-  expect(queued.budgetReservedTokens).toBe(225);
-  broker.admitNext();
-  broker.markSendActivated(queued.turnRef);
-  broker.close();
-
-  const restarted = openBudget(path, "budget-broker-b", () => 9_999_999);
-  try {
-    const recovered = restarted.getTurn(queued.turnRef)!;
-    expect(recovered.state).toBe("UNRECONCILED");
-    expect(recovered.budgetReservedTokens).toBe(225);
-    expect(restarted.getAccountSlotHolder()).toBe(queued.turnRef);
-  } finally {
-    restarted.close();
-  }
-
-  const fresh = budgetFixture({ softLimitTokens: 1_000 }).broker;
-  try {
-    fresh.createEpoch({ gooseSessionId: "budget-cancel" });
-    const cancellable = fresh.enqueueTurn({
-      gooseSessionId: "budget-cancel",
-      requestHash: "cancel-me",
-      budgetPromptTokens: () => 25,
-    });
-    fresh.admitNext();
-    expect(fresh.cancelRetryableBeforeSend(cancellable.turnRef).budgetReservedTokens).toBe(0);
-    expect(fresh.getCurrentEpoch("budget-cancel")?.budgetConsumedTokens).toBe(100);
-  } finally {
-    fresh.close();
-  }
-});
-
-test("tool growth is reserved before execution and budget exhaustion never authorizes another side effect", () => {
-  const { broker } = budgetFixture({ softLimitTokens: 1_000 });
-  try {
-    broker.createEpoch({ gooseSessionId: "budget-tools" });
-    const turn = broker.enqueueTurn({
-      gooseSessionId: "budget-tools",
-      requestHash: "budget-tools-request",
-      budgetPromptTokens: () => 10,
-    });
-    const admitted = broker.admitNext()!;
+    broker.createEpoch({ gooseSessionId: "uncapped-tools" });
+    const turn = broker.enqueueTurn({ gooseSessionId: "uncapped-tools", requestHash: "uncapped-request" });
+    let opRef = broker.admitNext()!.initialOpRef;
     broker.markSendActivated(turn.turnRef);
-    broker.bindConversation({ gooseSessionId: "budget-tools", epoch: 1, conversationId: "budget-tools-conversation" });
-    broker.markAccepted(turn.turnRef, "budget-tools-user");
-    broker.recordAnswerBoundary(turn.turnRef, admitted.initialOpRef, '{"chars":1}');
-    expect(broker.claimOperation({ turnRef: turn.turnRef, opRef: admitted.initialOpRef, inputHash: "hash-1" })).toMatchObject({
-      kind: "EXECUTE",
+    broker.bindConversation({
+      gooseSessionId: "uncapped-tools", epoch: 1, conversationId: "uncapped-conversation",
     });
-    expect(broker.getOperation(admitted.initialOpRef)?.budgetReservedTokens).toBe(100);
-    const terminal = broker.completeOperation({
-      opRef: admitted.initialOpRef,
-      inputHash: "hash-1",
-      outcome: "SUCCESS",
-      resultJson: '{"ok":true}',
-      budgetChargeTokens: 50,
-    });
-    expect(broker.getTurn(turn.turnRef)?.budgetGrowthConsumedTokens).toBe(50);
+    broker.markAccepted(turn.turnRef, "uncapped-user");
 
-    broker.recordAnswerBoundary(turn.turnRef, terminal.nextOpRef, '{"chars":2}');
-    expect(broker.claimOperation({ turnRef: turn.turnRef, opRef: terminal.nextOpRef, inputHash: "hash-2" })).toMatchObject({
-      kind: "BUDGET_REQUIRED",
-    });
-    expect(broker.getOperation(terminal.nextOpRef)?.state).toBe("MINTED");
-    const rejected = broker.rejectOperationForBudget({
-      turnRef: turn.turnRef,
-      opRef: terminal.nextOpRef,
-      inputHash: "hash-2",
-      resultJson: '{"budget":"exhausted"}',
-    });
-    expect(rejected.operation.state).toBe("FAILURE");
-    expect(broker.getTurn(turn.turnRef)).toMatchObject({
-      state: "UNRECONCILED",
-      budgetGrowthConsumedTokens: 70,
-      budgetReservedTokens: 210,
-    });
-    expect(broker.getAccountSlotHolder()).toBe(turn.turnRef);
-  } finally {
-    broker.close();
-  }
-});
-
-test("budgeted FIFO remains global across sessions and legacy unknown accounting forces rollover instead of guessing", () => {
-  const { broker } = budgetFixture({ softLimitTokens: 1_000 });
-  try {
-    broker.createEpoch({ gooseSessionId: "budget-fifo-a" });
-    broker.createEpoch({ gooseSessionId: "budget-fifo-b" });
-    const a = broker.enqueueTurn({ gooseSessionId: "budget-fifo-a", requestHash: "a", budgetPromptTokens: () => 10 });
-    const b = broker.enqueueTurn({ gooseSessionId: "budget-fifo-b", requestHash: "b", budgetPromptTokens: () => 10 });
-    expect(broker.admitNext()?.turn.turnRef).toBe(a.turnRef);
-    broker.cancelBeforeSend(a.turnRef);
-    expect(broker.admitNext()?.turn.turnRef).toBe(b.turnRef);
-    broker.cancelBeforeSend(b.turnRef);
-  } finally {
-    broker.close();
-  }
-
-  const legacy = fixture();
-  legacy.broker.createEpoch({ gooseSessionId: "legacy-budget" });
-  legacy.broker.close();
-  const upgraded = openBudget(legacy.path, "budget-upgrade");
-  try {
-    expect(upgraded.getCurrentEpoch("legacy-budget")?.budgetConsumedTokens).toBeNull();
-    let rollover: unknown;
-    try {
-      upgraded.enqueueTurn({
-        gooseSessionId: "legacy-budget",
-        requestHash: "legacy-budget-request",
-        budgetPromptTokens: () => 10,
+    for (let index = 0; index < 12; index += 1) {
+      broker.recordAnswerBoundary(turn.turnRef, opRef, JSON.stringify({ chars: index + 1 }));
+      expect(broker.claimOperation({
+        turnRef: turn.turnRef, opRef, inputHash: `hash-${index}`,
+      })).toMatchObject({ kind: "EXECUTE" });
+      const terminal = broker.completeOperation({
+        opRef, inputHash: `hash-${index}`, outcome: "SUCCESS",
+        resultJson: JSON.stringify({ output: "x".repeat(40_000) }),
       });
-    } catch (error) { rollover = error; }
-    expect((rollover as SessionBrokerError).code).toBe("BUDGET_ROLLOVER_REQUIRED");
-    expect(upgraded.createEpoch({ gooseSessionId: "legacy-budget" })).toMatchObject({ epoch: 2, budgetConsumedTokens: 100 });
+      opRef = terminal.nextOpRef;
+    }
+
+    expect(broker.getTurn(turn.turnRef)).toMatchObject({
+      state: "TURN_OUTSTANDING", budgetReservedTokens: null,
+      budgetPromptTokens: null, budgetGrowthConsumedTokens: null,
+    });
   } finally {
-    upgraded.close();
+    broker.close();
   }
 });

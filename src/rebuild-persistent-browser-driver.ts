@@ -51,9 +51,10 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_POLL_MS = 100;
 const DEFAULT_BOUNDARY_SETTLE_MS = 250;
 const DEFAULT_CONFIRM_SETTLE_MS = 250;
-const DEFAULT_STALE_OBSERVATION_REBIND_MS = 15_000;
-const DEFAULT_STALE_OBSERVATION_REOPEN_MS = 5 * 60_000;
+const DEFAULT_STALE_OBSERVATION_FIRST_REFRESH_MS = 15_000;
+const DEFAULT_STALE_OBSERVATION_SUBSEQUENT_REFRESH_MS = 5 * 60_000;
 const SEND_ENABLE_GRACE_MS = 10_000;
+const GCW_RECOVERY_CONTINUATION_PROMPT = "You seem to have stopped mid-turn. Work out where you got to and continue from there.";
 
 export interface RebuildAnswerProjection {
   assistantTurnId: string;
@@ -91,8 +92,8 @@ export interface RebuildPersistentBrowserDriverOptions {
   confirmationSettleMs?: number;
   completionSettleMs?: number;
   postToolAnswerGraceMs?: number;
-  staleObservationRebindMs?: number;
-  staleObservationReopenMs?: number;
+  staleObservationFirstRefreshMs?: number;
+  staleObservationSubsequentRefreshMs?: number;
   dependencies?: {
     notifyTurn?: NotifyTurn;
     connectSurface?: ConnectSurface;
@@ -120,7 +121,7 @@ export function rebuildConversationKey(projectId: string, gooseSessionId: string
 }
 
 function abortIfRequested(signal: AbortSignal): void {
-  if (signal.aborted) throw new DOMException("Persistent browser turn aborted before send", "AbortError");
+  if (signal.aborted) throw new DOMException("Persistent browser turn aborted", "AbortError");
 }
 
 function isTargetClosedError(error: unknown): boolean {
@@ -267,8 +268,8 @@ export function createRebuildPersistentBrowserDriver(
   const pollMs = options.pollMs ?? DEFAULT_POLL_MS;
   const boundarySettleMs = options.boundarySettleMs ?? DEFAULT_BOUNDARY_SETTLE_MS;
   const confirmationSettleMs = options.confirmationSettleMs ?? DEFAULT_CONFIRM_SETTLE_MS;
-  const staleObservationRebindMs = options.staleObservationRebindMs ?? DEFAULT_STALE_OBSERVATION_REBIND_MS;
-  const staleObservationReopenMs = options.staleObservationReopenMs ?? DEFAULT_STALE_OBSERVATION_REOPEN_MS;
+  const staleObservationFirstRefreshMs = options.staleObservationFirstRefreshMs ?? DEFAULT_STALE_OBSERVATION_FIRST_REFRESH_MS;
+  const staleObservationSubsequentRefreshMs = options.staleObservationSubsequentRefreshMs ?? DEFAULT_STALE_OBSERVATION_SUBSEQUENT_REFRESH_MS;
   const notifyTurn = options.dependencies?.notifyTurn ?? notifyLauncherTurn;
   const connectSurface = options.dependencies?.connectSurface ?? connectLauncherBrowserHost;
   const captureSnapshot = options.dependencies?.captureSnapshot ?? capturePersistentChatTurnSnapshot;
@@ -291,20 +292,20 @@ export function createRebuildPersistentBrowserDriver(
       let sendActivated = false;
       let acceptedConversationId: string | undefined;
       let acceptedUserTurnId: string | undefined;
+      let observationUserTurnId: string | undefined;
       let assistantTurnId: string | undefined;
       let baseline: PersistentChatTurnSnapshot | undefined;
       let completionTracker = new ChatGptCompletionTracker(
         options.completionSettleMs, options.postToolAnswerGraceMs,
       );
       let staleObservation: { kind: "running" | "missing-completion-action"; signature: string; since: number } | undefined;
-      let staleObservationRecoveryStage: "initial" | "rebound" | "reopened" = "initial";
+      let staleObservationRecoveryStage: "initial" | "refreshed" = "initial";
       let boundaryRevision = 0;
       let lastBoundaryText: string | undefined;
       let boundaryCaptureInFlight = false;
       let launcherEnded = false;
       let connectorBound = false;
       let surfaceRecreated = false;
-      let postSendSurfaceRecoveryAttempted = false;
 
       const closeConnection = async () => {
         if (!connection) return;
@@ -373,14 +374,16 @@ export function createRebuildPersistentBrowserDriver(
         );
         return await controller.reopen(binding, input.preSendAbortSignal);
       });
-      const acceptedBinding = (): PersistentChatBinding => {
-        if (!leasedSurfaceId || !acceptedConversationId || !acceptedUserTurnId) {
-          throw new Error("Persistent ChatGPT accepted surface binding is incomplete");
+      const observationBinding = (): PersistentChatBinding => {
+        if (!leasedSurfaceId || !acceptedConversationId || !observationUserTurnId) {
+          throw new Error("Persistent ChatGPT observation binding is incomplete");
         }
         return {
           surfaceId: leasedSurfaceId,
           conversationId: acceptedConversationId,
-          acceptedUserTurnId,
+          // Recovery continuations are private GCW artifacts. This anchor may advance while the
+          // broker-visible acceptedUserTurnId remains the original Goose user turn.
+          acceptedUserTurnId: observationUserTurnId,
         };
       };
       const assertRecoveryAllowed = async (): Promise<void> => {
@@ -407,11 +410,10 @@ export function createRebuildPersistentBrowserDriver(
         return true;
       };
       const recoverLostAcceptedSurface = async (cause: unknown): Promise<boolean> => {
-        if (postSendSurfaceRecoveryAttempted || !sendActivated || !acceptedConversationId || !acceptedUserTurnId) return false;
+        if (!sendActivated || !acceptedConversationId || !observationUserTurnId) return false;
         if (input.gooseWork.isToolWorkInFlight()) return false;
         const currentPage = page;
         if (!currentPage || (!currentPage.isClosed() && !isTargetClosedError(cause))) return false;
-        postSendSurfaceRecoveryAttempted = true;
         stopHeartbeat();
         await closeConnection();
         const lease = await notifyTurn(options.descriptorPath, {
@@ -444,7 +446,7 @@ export function createRebuildPersistentBrowserDriver(
         let anchorRecovered = false;
         while (Date.now() < deadline) {
           const snapshot = await captureSnapshot(recoveredPage);
-          if (acceptedUserAnchorPresent(snapshot, acceptedUserTurnId)) { anchorRecovered = true; break; }
+          if (acceptedUserAnchorPresent(snapshot, observationUserTurnId)) { anchorRecovered = true; break; }
           await sleep(pollMs);
         }
         if (!anchorRecovered) throw new Error("Reconstructed ChatGPT surface did not recover the accepted user-turn anchor");
@@ -456,7 +458,7 @@ export function createRebuildPersistentBrowserDriver(
         startHeartbeat();
         return true;
       };
-      const adoptBoundConnection = async (binding: PersistentChatBinding, action: "rebind" | "reopen") => {
+      const adoptBoundConnection = async (binding: PersistentChatBinding) => {
         connection = await connectSurface(
           options.descriptorPath, timeoutMs, binding.surfaceId, input.preSendAbortSignal,
         );
@@ -465,26 +467,19 @@ export function createRebuildPersistentBrowserDriver(
         await verifyAuthenticated(reboundPage, timeoutMs, input.preSendAbortSignal);
         const location = classifyChatGptConversationUrl(reboundPage.url());
         if (location.kind !== "canonical" || location.conversationId !== binding.conversationId) {
-          throw new Error(`Persistent ChatGPT stale-observation ${action} reached a different conversation`);
+          throw new Error("Persistent ChatGPT stale-observation refresh reached a different conversation");
         }
         const snapshot = await captureSnapshot(reboundPage);
         const derivedAssistant = assistantTurnForAcceptedUser(snapshot, binding.acceptedUserTurnId);
         if (!derivedAssistant) {
-          throw new Error(`Persistent ChatGPT stale-observation ${action} lost the accepted user-turn anchor`);
+          throw new Error("Persistent ChatGPT stale-observation refresh lost the accepted user-turn anchor");
         }
         assistantTurnId = derivedAssistant;
         resetCompletionTracker();
       };
-      const rebindAcceptedSurface = async (): Promise<void> => {
-        await assertRecoveryAllowed();
-        const binding = acceptedBinding();
-        // The cheap tier changes only the disposable CDP/Playwright handle; it never navigates or resends.
-        await closeConnection();
-        await adoptBoundConnection(binding, "rebind");
-      };
       const reopenAcceptedSurface = async (): Promise<void> => {
         await assertRecoveryAllowed();
-        const binding = acceptedBinding();
+        const binding = observationBinding();
         // Elapsed time only authorizes the next observation tier; it never proves completion or resend safety.
         await closeConnection();
         const reopened = await reopenBinding(binding);
@@ -494,13 +489,56 @@ export function createRebuildPersistentBrowserDriver(
           || !reopened.assistantTurnId) {
           throw new Error("Persistent ChatGPT stale-observation reopen did not preserve the durable turn binding");
         }
-        await adoptBoundConnection(binding, "reopen");
+        await adoptBoundConnection(binding);
+      };
+      const pressComposerSend = async (composer: Locator): Promise<void> => {
+        const sendButton = composer.locator("xpath=ancestor::form[1]").getByTestId("send-button");
+        await sendButton.waitFor({ state: "visible", timeout: timeoutMs });
+        const sendDeadline = Date.now() + Math.min(timeoutMs, SEND_ENABLE_GRACE_MS);
+        while (!await sendButton.isEnabled()) {
+          abortIfRequested(input.preSendAbortSignal);
+          if (Date.now() >= sendDeadline) throw new Error("ChatGPT persistent send button remained disabled");
+          await sleep(pollMs);
+        }
+        abortIfRequested(input.preSendAbortSignal);
+        await sendButton.press("Enter", { noWaitAfter: true, timeout: 0 });
+      };
+      const sendRecoveryContinuation = async (): Promise<void> => {
+        await assertRecoveryAllowed();
+        if (!acceptedConversationId) throw new Error("Persistent ChatGPT recovery continuation has no durable conversation");
+        const currentPage = requireLiveSurface();
+        assertExactExistingConversation(currentPage, acceptedConversationId, "Recovery continuation surface");
+        const running = await currentPage.locator(CHATGPT_STOP_BUTTON_SELECTOR).last().isVisible().catch(() => false);
+        if (running) return;
+        const before = await captureSnapshot(currentPage);
+        const preparedComposer = await prepareOrdinaryComposer(currentPage);
+        const composer = await attachExactPrompt(
+          currentPage, GCW_RECOVERY_CONTINUATION_PROMPT, timeoutMs, input.preSendAbortSignal, preparedComposer,
+          false, thinkMode,
+        );
+        await pressComposerSend(composer);
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          const snapshot = await captureSnapshot(currentPage);
+          const continuationUserTurnId = acceptedUserTurnIdentity(before.turnIdentities, snapshot);
+          if (continuationUserTurnId) {
+            assertExactExistingConversation(currentPage, acceptedConversationId, "Recovery continuation acceptance");
+            observationUserTurnId = continuationUserTurnId;
+            assistantTurnId = undefined;
+            resetCompletionTracker();
+            staleObservation = undefined;
+            staleObservationRecoveryStage = "initial";
+            return;
+          }
+          await sleep(pollMs);
+        }
+        throw new Error("Persistent ChatGPT recovery continuation was not accepted into the same conversation");
       };
       const observeAnchoredProjection = async (): Promise<RebuildAnswerProjection> => {
         const currentPage = requireLiveSurface();
-        if (!acceptedUserTurnId) throw new Error("Persistent ChatGPT user-turn identity is not accepted yet");
+        if (!observationUserTurnId) throw new Error("Persistent ChatGPT observation anchor is not accepted yet");
         const snapshot = await captureSnapshot(currentPage);
-        const derivedAssistant = assistantTurnForAcceptedUser(snapshot, acceptedUserTurnId);
+        const derivedAssistant = assistantTurnForAcceptedUser(snapshot, observationUserTurnId);
         if (!derivedAssistant) throw new Error("Persistent ChatGPT assistant turn has not materialized yet");
         assistantTurnId = derivedAssistant;
         await assertNoTerminalError(currentPage, derivedAssistant);
@@ -543,11 +581,16 @@ export function createRebuildPersistentBrowserDriver(
         }
       };
       const waitForAcceptedIdentity = async (): Promise<void> => {
-        const currentPage = requireLiveSurface();
         if (!baseline) throw new Error("Persistent ChatGPT submission baseline is missing");
-        const deadline = Date.now() + timeoutMs;
-        while (Date.now() < deadline) {
+        // Once the durable send fence is armed, elapsed time cannot prove non-acceptance. Keep the
+        // owned observer alive until remote identity appears or an actual abort/browser failure occurs.
+        for (;;) {
+          abortIfRequested(input.preSendAbortSignal);
+          const currentPage = requireLiveSurface();
           const snapshot = await captureSnapshot(currentPage);
+          // The snapshot already reduces nested data-turn-id-container duplicates to one logical
+          // outer turn identity. Do not classify error UI before broker identity is durable: once the
+          // accepted Goose user anchor is recorded, same-chat recovery owns terminal/error handling.
           const userTurn = acceptedUserTurnIdentity(baseline.turnIdentities, snapshot);
           let conversationId: string | undefined;
           try {
@@ -563,28 +606,45 @@ export function createRebuildPersistentBrowserDriver(
             }
             acceptedConversationId = conversationId;
             acceptedUserTurnId = userTurn;
+            observationUserTurnId = userTurn;
             await input.lifecycle.onAccepted({ canonicalConversationId: conversationId, acceptedUserTurnId: userTurn });
             return;
           }
           await sleep(pollMs);
         }
-        throw new Error("Persistent ChatGPT submission never established canonical conversation and absolute user-turn identity");
       };
       const waitForFinalCandidate = async (): Promise<RebuildBrowserFinalEvidence> => {
+        let terminalViewRefreshed = false;
         // Once ChatGPT has accepted the remote user turn, elapsed time is not terminal evidence.
         // Keep the exact launcher-owned observer alive until authoritative DOM/tool/browser state
-        // proves completion. If only the disposable observer disappears, reconstruct that view once
-        // from the durable canonical conversation/user anchor; never replay the accepted prompt.
+        // proves completion. If only the disposable observer disappears, reconstruct that view
+        // from the durable canonical conversation/user anchor as often as needed; never replay the accepted prompt.
         for (;;) {
           try {
             if (boundaryCaptureInFlight) { await sleep(pollMs); continue; }
             const currentPage = requireLiveSurface();
             const snapshot = await captureSnapshot(currentPage);
           if (!acceptedUserTurnId || !acceptedConversationId) throw new Error("Persistent ChatGPT accepted identity disappeared");
-          const derivedAssistant = assistantTurnForAcceptedUser(snapshot, acceptedUserTurnId);
+          if (!observationUserTurnId) throw new Error("Persistent ChatGPT observation anchor disappeared");
+          const derivedAssistant = assistantTurnForAcceptedUser(snapshot, observationUserTurnId);
           if (!derivedAssistant) { await sleep(pollMs); continue; }
           assistantTurnId = derivedAssistant;
-          await assertNoTerminalError(currentPage, derivedAssistant);
+          try {
+            await assertNoTerminalError(currentPage, derivedAssistant);
+            terminalViewRefreshed = false;
+          } catch (error) {
+            if (!(error instanceof ChatGptUpstreamTerminalError)) throw error;
+            if (!terminalViewRefreshed) {
+              await reopenAcceptedSurface();
+              terminalViewRefreshed = true;
+              staleObservation = undefined;
+              staleObservationRecoveryStage = "refreshed";
+            } else {
+              await sendRecoveryContinuation();
+              terminalViewRefreshed = false;
+            }
+            continue;
+          }
           const projection = await captureAnswer(currentPage, derivedAssistant);
           const running = await currentPage.locator(CHATGPT_STOP_BUTTON_SELECTOR).last().isVisible().catch(() => false);
           const toolWorkInFlight = input.gooseWork.isToolWorkInFlight();
@@ -623,25 +683,31 @@ export function createRebuildPersistentBrowserDriver(
               staleObservation = { kind: staleObservationKind, signature, since: now };
               staleObservationRecoveryStage = "initial";
             } else if (staleObservation.signature !== signature) {
-              // Content progress restarts only the settle clock. It does not erase a rebind already
+              // Content progress restarts only the settle clock. It does not erase a refresh already
               // performed for this same stale-observation episode.
               staleObservation = { kind: staleObservationKind, signature, since: now };
             } else {
-              const recoveryThresholdMs = staleObservationRecoveryStage === "initial"
-                ? staleObservationRebindMs
-                : staleObservationReopenMs;
+              // A visible running state is positive work evidence; only the long watchdog may
+              // refresh that disposable view while generation is still active.
+              const recoveryThresholdMs = staleObservationKind === "running"
+                ? staleObservationSubsequentRefreshMs
+                : staleObservationRecoveryStage === "initial"
+                  ? staleObservationFirstRefreshMs
+                  : staleObservationSubsequentRefreshMs;
               if (now - staleObservation.since >= recoveryThresholdMs) {
-                if (staleObservationRecoveryStage === "initial") {
-                  await rebindAcceptedSurface();
-                  staleObservationRecoveryStage = "rebound";
-                } else if (staleObservationRecoveryStage === "rebound") {
-                  await reopenAcceptedSurface();
-                  staleObservationRecoveryStage = "reopened";
+                if (staleObservationKind === "missing-completion-action"
+                  && staleObservationRecoveryStage === "refreshed") {
+                  await sendRecoveryContinuation();
+                  terminalViewRefreshed = false;
                 } else {
-                  throw new Error("Persistent ChatGPT observation remained stale after bounded recovery");
+                  // Browser state is only a view. Reconstruct that view in the same canonical
+                  // conversation, settle it, then reassess instead of retiring the provider chat.
+                  await reopenAcceptedSurface();
+                  staleObservationRecoveryStage = "refreshed";
                 }
-                // The replacement observer must establish its own stable projection before the next tier.
-                staleObservation = { kind: staleObservationKind, signature: "", since: Date.now() };
+                staleObservation = staleObservationRecoveryStage === "refreshed"
+                  ? { kind: staleObservationKind, signature: "", since: Date.now() }
+                  : undefined;
                 continue;
               }
             }
@@ -770,18 +836,9 @@ export function createRebuildPersistentBrowserDriver(
               currentPage, input.prompt, timeoutMs, input.preSendAbortSignal, preparedComposer,
               false, thinkMode,
             );
-            const sendButton = composer.locator("xpath=ancestor::form[1]").getByTestId("send-button");
-            await sendButton.waitFor({ state: "visible", timeout: timeoutMs });
-            const sendDeadline = Date.now() + Math.min(timeoutMs, SEND_ENABLE_GRACE_MS);
-            while (!await sendButton.isEnabled()) {
-              abortIfRequested(input.preSendAbortSignal);
-              if (Date.now() >= sendDeadline) throw new Error("ChatGPT persistent send button remained disabled");
-              await sleep(pollMs);
-            }
-            abortIfRequested(input.preSendAbortSignal);
             await input.lifecycle.onSendActivated();
             sendActivated = true;
-            await sendButton.press("Enter", { noWaitAfter: true, timeout: 0 });
+            await pressComposerSend(composer);
             await waitForAcceptedIdentity();
             return await waitForFinalCandidate();
           } catch (error) {

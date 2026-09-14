@@ -52,6 +52,43 @@ out({ type: "ready", version: 1 });
   return path;
 }
 
+function boundaryRetryWorkerFixture(): string {
+  const root = mkdtempSync(join(tmpdir(), "cgw-node-browser-driver-boundary-test-"));
+  ROOTS.push(root);
+  const path = join(root, "worker.mjs");
+  writeFileSync(path, `
+import { createInterface } from "node:readline";
+const out = value => process.stdout.write(JSON.stringify(value) + "\\n");
+const accepted = { canonicalConversationId: ${JSON.stringify(CONVERSATION)}, acceptedUserTurnId: "user-fixture" };
+const final = { ...accepted, text: "fixture final", remoteNonRunning: true };
+let boundaryAttempts = 0;
+createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", line => {
+  const message = JSON.parse(line);
+  if (message.type === "start") return out({ type: "lifecycle", event: "send_activated" });
+  if (message.type === "lifecycle_ack" && message.event === "send_activated") {
+    if (!message.ok) return out({ type: "error", message: message.message || "send rejected" });
+    return out({ type: "lifecycle", event: "accepted", evidence: accepted });
+  }
+  if (message.type === "lifecycle_ack" && message.event === "accepted") {
+    if (!message.ok) return out({ type: "error", message: message.message || "accept rejected" });
+    return;
+  }
+  if (message.type === "boundary") {
+    boundaryAttempts += 1;
+    if (boundaryAttempts === 1) return out({ type: "boundary", requestId: message.requestId, error: "identity not ready" });
+    out({ type: "boundary", requestId: message.requestId, boundaryJson: "fixture-boundary" });
+    return out({ type: "candidate", evidence: final });
+  }
+  if (message.type === "confirm") {
+    out({ type: "confirmed", evidence: final });
+    return setImmediate(() => process.exit(0));
+  }
+});
+out({ type: "ready", version: 1 });
+`, { mode: 0o600 });
+  return path;
+}
+
 function turnInput(overrides: Partial<RebuildPersistentBrowserTurnInput> = {}): RebuildPersistentBrowserTurnInput {
   return {
     turnRef: "turn-fixture",
@@ -121,4 +158,23 @@ test("parent rejection of the send fence fails the worker turn instead of acknow
     },
   }));
   await expect(execution.run()).rejects.toThrow("durable send fence failed");
+});
+
+test("boundary refusal rejects only that request while the browser turn remains live", async () => {
+  let acceptedResolve!: () => void;
+  const accepted = new Promise<void>(resolve => { acceptedResolve = resolve; });
+  const execution = driver(boundaryRetryWorkerFixture()).createTurn(turnInput({
+    lifecycle: {
+      onSendActivated: () => {},
+      onAccepted: () => { acceptedResolve(); },
+    },
+  }));
+
+  const running = execution.run();
+  await accepted;
+  await expect(execution.captureAnswerBoundary("op-fixture")).rejects.toThrow("identity not ready");
+  expect(await execution.captureAnswerBoundary("op-fixture")).toBe("fixture-boundary");
+  const candidate = await running;
+  expect(candidate.text).toBe("fixture final");
+  expect(await execution.confirmFinal(candidate)).toEqual(candidate);
 });

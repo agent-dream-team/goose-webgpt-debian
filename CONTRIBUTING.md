@@ -1,55 +1,9 @@
 # Contributing
 
-> **REBUILD NOTE:** The scope text below is inherited from the upstream Codex product. Persistent-rebuild work follows `AGENTS.md` and `docs/persistent-chat-rebuild-plan.md` instead.
+Repository changes must follow `AGENTS.md` and the current authority documents it names.
 
+Keep changes bounded to the DreamBook Goose ChatGPT Web appliance. Preserve Goose's ownership of sessions, context, tools, approvals, and delegation; do not reintroduce inherited Codex workflow or a second agent/session runtime.
 
-Codex Web GPT was created and is primarily developed and maintained by
-[@miuuyy](https://github.com/miuuyy). Product direction, core architecture, and release decisions
-remain with the creator. Other contributors listed by GitHub have provided focused external fixes
-rather than shared product or architectural ownership.
+Before proposing or changing lifecycle, browser, persistence, or recovery behavior, read `docs/persistent-chat-lifecycle.md` and `docs/persistent-chat-follow-up.md`. Add focused regression coverage for behavior changes and run validation appropriate to the changed path.
 
-External contributions are welcome, but this is an intentionally maintainer-led project. Pull
-requests are expected to be small, focused, and easy to review and verify. Good contributions
-include isolated bug fixes, regression tests, documentation corrections, and narrow
-platform-specific fixes.
-
-Before opening a bug report, work through [TROUBLESHOOTING.md](TROUBLESHOOTING.md) and use the
-structured issue form. Reproduce once on the latest release and attach the privacy-safe export from
-**Activity → Export safe log**; never upload raw browser state, credentials, or unredacted logs.
-
-Large feature branches, broad refactors, rewrites, new providers, and changes to core behavior or
-architecture are generally not accepted. In rare cases they may be considered, but discuss the
-proposal in an issue before implementation. Prior discussion does not guarantee acceptance, and a
-large unsolicited pull request may be closed even when substantial work went into it.
-
-## Scope and invariants
-
-- Keep the project focused on ChatGPT web-backed Codex models. Generic providers and unrelated
-  product surfaces are out of scope.
-- Model selection is explicit. Never silently fall back to another model or reasoning level.
-- Full mode exposes local tools only through the active outer Codex registry and official MCP
-  tunnel. Browser-only mode must not create a broker capability or attach an MCP connector.
-- Every available ChatGPT Web effort has the same turn-bound MCP capability in Full mode. Do not
-  add effort-specific MCP exclusions.
-- Preserve fail-closed behavior. A selector or protocol failure must return an explicit error, not
-  pick another option or claim success.
-- Never commit browser state, cookies, API keys, tunnel IDs, Codex history, generated logs, or
-  absolute user paths.
-
-## Before opening a pull request
-
-1. Run `bun install --frozen-lockfile` in the repository root and in `launcher/`.
-2. Run `bun run verify`.
-3. Add a focused regression test for behavior changes.
-4. For browser UI changes, include the observed DOM evidence and a reproducible fixture. Do not
-   broaden selectors speculatively.
-5. Keep Terms and trademark claims factual. Do not market the project as a quota or rate-limit
-   bypass.
-6. Manually test the affected behavior. DEV mode is sufficient only when the change does not affect
-   local-tool execution, MCP execution, or the outer Codex agent loop. Execution changes require a
-   real installed Codex integration; DEV simulation is not end-to-end acceptance evidence.
-
-Launcher changes must preserve native packaging on macOS, Windows, and Linux. Platform packages
-must be built on their matching operating system. See [DEV chat mode](docs/dev-chat.md) for isolated
-browser and MCP development, and [release validation](docs/release-validation.md) for the required
-account-bound release checks.
+Never commit credentials, cookies, browser/profile state, tunnel/runtime keys, raw provider history, private prompts/tool results, or host-secret material. Work on a branch and keep qualification evidence privacy-safe and reproducible.

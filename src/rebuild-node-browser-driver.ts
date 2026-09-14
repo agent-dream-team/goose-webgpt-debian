@@ -29,7 +29,7 @@ type WorkerMessage =
   | { type: "lifecycle"; event: "accepted"; evidence: RebuildBrowserAcceptedEvidence }
   | { type: "candidate"; evidence: RebuildBrowserFinalEvidence }
   | { type: "confirmed"; evidence: RebuildBrowserFinalEvidence }
-  | { type: "boundary"; requestId: number; boundaryJson: string }
+  | { type: "boundary"; requestId: number; boundaryJson?: string; error?: string }
   | { type: "error"; message: string };
 
 interface Deferred<T> {
@@ -130,7 +130,10 @@ export function createRebuildNodeBrowserDriver(
           else await input.lifecycle.onAccepted(message.evidence);
           await send({ type: "lifecycle_ack", event: message.event, ok: true });
         } catch (error) {
-          await send({ type: "lifecycle_ack", event: message.event, ok: false, message: errorMessage(error) }).catch(() => {});
+          // A parent durability refusal is already authoritative for this turn. Do not send a
+          // negative acknowledgement and then tear the child down: the worker would react by
+          // writing the same failure back while its pipe is closing, which can race into EPIPE.
+          // Throwing here lets the parent preserve the original refusal and terminate the worker.
           throw error;
         }
       };
@@ -161,6 +164,13 @@ export function createRebuildNodeBrowserDriver(
           const pending = boundaries.get(message.requestId);
           if (!pending) throw new Error("Node browser worker returned an unknown boundary request");
           boundaries.delete(message.requestId);
+          if (message.error !== undefined) {
+            pending.reject(new Error(message.error));
+            return;
+          }
+          if (typeof message.boundaryJson !== "string") {
+            throw new Error("Node browser worker returned an invalid boundary response");
+          }
           pending.resolve(message.boundaryJson);
           return;
         }

@@ -1,6 +1,6 @@
 # Goose ChatGPT Web V1 rules
 
-This checkout contains the qualified Goose ChatGPT Web V1. Read `docs/persistent-chat-rebuild-plan.md` before architecture, browser, connector, lifecycle, security, or recovery work; it is now the durable qualification ledger and follow-up-gate authority rather than a pre-V1 design proposal. The exact deployed non-reboot V1 code checkpoint is `2ac2f561a674482d8eccf0e0cc690edc095b7806`; later repository commits may be documentation/closeout only.
+This checkout contains the qualified Goose ChatGPT Web V1. Read `docs/persistent-chat-lifecycle.md` before architecture, browser, lifecycle, or recovery work; it owns the non-negotiable persistent-conversation invariants. Then read `docs/persistent-chat-follow-up.md` for the current implementation/qualification gaps. The qualified installed runtime behavior is based on source checkpoint `5aff187bf356b6ca8287347106659489904f1842` (`Retire local conversation budget enforcement`); repository HEAD may be newer, but newer source is not installed authority until separately packaged and qualified.
 
 DreamBook repository authority: `origin` must be `agent-dream-team/goose-webgpt-debian`. Do not point this checkout at `luke-m-selway/goose-chatgpt-web`; that repository is reserved for later cross-platform/macOS adaptation of the V1 design.
 
@@ -10,9 +10,10 @@ Baseline: `miuuyy/codex-chatgpt-web@e85e3693fdb4e3e033348c08df0298c20fcdb612` (v
 
 - Goose owns the canonical logical session/transcript projection, tools and approvals, delegation/subagents, project execution, and Goose context lifecycle.
 - A persistent ChatGPT conversation is provider-side working continuity only. It may continue only while its recorded Goose projection remains append-compatible.
-- **Core persistence invariant:** within that provider layer, the persistent remote object is the server-side ordinary ChatGPT conversation identified by its canonical `/c/<uuid>` conversation ID. BrowserHost tabs, renderer instances, Playwright handles, and launcher process memory are disposable views onto that conversation, never its identity. Loss of a view alone must recover/reopen the same canonical conversation; it is not permission to create a new epoch.
-- Goose compaction, truncation, revision, branching, or any other non-append-compatible model-visible history change forces a new remote conversation epoch. Proven remote-conversation irrecoverability or an explicit context/budget boundary may also roll an epoch, but only after bounded same-ID reopen/reconstruction has failed; ephemeral tab/process loss does not qualify.
-- Epoch rollover may replay the current canonical Goose projection. Full-history replay is reduced to explicit boundaries, not claimed to be eliminated.
+- **Core persistence invariant:** within that provider layer, the persistent remote object is the server-side ordinary ChatGPT conversation identified by its canonical `/c/<uuid>` conversation ID. BrowserHost tabs, renderer instances, Playwright handles, and launcher process memory are disposable views onto that conversation, never its identity.
+- **Recovery invariant:** persistent provider chats are recovered, not abandoned. Browser/DOM/heartbeat/elapsed-time failure may trigger hard-refresh/view recovery and, after a fully settled stopped/error view with no intended final, an internal same-chat continuation prompt. It must not terminate the provider chat, click Retry, resend the original Goose turn, or independently start another ChatGPT conversation.
+- **Paired-context invariant:** one Goose chat and one ChatGPT provider chat remain context partners until deliberate handoff. When context health requires rollover, obtain a handoff and start both a fresh ChatGPT conversation and a fresh Goose session; do not roll only the provider chat while continuing the old Goose session.
+- Detailed lifecycle semantics, including continuation-as-GCW-artifact and the requirement for ChatGPT-side context-degradation/handoff instructions, are owned by `docs/persistent-chat-lifecycle.md`.
 - Do not recreate Goose session, delegation, approval, or context authority inside this repository.
 - Model-visible turn identifiers are correlation values, never the sole authorization for local tools.
 
@@ -23,10 +24,10 @@ This repository is **Goose ChatGPT Web**, not the inherited Codex product descri
 - **Rebuild-owned production path:** `runtimeKind=persistent-rebuild`, core/profile root `~/.local/share/goose-chatgpt-web-rebuild`, persistent Goose Responses facade, Session Broker, rebuild connector gateway, launcher-owned BrowserHost, and the reused `Goose Native 2nd Shift` tunnel/connector identity.
 - **Borrowed development mechanisms:** Electron BrowserHost/profile/session ownership, embedded ChatGPT login/browser surface, selected Playwright/DOM/auth helpers, packaging/runtime installation primitives, and launcher supervision where explicitly adapted. Borrowing a mechanism does **not** import its Codex setup semantics.
 - **Retired legacy appliance:** `/home/dreamteam/repos/goose-webgpt-debian` and `~/.goose-chatgpt-web-dev` were removed after the V1 cutover on 2026-09-13. They are historical evidence only and are not a supported rollback route.
-- **Inherited upstream surfaces that are not rebuild workflow:** top-level README Quick Start, browser smoke → Install models, Setup/MCP pages, Codex route/catalog integration, `Codex Native2`, Bigger Context, Zero Risk/manual mode, Codex compaction/subagents, and default `~/.codex-chatgpt-web` / `~/.config/Codex Web GPT` production profile. Do not use these to configure, qualify, or repair the persistent rebuild.
+- **Inherited upstream surfaces that are not rebuild workflow:** Codex route/catalog integration, Setup/MCP mutation paths, browser smoke → Install models, `Codex Native2`, Bigger Context, Zero Risk/manual mode, Codex compaction/subagents, and default `~/.codex-chatgpt-web` / `~/.config/Codex Web GPT` production profile. Obsolete upstream operator documentation has been removed; do not recreate it as current Goose guidance.
 - **Qualification-only scaffolding:** `.qualification/`, isolated worktrees, VNC/x11vnc, and source/account-fence/Xvfb launch helpers are disposable local evidence unless explicitly promoted. `.qualification/` is ignored and should be removed once its durable conclusions are recorded.
 
-If an inherited UI or document conflicts with this section or `docs/persistent-chat-rebuild-plan.md`, treat it as heritage/reference and stop before acting on it.
+If an inherited UI/code path conflicts with this section, `docs/persistent-chat-lifecycle.md`, or `docs/persistent-chat-follow-up.md`, treat it as non-authoritative and stop before acting on it.
 
 ## Safety and isolation
 
@@ -41,6 +42,6 @@ If an inherited UI or document conflicts with this section or `docs/persistent-c
 
 ## Workflow
 
-Gate sequencing and current qualification status live in `docs/persistent-chat-rebuild-plan.md`; do not infer the next gate from this rules file. Later evidence may reopen any contradicted contract.
+Current follow-up priorities and qualification gaps live in `docs/persistent-chat-follow-up.md`; do not infer current work from old commits, historical PR discussion, or retired gate evidence.
 
-For documentation work apply the current Day Shift lean-documentation skill. Before source/configuration changes apply the current code-maintainability skill and the plan's upstream keep/adapt/delete/excise boundary. Future behavior belongs in the plan until implemented and qualified; current-state documentation must describe only what is actually true.
+For documentation work apply the current Day Shift lean-documentation skill. Before source/configuration changes apply the current code-maintainability skill and preserve the product boundary documented here and in the follow-up plan. Future behavior belongs in the plan until implemented and qualified; current-state documentation must describe only what is actually true.
