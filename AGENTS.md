@@ -1,6 +1,6 @@
 # Goose ChatGPT Web V1 rules
 
-This checkout contains the qualified Goose ChatGPT Web V1. Read `docs/persistent-chat-rebuild-plan.md` before architecture, browser, connector, lifecycle, security, or recovery work; it is now the durable qualification ledger and follow-up-gate authority rather than a pre-V1 design proposal. The exact deployed non-reboot V1 code checkpoint is `2ac2f561a674482d8eccf0e0cc690edc095b7806`; later repository commits may be documentation/closeout only.
+This checkout contains the qualified Goose ChatGPT Web V1. Read `docs/persistent-chat-lifecycle.md` before architecture, browser, lifecycle, or recovery work; it owns the non-negotiable persistent-conversation invariants. Then read `docs/persistent-chat-rebuild-plan.md` for implementation sequencing, qualification evidence, and current follow-up gates. The exact deployed non-reboot V1 code checkpoint is `2ac2f561a674482d8eccf0e0cc690edc095b7806`; later repository commits may be documentation/closeout only.
 
 DreamBook repository authority: `origin` must be `agent-dream-team/goose-webgpt-debian`. Do not point this checkout at `luke-m-selway/goose-chatgpt-web`; that repository is reserved for later cross-platform/macOS adaptation of the V1 design.
 
@@ -10,9 +10,10 @@ Baseline: `miuuyy/codex-chatgpt-web@e85e3693fdb4e3e033348c08df0298c20fcdb612` (v
 
 - Goose owns the canonical logical session/transcript projection, tools and approvals, delegation/subagents, project execution, and Goose context lifecycle.
 - A persistent ChatGPT conversation is provider-side working continuity only. It may continue only while its recorded Goose projection remains append-compatible.
-- **Core persistence invariant:** within that provider layer, the persistent remote object is the server-side ordinary ChatGPT conversation identified by its canonical `/c/<uuid>` conversation ID. BrowserHost tabs, renderer instances, Playwright handles, and launcher process memory are disposable views onto that conversation, never its identity. Loss of a view alone must recover/reopen the same canonical conversation; it is not permission to create a new epoch.
-- Goose compaction, truncation, revision, branching, or any other non-append-compatible model-visible history change forces a new remote conversation epoch. Proven remote-conversation irrecoverability or an explicit context/budget boundary may also roll an epoch, but only after bounded same-ID reopen/reconstruction has failed; ephemeral tab/process loss does not qualify.
-- Epoch rollover may replay the current canonical Goose projection. Full-history replay is reduced to explicit boundaries, not claimed to be eliminated.
+- **Core persistence invariant:** within that provider layer, the persistent remote object is the server-side ordinary ChatGPT conversation identified by its canonical `/c/<uuid>` conversation ID. BrowserHost tabs, renderer instances, Playwright handles, and launcher process memory are disposable views onto that conversation, never its identity.
+- **Recovery invariant:** persistent provider chats are recovered, not abandoned. Browser/DOM/heartbeat/elapsed-time failure may trigger hard-refresh/view recovery and, after a fully settled stopped/error view with no intended final, an internal same-chat continuation prompt. It must not terminate the provider chat, click Retry, resend the original Goose turn, or independently start another ChatGPT conversation.
+- **Paired-context invariant:** one Goose chat and one ChatGPT provider chat remain context partners until deliberate handoff. When context health requires rollover, obtain a handoff and start both a fresh ChatGPT conversation and a fresh Goose session; do not roll only the provider chat while continuing the old Goose session.
+- Detailed lifecycle semantics, including continuation-as-GCW-artifact and the requirement for ChatGPT-side context-degradation/handoff instructions, are owned by `docs/persistent-chat-lifecycle.md`.
 - Do not recreate Goose session, delegation, approval, or context authority inside this repository.
 - Model-visible turn identifiers are correlation values, never the sole authorization for local tools.
 
