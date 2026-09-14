@@ -130,7 +130,10 @@ export function createRebuildNodeBrowserDriver(
           else await input.lifecycle.onAccepted(message.evidence);
           await send({ type: "lifecycle_ack", event: message.event, ok: true });
         } catch (error) {
-          await send({ type: "lifecycle_ack", event: message.event, ok: false, message: errorMessage(error) }).catch(() => {});
+          // A parent durability refusal is already authoritative for this turn. Do not send a
+          // negative acknowledgement and then tear the child down: the worker would react by
+          // writing the same failure back while its pipe is closing, which can race into EPIPE.
+          // Throwing here lets the parent preserve the original refusal and terminate the worker.
           throw error;
         }
       };
