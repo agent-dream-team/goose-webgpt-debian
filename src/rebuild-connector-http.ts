@@ -5,7 +5,6 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import * as z from "zod/v4";
 import { canonicalJsonSha256 } from "./canonical-json";
-import { estimatePersistentToolResultTokens } from "./conversation-budget";
 import {
   preparePersistentRemoteToolResult,
   type PersistentRemoteDataClass,
@@ -20,7 +19,7 @@ export type ConnectorOperationClaimDecision =
   | { kind: "EXECUTE"; opRef: string; seq: number }
   | { kind: "ATTACH"; opRef: string; seq: number }
   | { kind: "REPLAY"; opRef: string; seq: number; outcome: "SUCCESS" | "FAILURE"; resultJson: string; nextOpRef: string }
-  | { kind: "UNCERTAIN" | "CONFLICT" | "STALE" | "WRONG_TURN" | "UNKNOWN" | "OUT_OF_ORDER" | "BOUNDARY_REQUIRED" | "BUDGET_REQUIRED" | "PROTOCOL_VIOLATION"; opRef: string; seq: number | null };
+  | { kind: "UNCERTAIN" | "CONFLICT" | "STALE" | "WRONG_TURN" | "UNKNOWN" | "OUT_OF_ORDER" | "BOUNDARY_REQUIRED" | "PROTOCOL_VIOLATION"; opRef: string; seq: number | null };
 
 export type ConnectorMissingOperationDecision =
   | { kind: "UNCERTAIN"; matchingOpRefs: string[] }
@@ -40,14 +39,7 @@ export interface ConnectorOperationAuthority {
     inputHash: string;
     outcome: "SUCCESS" | "FAILURE";
     resultJson: string;
-    budgetChargeTokens?: number;
     progressCheckpointJson?: string;
-  }): { nextOpRef: string };
-  rejectOperationForBudget?(input: {
-    turnRef: string;
-    opRef: string;
-    inputHash: string;
-    resultJson: string;
   }): { nextOpRef: string };
 }
 
@@ -281,28 +273,6 @@ export class RebuildConnectorGateway {
       // new execution. Treat the missing attachment as ambiguous and fail closed.
       return existing ?? claimError(input.turnRef, input.opRef, "UNCERTAIN");
     }
-    if (claim.kind === "BUDGET_REQUIRED") {
-      if (!this.options.authority.rejectOperationForBudget) {
-        return claimError(input.turnRef, input.opRef, "BUDGET_REQUIRED");
-      }
-      const prepared = prepareConnectorTerminalResult({
-        outcome: "FAILURE",
-        dataClass: "public",
-        content: "REMOTE_CONVERSATION_BUDGET_EXHAUSTED",
-      });
-      try {
-        const terminal = this.options.authority.rejectOperationForBudget({
-          turnRef: input.turnRef,
-          opRef: input.opRef,
-          inputHash,
-          resultJson: prepared.resultJson,
-        });
-        const stored = parseStoredResult(prepared.resultJson);
-        return mcpResult({ ...stored, turn_ref: input.turnRef, op_ref: input.opRef, next_op_ref: terminal.nextOpRef }, true);
-      } catch {
-        return claimError(input.turnRef, input.opRef, "UNCERTAIN");
-      }
-    }
     if (claim.kind !== "EXECUTE") return claimError(input.turnRef, input.opRef, claim.kind);
 
     const execution = this.executeClaimed({
@@ -349,7 +319,6 @@ export class RebuildConnectorGateway {
         inputHash,
         outcome,
         resultJson: prepared.resultJson,
-        budgetChargeTokens: estimatePersistentToolResultTokens(prepared.resultJson),
         ...(result.progress ? { progressCheckpointJson: result.progress.checkpointJson } : {}),
       });
     } catch {

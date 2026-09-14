@@ -1,15 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readJsonRequestBody } from "./http-body";
 import {
-  conversationBudgetPolicyJson,
-  estimatePersistentFinalTokens,
-  estimatePersistentPromptTokens,
-  estimatePersistentToolResultTokens,
-  requiredPersistentFinalReserveTokens,
-  resolveConversationBudgetPolicy,
-  type ConversationBudgetPolicy,
-} from "./conversation-budget";
-import {
   advertisedGooseToolNames,
   GooseToolRendezvous,
   GooseToolRendezvousError,
@@ -108,7 +99,6 @@ export interface RebuildProviderRuntimeOptions {
   connectorIdentity: string;
   brokerPath: string;
   terminalReplayWindowMs?: number;
-  conversationBudgetPolicy?: Partial<ConversationBudgetPolicy>;
   connectorPort: number;
   connectorAuthorizationFile: string;
   browserDriver: RebuildPersistentBrowserDriver;
@@ -187,12 +177,9 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
   if (hostname !== "127.0.0.1") throw new Error("Rebuild provider must bind IPv4 loopback only");
   if (!options.controlToken) throw new Error("Rebuild provider control token is required");
 
-  const conversationBudgetPolicy = resolveConversationBudgetPolicy(options.conversationBudgetPolicy);
-  const budgetPolicyJson = conversationBudgetPolicyJson(conversationBudgetPolicy);
   const broker = new SessionBroker(options.brokerPath, {
     projectId: options.projectId,
     terminalReplayWindowMs: options.terminalReplayWindowMs ?? REBUILD_TERMINAL_REPLAY_WINDOW_MS,
-    conversationBudgetPolicy,
   });
   const baton = new GooseToolRendezvous({ loadCheckpoint: turnRef => broker.getTurn(turnRef)?.checkpointJson ?? null });
   const executions = new Map<string, ActiveExecution>();
@@ -220,7 +207,6 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       return op?.turnRef === turnRef ? op.inputHash : null;
     },
     markUnreconciled: (turnRef, reason) => { broker.markUnreconciled(turnRef, reason); },
-    rejectOperationForBudget: input => broker.rejectOperationForBudget(input),
     completeOperation: input => input.progressCheckpointJson === undefined
       ? broker.completeOperation(input)
       : broker.completeOperationWithProgress({ ...input, checkpointJson: input.progressCheckpointJson }),
@@ -287,14 +273,8 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     },
   });
 
-  const ensureEpoch = (sessionId: string): RemoteEpoch => {
-    const current = broker.getCurrentEpoch(sessionId);
-    if (!current) return broker.createEpoch({ gooseSessionId: sessionId });
-    if (current.budgetPolicyJson !== budgetPolicyJson || current.budgetConsumedTokens === null) {
-      return broker.createEpoch({ gooseSessionId: sessionId });
-    }
-    return current;
-  };
+  const ensureEpoch = (sessionId: string): RemoteEpoch =>
+    broker.getCurrentEpoch(sessionId) ?? broker.createEpoch({ gooseSessionId: sessionId });
 
   const durableToolResult = (opRef: string): string => {
     const operation = broker.getOperation(opRef);
@@ -332,10 +312,6 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       items: history.items,
       resolveDurableToolResult: durableToolResult,
     });
-    if (turn.budgetPromptTokens !== null
-      && estimatePersistentPromptTokens(prompt, options.model) !== turn.budgetPromptTokens) {
-      throw new Error("Durable conversation-budget prompt estimate drifted before browser execution");
-    }
     const preSendAbort = new AbortController();
     let sendActivated = false;
     let active!: ActiveExecution;
@@ -428,7 +404,6 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
             checkpoint: decodeGooseResponsesProjectionCheckpoint(confirmedTurn.checkpointJson),
             finalAssistantText: confirmed.text,
           }),
-          budgetFinalTokens: estimatePersistentFinalTokens(confirmed.text, options.model),
           answerBoundary: active.latestBoundaryOpRef
             ? {
                 opRef: active.latestBoundaryOpRef,
@@ -546,25 +521,9 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       if (!Number.isSafeInteger(record.max_output_tokens) || Number(record.max_output_tokens) <= 0) {
         return jsonError(400, "invalid_responses_request", "Responses max_output_tokens must be a positive safe integer");
       }
-      if (requiredPersistentFinalReserveTokens(Number(record.max_output_tokens))
-        > conversationBudgetPolicy.finalResponseReserveTokens) {
-        return jsonError(409, "conversation_budget_output_reserve",
-          "Responses max_output_tokens exceeds the configured persistent final-response reserve");
-      }
     }
     const checkpoint = gooseResponsesProjectionCheckpoint(body);
     let turn = broker.getOpenTurnForSession(sessionId);
-
-    // A pre-send turn may be safely re-admitted under a newly tightened/calibrated budget policy.
-    // Once send activation occurs, its persisted epoch policy remains the accounting authority.
-    if (turn?.state === "QUEUED") {
-      const queuedEpoch = broker.getCurrentEpoch(sessionId);
-      if (!queuedEpoch || queuedEpoch.epoch !== turn.epoch
-        || queuedEpoch.budgetPolicyJson !== budgetPolicyJson || queuedEpoch.budgetConsumedTokens === null) {
-        broker.cancelRetryableBeforeSend(turn.turnRef);
-        turn = null;
-      }
-    }
 
     if (turn?.state === "UNRECONCILED") {
       return jsonError(409, "turn_unreconciled", "The persistent remote turn requires explicit recovery before more Goose work");
@@ -600,50 +559,11 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
           : { kind: "ROLLOVER" as const, reason: "bound_epoch_missing_history_watermark", items: [] };
         if (history.kind !== "APPEND") epoch = broker.createEpoch({ gooseSessionId: sessionId });
       }
-      const admissionToolNames = [...advertisedGooseToolNames(body)];
-      const enqueueBudgetedTurn = () => broker.enqueueTurn({
+      turn = broker.enqueueTurn({
         gooseSessionId: sessionId,
         requestHash: checkpoint.requestHash,
         checkpointJson: encodeGooseResponsesProjectionCheckpoint(checkpoint),
-        budgetPromptTokens: identity => {
-          const history = classifyGooseCanonicalHistory(body, identity.epoch.historyWatermark);
-          if (identity.epoch.conversationId && history.kind !== "APPEND") {
-            throw new Error("Budget admission found a non-append projection on a bound epoch");
-          }
-          if (!identity.epoch.conversationId && history.kind !== "SEED") {
-            throw new Error("Budget admission found a non-seed projection on a fresh epoch");
-          }
-          const prompt = renderGoosePersistentPrompt({
-            turnRef: identity.turnRef,
-            submitNonce: identity.submitNonce,
-            opRef: identity.initialOpRef,
-            mode: history.kind === "APPEND" ? "append" : "seed",
-            connectorIdentity: options.connectorIdentity,
-            availableToolNames: admissionToolNames,
-            items: history.items,
-            resolveDurableToolResult: durableToolResult,
-          });
-          return estimatePersistentPromptTokens(prompt, options.model);
-        },
       });
-      try {
-        turn = enqueueBudgetedTurn();
-      } catch (error) {
-        if (!(error instanceof SessionBrokerError) || error.code !== "BUDGET_ROLLOVER_REQUIRED"
-          || !epoch.conversationId) throw error;
-        epoch = broker.createEpoch({ gooseSessionId: sessionId });
-        try {
-          turn = enqueueBudgetedTurn();
-        } catch (freshError) {
-          if (freshError instanceof SessionBrokerError && freshError.code === "BUDGET_ROLLOVER_REQUIRED") {
-            throw new SessionBrokerError(
-              "BUDGET_INPUT_TOO_LARGE",
-              "Current canonical Goose projection cannot fit the configured fresh-conversation reserve-first budget",
-            );
-          }
-          throw freshError;
-        }
-      }
     }
 
     let admitted: ReturnType<SessionBroker["admitNext"]>;
@@ -745,7 +665,6 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
             inputHash,
             outcome: prepared.outcome,
             resultJson: prepared.resultJson,
-            budgetChargeTokens: estimatePersistentToolResultTokens(prepared.resultJson, options.model),
           });
           return Response.json({
             status: "ok",

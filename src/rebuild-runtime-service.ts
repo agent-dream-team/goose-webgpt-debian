@@ -66,7 +66,6 @@ export function startPersistentRebuildService(config: AppConfig): PersistentRebu
     projectId: config.rebuild.projectId,
     connectorIdentity: config.rebuild.connectorName,
     brokerPath,
-    conversationBudgetPolicy: config.rebuild.conversationBudget,
     connectorPort: config.rebuild.connectorPort,
     connectorAuthorizationFile,
     browserDriver,

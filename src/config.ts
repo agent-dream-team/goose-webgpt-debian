@@ -3,7 +3,6 @@ import { chmodSync, mkdirSync, openSync, closeSync, renameSync, rmSync, writeFil
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep, win32 } from "node:path";
 import { tmpdir } from "node:os";
-import { resolveConversationBudgetPolicy } from "./conversation-budget";
 import {
   CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL,
   CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL,
@@ -66,21 +65,12 @@ export interface TunnelConfig {
   alias: string;
 }
 
-export interface PersistentRebuildConversationBudgetConfig {
-  softLimitTokens?: number;
-  baseAllowanceTokens?: number;
-  recoveryReserveTokens?: number;
-  turnGrowthReserveTokens?: number;
-  finalResponseReserveTokens?: number;
-}
-
 export interface PersistentRebuildConfig {
   projectId: string;
   projectName: string;
   connectorName: string;
   connectorMentionQuery: string;
   connectorPort: number;
-  conversationBudget?: PersistentRebuildConversationBudgetConfig;
 }
 
 export interface AppConfig {
@@ -475,33 +465,8 @@ function parseConfig(value: unknown, path: string): AppConfig {
       || !connectorMentionQuery || !Number.isInteger(connectorPort) || connectorPort < 1 || connectorPort > 65_535) {
       throw new Error(`Persistent rebuild configuration is invalid in ${path}`);
     }
-    let conversationBudget: PersistentRebuildConversationBudgetConfig | undefined;
-    if (value.conversationBudget !== undefined) {
-      if (!value.conversationBudget || typeof value.conversationBudget !== "object" || Array.isArray(value.conversationBudget)) {
-        throw new Error(`Persistent rebuild conversationBudget is invalid in ${path}`);
-      }
-      const rawBudget = value.conversationBudget as Record<string, unknown>;
-      const allowed = [
-        "softLimitTokens",
-        "baseAllowanceTokens",
-        "recoveryReserveTokens",
-        "turnGrowthReserveTokens",
-        "finalResponseReserveTokens",
-      ] as const;
-      if (Object.keys(rawBudget).some(key => !(allowed as readonly string[]).includes(key))) {
-        throw new Error(`Persistent rebuild conversationBudget contains an unknown field in ${path}`);
-      }
-      conversationBudget = {};
-      for (const key of allowed) {
-        const candidate = rawBudget[key];
-        if (candidate === undefined) continue;
-        if (!Number.isSafeInteger(candidate) || (candidate as number) <= 0) {
-          throw new Error(`Persistent rebuild conversationBudget.${key} is invalid in ${path}`);
-        }
-        conversationBudget[key] = candidate as number;
-      }
-      try { resolveConversationBudgetPolicy(conversationBudget); }
-      catch { throw new Error(`Persistent rebuild conversationBudget policy is invalid in ${path}`); }
+    if ((value as unknown as Record<string, unknown>).conversationBudget !== undefined) {
+      throw new Error(`Persistent rebuild conversationBudget is retired in ${path}; local budget estimates are advisory only`);
     }
     rebuild = {
       projectId,
@@ -509,7 +474,6 @@ function parseConfig(value: unknown, path: string): AppConfig {
       connectorName,
       connectorMentionQuery,
       connectorPort,
-      ...(conversationBudget ? { conversationBudget } : {}),
     };
   } else if (parsed.rebuild !== undefined) {
     throw new Error(`Legacy runtime cannot contain persistent rebuild configuration in ${path}`);

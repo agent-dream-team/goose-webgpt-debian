@@ -5,7 +5,6 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { canonicalJson } from "../src/canonical-json";
-import type { ConversationBudgetPolicy } from "../src/conversation-budget";
 import { encodeGooseCanonicalHistoryWatermark } from "../src/goose-canonical-history";
 import { encodeGooseResponsesProjectionCheckpoint, gooseResponsesProjectionCheckpoint } from "../src/goose-responses-projection";
 import { connectorOperationInputHash } from "../src/rebuild-connector-http";
@@ -75,10 +74,7 @@ function watermark(body: unknown, finalText: string): string {
   });
 }
 
-function setup(
-  driver: RebuildPersistentBrowserDriver,
-  conversationBudgetPolicy?: Partial<ConversationBudgetPolicy>,
-) {
+function setup(driver: RebuildPersistentBrowserDriver) {
   const root = mkdtempSync(join(tmpdir(), "cgw-rebuild-provider-"));
   roots.push(root);
   const authorizationFile = join(root, "connector-auth.txt");
@@ -94,7 +90,6 @@ function setup(
     connectorIdentity: "Goose Native 2nd Shift",
     brokerPath: join(root, "broker.sqlite"),
     terminalReplayWindowMs: 60_000,
-    conversationBudgetPolicy,
     connectorPort: 0,
     connectorAuthorizationFile: authorizationFile,
     browserDriver: driver,
@@ -150,21 +145,7 @@ test("minimal Responses SSE keeps text and function-call terminals mutually excl
   })).toThrow("Exactly one");
 });
 
-test("Responses output ceiling must fit the configured final-response reserve before browser work", async () => {
-  let browserStarts = 0;
-  const driver: RebuildPersistentBrowserDriver = {
-    createTurn() { browserStarts += 1; throw new Error("output-reserve rejection must precede browser construction"); },
-  };
-  const { runtime } = setup(driver);
-  const body = { ...requestBody("oversized output ceiling"), max_output_tokens: 32_769 };
-  const response = await post(runtime, body, "goose-output-reserve");
-  expect(response.status).toBe(409);
-  expect(await response.text()).toContain("conversation_budget_output_reserve");
-  expect(browserStarts).toBe(0);
-  expect(runtime.broker.getCurrentEpoch("goose-output-reserve")).toBeNull();
-});
-
-test("current Goose 1.50 output ceiling fits the default final-response reserve", async () => {
+test("positive Responses output ceilings are not rejected by a local conversation reserve", async () => {
   const driver: RebuildPersistentBrowserDriver = {
     createTurn(input) {
       return {
@@ -174,12 +155,12 @@ test("current Goose 1.50 output ceiling fits the default final-response reserve"
           input.lifecycle.onSendActivated();
           input.lifecycle.onAccepted({
             canonicalConversationId: "99999999-1111-4222-8333-444444444444",
-            acceptedUserTurnId: "user-output-reserve",
+            acceptedUserTurnId: "user-output-uncapped",
           });
           return {
             canonicalConversationId: "99999999-1111-4222-8333-444444444444",
-            acceptedUserTurnId: "user-output-reserve",
-            text: "output-reserve-ok",
+            acceptedUserTurnId: "user-output-uncapped",
+            text: "output-uncapped-ok",
             remoteNonRunning: true,
           };
         },
@@ -187,9 +168,14 @@ test("current Goose 1.50 output ceiling fits the default final-response reserve"
     },
   };
   const { runtime } = setup(driver);
-  const response = await post(runtime, { ...requestBody("qualified ceiling"), max_output_tokens: 32_768 }, "goose-output-reserve-ok");
+  const response = await post(runtime, {
+    ...requestBody("large positive ceiling"), max_output_tokens: 65_536,
+  }, "goose-output-uncapped");
   expect(response.status).toBe(200);
-  expect(await response.text()).toContain("output-reserve-ok");
+  expect(await response.text()).toContain("output-uncapped-ok");
+  expect(runtime.broker.getCurrentEpoch("goose-output-uncapped")).toMatchObject({
+    epoch: 1, budgetPolicyJson: null, budgetConsumedTokens: null,
+  });
 });
 
 test("runtime health/control surface and two completed Goose turns reuse one persistent epoch", async () => {
@@ -263,94 +249,6 @@ test("runtime health/control surface and two completed Goose turns reuse one per
     method: "POST", headers: { authorization: "Bearer control-token" },
   });
   expect((await resume.json() as any).accepting_turns).toBe(true);
-});
-
-test("reserve-first cumulative budget rolls before browser send and seeds the current canonical projection", async () => {
-  const starts: RebuildPersistentBrowserTurnInput[] = [];
-  const conversations = [
-    "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb",
-    "cccccccc-4444-4555-8666-dddddddddddd",
-  ];
-  const driver: RebuildPersistentBrowserDriver = {
-    createTurn(input) {
-      starts.push(input);
-      const ordinal = starts.length;
-      return {
-        captureAnswerBoundary: async () => { throw new Error("no tool expected"); },
-        confirmFinal: async evidence => evidence,
-        run: async () => {
-          input.lifecycle.onSendActivated();
-          input.lifecycle.onAccepted({
-            canonicalConversationId: conversations[ordinal - 1]!,
-            acceptedUserTurnId: `budget-user-${ordinal}`,
-          });
-          return {
-            canonicalConversationId: conversations[ordinal - 1]!,
-            acceptedUserTurnId: `budget-user-${ordinal}`,
-            text: `budget-answer-${ordinal}`,
-            remoteNonRunning: true,
-          };
-        },
-      };
-    },
-  };
-  const { runtime } = setup(driver, {
-    softLimitTokens: 19_000,
-    baseAllowanceTokens: 100,
-    recoveryReserveTokens: 500,
-    turnGrowthReserveTokens: 10_000,
-    finalResponseReserveTokens: 8_500,
-    toolOperationReserveTokens: 1_000,
-    budgetFailureReserveTokens: 200,
-  });
-  const session = "goose-budget-rollover";
-  const firstRequest = requestBody("budget first");
-  const first = await post(runtime, firstRequest, session);
-  expect(first.status).toBe(200);
-  expect(await first.text()).toContain("budget-answer-1");
-  const epochOne = runtime.broker.getCurrentEpoch(session)!;
-  expect(epochOne).toMatchObject({ epoch: 1, conversationId: conversations[0] });
-  expect(epochOne.budgetConsumedTokens).toBeGreaterThan(100);
-
-  const secondRequest = laterTurnBody(firstRequest, "budget-answer-1", "budget second");
-  const second = await post(runtime, secondRequest, session);
-  expect(second.status).toBe(200);
-  expect(await second.text()).toContain("budget-answer-2");
-  expect(starts).toHaveLength(2);
-  expect(starts[1]).toMatchObject({ epoch: 2, existingConversationId: null });
-  expect(starts[1]?.prompt).toContain('"mode":"seed"');
-  expect(starts[1]?.prompt).toContain("budget first");
-  expect(starts[1]?.prompt).toContain("budget-answer-1");
-  expect(starts[1]?.prompt).toContain("budget second");
-  expect(runtime.broker.getCurrentEpoch(session)).toMatchObject({
-    epoch: 2,
-    conversationId: conversations[1],
-    leaseState: "IDLE",
-  });
-});
-
-test("fresh canonical seed that cannot fit the configured reserve-first budget fails before browser construction", async () => {
-  let browserStarts = 0;
-  const driver: RebuildPersistentBrowserDriver = {
-    createTurn() {
-      browserStarts += 1;
-      throw new Error("oversized seed must fail before browser construction");
-    },
-  };
-  const { runtime } = setup(driver, {
-    softLimitTokens: 4_200,
-    baseAllowanceTokens: 100,
-    recoveryReserveTokens: 500,
-    turnGrowthReserveTokens: 3_500,
-    finalResponseReserveTokens: 3_000,
-    toolOperationReserveTokens: 300,
-    budgetFailureReserveTokens: 100,
-  });
-  const response = await post(runtime, requestBody("x".repeat(30_000)), "goose-budget-too-large");
-  expect(response.status).toBe(409);
-  expect(await response.text()).toContain("BUDGET_ROLLOVER_REQUIRED");
-  expect(browserStarts).toBe(0);
-  expect(runtime.broker.getOpenTurnForSession("goose-budget-too-large")).toBeNull();
 });
 
 test("canonical divergence rolls to a fresh epoch and seeds the full current projection", async () => {
@@ -988,7 +886,6 @@ test("authenticated recovery reconciles only post-owner known operation evidence
   const queued = first.broker.enqueueTurn({
     gooseSessionId: "goose-recovery",
     requestHash: "request-recovery",
-    budgetPromptTokens: () => 1,
   });
   const admitted = first.broker.admitNext()!;
   expect(admitted.turn.turnRef).toBe(queued.turnRef);
@@ -1085,7 +982,6 @@ test("authenticated abandonment can retire a verified pre-identity orphan withou
   const turn = runtime.broker.enqueueTurn({
     gooseSessionId: sessionId,
     requestHash: "orphan-request",
-    budgetPromptTokens: () => 1,
   });
   runtime.broker.admitNext();
   runtime.broker.markSendActivated(turn.turnRef);
@@ -1123,7 +1019,6 @@ test("authenticated orphan abandonment rejects malformed recovery identity befor
   const turn = runtime.broker.enqueueTurn({
     gooseSessionId: sessionId,
     requestHash: "malformed-orphan-request",
-    budgetPromptTokens: () => 1,
   });
   runtime.broker.admitNext();
   runtime.broker.markSendActivated(turn.turnRef);
@@ -1192,7 +1087,6 @@ test("abandoned current epoch forces the next Goose turn onto a fresh seeded con
   const abandoned = runtime.broker.enqueueTurn({
     gooseSessionId: sessionId,
     requestHash: "abandoned-request",
-    budgetPromptTokens: () => 1,
   });
   runtime.broker.admitNext();
   runtime.broker.markSendActivated(abandoned.turnRef);
@@ -1462,77 +1356,4 @@ test("invalid browser acceptance identity cannot partially bind durable remote i
   expect(turn?.acceptedUserTurnId).toBeNull();
   expect(runtime.broker.getCurrentEpoch("goose-invalid-browser-identity")?.conversationId).toBeNull();
   expect(runtime.broker.getAccountSlotHolder()).toBe(turn?.turnRef ?? null);
-});
-
-test("restart re-admits an orphaned pre-send queued turn under the current budget policy", async () => {
-  const root = mkdtempSync(join(tmpdir(), "cgw-rebuild-budget-policy-restart-"));
-  roots.push(root);
-  const authorizationFile = join(root, "connector-auth.txt");
-  writeFileSync(authorizationFile, `Bearer ${"q".repeat(64)}\n`, { mode: 0o600 });
-  chmodSync(authorizationFile, 0o600);
-  const brokerPath = join(root, "broker.sqlite");
-  const starts: RebuildPersistentBrowserTurnInput[] = [];
-  const driver: RebuildPersistentBrowserDriver = {
-    createTurn(input) {
-      starts.push(input);
-      return {
-        captureAnswerBoundary: async () => { throw new Error("no tool expected"); },
-        confirmFinal: async evidence => evidence,
-        run: async () => {
-          input.lifecycle.onSendActivated();
-          input.lifecycle.onAccepted({
-            canonicalConversationId: "eeeeeeee-1111-4222-8333-ffffffffffff",
-            acceptedUserTurnId: "budget-policy-user",
-          });
-          return {
-            canonicalConversationId: "eeeeeeee-1111-4222-8333-ffffffffffff",
-            acceptedUserTurnId: "budget-policy-user",
-            text: "policy-restart-ok",
-            remoteNonRunning: true,
-          };
-        },
-      };
-    },
-  };
-  const start = (softLimitTokens: number) => {
-    const runtime = startRebuildProviderRuntime({
-      port: 0,
-      model: "gpt-4.1",
-      contextWindow: 200_000,
-      controlToken: "control-token",
-      projectId: "project-runtime-test",
-      connectorIdentity: "Goose Native 2nd Shift",
-      brokerPath,
-      terminalReplayWindowMs: 60_000,
-      conversationBudgetPolicy: { softLimitTokens },
-      connectorPort: 0,
-      connectorAuthorizationFile: authorizationFile,
-      browserDriver: driver,
-    });
-    runtimes.push(runtime);
-    return runtime;
-  };
-
-  const session = "goose-budget-policy-restart";
-  const body = requestBody("policy changed while queued");
-  const checkpoint = gooseResponsesProjectionCheckpoint(body);
-  const first = start(512_000);
-  first.broker.createEpoch({ gooseSessionId: session });
-  const oldQueued = first.broker.enqueueTurn({
-    gooseSessionId: session,
-    requestHash: checkpoint.requestHash,
-    checkpointJson: encodeGooseResponsesProjectionCheckpoint(checkpoint),
-    budgetPromptTokens: () => 1,
-  });
-  expect(oldQueued.state).toBe("QUEUED");
-  await first.stop();
-
-  const restarted = start(600_000);
-  const response = await post(restarted, body, session);
-  expect(response.status).toBe(200);
-  expect(await response.text()).toContain("policy-restart-ok");
-  expect(restarted.broker.getTurn(oldQueued.turnRef)).toMatchObject({ state: "CANCELLED", budgetReservedTokens: 0 });
-  expect(starts).toHaveLength(1);
-  expect(starts[0]).toMatchObject({ epoch: 2, existingConversationId: null });
-  expect(restarted.broker.getCurrentEpoch(session)).toMatchObject({ epoch: 2, leaseState: "IDLE" });
 });
