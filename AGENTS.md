@@ -1,6 +1,6 @@
 # Goose ChatGPT Web V1 rules
 
-This checkout contains the qualified Goose ChatGPT Web V1. Read `docs/persistent-chat-lifecycle.md` before architecture, browser, lifecycle, or recovery work; it owns the non-negotiable persistent-conversation invariants. Then read `docs/persistent-chat-rebuild-plan.md` for implementation sequencing, qualification evidence, and current follow-up gates. The exact deployed non-reboot V1 code checkpoint is `2ac2f561a674482d8eccf0e0cc690edc095b7806`; later repository commits may be documentation/closeout only.
+This checkout contains the qualified Goose ChatGPT Web V1. Read `docs/persistent-chat-lifecycle.md` before architecture, browser, lifecycle, or recovery work; it owns the non-negotiable persistent-conversation invariants. Then read `docs/persistent-chat-rebuild-plan.md` for implementation sequencing, qualification evidence, and current follow-up gates. The qualified installed runtime behavior is based on source checkpoint `5aff187bf356b6ca8287347106659489904f1842` (`Retire local conversation budget enforcement`); later repository commits may be documentation/test-only cleanup unless separately packaged and qualified.
 
 DreamBook repository authority: `origin` must be `agent-dream-team/goose-webgpt-debian`. Do not point this checkout at `luke-m-selway/goose-chatgpt-web`; that repository is reserved for later cross-platform/macOS adaptation of the V1 design.
 
@@ -24,10 +24,10 @@ This repository is **Goose ChatGPT Web**, not the inherited Codex product descri
 - **Rebuild-owned production path:** `runtimeKind=persistent-rebuild`, core/profile root `~/.local/share/goose-chatgpt-web-rebuild`, persistent Goose Responses facade, Session Broker, rebuild connector gateway, launcher-owned BrowserHost, and the reused `Goose Native 2nd Shift` tunnel/connector identity.
 - **Borrowed development mechanisms:** Electron BrowserHost/profile/session ownership, embedded ChatGPT login/browser surface, selected Playwright/DOM/auth helpers, packaging/runtime installation primitives, and launcher supervision where explicitly adapted. Borrowing a mechanism does **not** import its Codex setup semantics.
 - **Retired legacy appliance:** `/home/dreamteam/repos/goose-webgpt-debian` and `~/.goose-chatgpt-web-dev` were removed after the V1 cutover on 2026-09-13. They are historical evidence only and are not a supported rollback route.
-- **Inherited upstream surfaces that are not rebuild workflow:** top-level README Quick Start, browser smoke → Install models, Setup/MCP pages, Codex route/catalog integration, `Codex Native2`, Bigger Context, Zero Risk/manual mode, Codex compaction/subagents, and default `~/.codex-chatgpt-web` / `~/.config/Codex Web GPT` production profile. Do not use these to configure, qualify, or repair the persistent rebuild.
+- **Inherited upstream surfaces that are not rebuild workflow:** Codex route/catalog integration, Setup/MCP mutation paths, browser smoke → Install models, `Codex Native2`, Bigger Context, Zero Risk/manual mode, Codex compaction/subagents, and default `~/.codex-chatgpt-web` / `~/.config/Codex Web GPT` production profile. Obsolete upstream operator documentation has been removed; do not recreate it as current Goose guidance.
 - **Qualification-only scaffolding:** `.qualification/`, isolated worktrees, VNC/x11vnc, and source/account-fence/Xvfb launch helpers are disposable local evidence unless explicitly promoted. `.qualification/` is ignored and should be removed once its durable conclusions are recorded.
 
-If an inherited UI or document conflicts with this section or `docs/persistent-chat-rebuild-plan.md`, treat it as heritage/reference and stop before acting on it.
+If an inherited UI/code path conflicts with this section or `docs/persistent-chat-rebuild-plan.md`, treat it as non-authoritative and stop before acting on it.
 
 ## Safety and isolation
 

@@ -1,14 +1,14 @@
 ---
 type: plan
 status: temporary
-as_of: 2026-09-13
+as_of: 2026-09-14
 ---
 
 # Persistent-chat Goose ChatGPT Web rebuild
 
 > **Covers:** implementation sequencing, qualification evidence, and remaining follow-up gates for the DreamBook appliance.
 > **Lifecycle authority:** `docs/persistent-chat-lifecycle.md` owns the non-negotiable persistent-conversation and paired-handoff invariants. Tunable recovery mechanics in this plan must conform to that decision; historical qualification evidence does not override it.
-> **Current checkpoint:** non-reboot V1 is accepted. The exact deployed code checkpoint is `2ac2f561a674482d8eccf0e0cc690edc095b7806`; machine-reboot reconstruction remains deferred. Historical pre-cutover evidence below is retained as history, not current operating instruction.
+> **Current checkpoint:** non-reboot V1 is accepted. The qualified installed runtime behavior is based on source checkpoint `5aff187bf356b6ca8287347106659489904f1842`; the active immutable bundle is `531d4ef3f9d9fb73fa22695878a2ed5f31cf2ac66ce8179976bc8719034c0860` with AppImage SHA-256 `7f15dff2a9175ee136bd9e9a107cc51d2c267c1ed26dec04f962e1cb9677bebb`. Machine-reboot reconstruction remains deferred. Historical pre-cutover evidence below is retained as history, not current operating instruction.
 
 ## Current rebuild boundary — operational authority
 

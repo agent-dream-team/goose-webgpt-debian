@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 const read = (path: string) => readFileSync(path, "utf8");
 
@@ -47,21 +47,21 @@ test("persistent-chat lifecycle authority preserves recovery and paired-handoff 
   expect(plan).toContain("REOPENED BY LIFECYCLE DECISION");
 });
 
-test("inherited Codex operator documents are visibly marked as heritage/reference", () => {
-  const inherited = [
-    "README.md",
+test("obsolete inherited Codex operator documents are removed from the DreamBook product surface", () => {
+  for (const path of [
     "README.zh-CN.md",
     "README.ja.md",
-    "CONTRIBUTING.md",
     "TROUBLESHOOTING.md",
-    "SECURITY.md",
     "docs/architecture.md",
     "docs/dev-chat.md",
     "docs/release-validation.md",
     "docs/security-model.md",
-  ];
-  for (const path of inherited) {
-    const head = read(path).split("\n").slice(0, 16).join("\n");
-    expect(head).toMatch(/HERITAGE DOCUMENT|REBUILD NOTE|CURRENT GOOSE V1/);
-  }
+  ]) expect(existsSync(path)).toBe(false);
+
+  const readme = read("README.md");
+  expect(readme).toContain("agent-dream-team/goose-webgpt-debian");
+  expect(readme).toContain("luke-m-selway/goose-chatgpt-web");
+  expect(readme).toContain("docs/persistent-chat-lifecycle.md");
+  expect(read("CONTRIBUTING.md")).toContain("DreamBook Goose ChatGPT Web appliance");
+  expect(read("SECURITY.md")).toContain("~/.local/share/goose-chatgpt-web-rebuild");
 });
