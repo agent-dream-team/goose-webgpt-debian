@@ -1,6 +1,6 @@
 # Goose ChatGPT Web V1 rules
 
-This checkout contains the qualified Goose ChatGPT Web V1. Read `docs/persistent-chat-lifecycle.md` before architecture, browser, lifecycle, or recovery work; it owns the non-negotiable persistent-conversation invariants. Then read `docs/persistent-chat-rebuild-plan.md` for implementation sequencing, qualification evidence, and current follow-up gates. The qualified installed runtime behavior is based on source checkpoint `5aff187bf356b6ca8287347106659489904f1842` (`Retire local conversation budget enforcement`); later repository commits may be documentation/test-only cleanup unless separately packaged and qualified.
+This checkout contains the qualified Goose ChatGPT Web V1. Read `docs/persistent-chat-lifecycle.md` before architecture, browser, lifecycle, or recovery work; it owns the non-negotiable persistent-conversation invariants. Then read `docs/persistent-chat-follow-up.md` for the current implementation/qualification gaps. The qualified installed runtime behavior is based on source checkpoint `5aff187bf356b6ca8287347106659489904f1842` (`Retire local conversation budget enforcement`); repository HEAD may be newer, but newer source is not installed authority until separately packaged and qualified.
 
 DreamBook repository authority: `origin` must be `agent-dream-team/goose-webgpt-debian`. Do not point this checkout at `luke-m-selway/goose-chatgpt-web`; that repository is reserved for later cross-platform/macOS adaptation of the V1 design.
 
@@ -27,7 +27,7 @@ This repository is **Goose ChatGPT Web**, not the inherited Codex product descri
 - **Inherited upstream surfaces that are not rebuild workflow:** Codex route/catalog integration, Setup/MCP mutation paths, browser smoke → Install models, `Codex Native2`, Bigger Context, Zero Risk/manual mode, Codex compaction/subagents, and default `~/.codex-chatgpt-web` / `~/.config/Codex Web GPT` production profile. Obsolete upstream operator documentation has been removed; do not recreate it as current Goose guidance.
 - **Qualification-only scaffolding:** `.qualification/`, isolated worktrees, VNC/x11vnc, and source/account-fence/Xvfb launch helpers are disposable local evidence unless explicitly promoted. `.qualification/` is ignored and should be removed once its durable conclusions are recorded.
 
-If an inherited UI/code path conflicts with this section or `docs/persistent-chat-rebuild-plan.md`, treat it as non-authoritative and stop before acting on it.
+If an inherited UI/code path conflicts with this section, `docs/persistent-chat-lifecycle.md`, or `docs/persistent-chat-follow-up.md`, treat it as non-authoritative and stop before acting on it.
 
 ## Safety and isolation
 
@@ -42,6 +42,6 @@ If an inherited UI/code path conflicts with this section or `docs/persistent-cha
 
 ## Workflow
 
-Gate sequencing and current qualification status live in `docs/persistent-chat-rebuild-plan.md`; do not infer the next gate from this rules file. Later evidence may reopen any contradicted contract.
+Current follow-up priorities and qualification gaps live in `docs/persistent-chat-follow-up.md`; do not infer current work from old commits, historical PR discussion, or retired gate evidence.
 
-For documentation work apply the current Day Shift lean-documentation skill. Before source/configuration changes apply the current code-maintainability skill and the plan's upstream keep/adapt/delete/excise boundary. Future behavior belongs in the plan until implemented and qualified; current-state documentation must describe only what is actually true.
+For documentation work apply the current Day Shift lean-documentation skill. Before source/configuration changes apply the current code-maintainability skill and preserve the product boundary documented here and in the follow-up plan. Future behavior belongs in the plan until implemented and qualified; current-state documentation must describe only what is actually true.

@@ -22,7 +22,7 @@ Read these before changing the appliance:
 
 - `AGENTS.md` — repository boundaries, safety rules, and workflow.
 - `docs/persistent-chat-lifecycle.md` — non-negotiable persistent-conversation and recovery invariants.
-- `docs/persistent-chat-rebuild-plan.md` — current implementation sequence, qualification evidence, and remaining follow-up gates.
+- `docs/persistent-chat-follow-up.md` — current implementation/qualification gaps and next work.
 
 Goose owns logical sessions, transcript/context lifecycle, tools, approvals, delegation, and project execution. This repository owns only the provider-side ChatGPT Web appliance and the local state needed to operate and recover it.
 
@@ -30,4 +30,4 @@ The inherited `miuuyy/codex-chatgpt-web` codebase remains implementation lineage
 
 ## Development
 
-Use the repository-pinned Bun/runtime tooling and the validation commands required by the current gate in `docs/persistent-chat-rebuild-plan.md`. Do not use old Codex setup, model-install, browser-smoke, or MCP instructions as Goose ChatGPT Web recovery procedures.
+Use the repository-pinned Bun/runtime tooling and the validation appropriate to the changed path. Do not use old Codex setup, model-install, browser-smoke, or MCP instructions as Goose ChatGPT Web recovery procedures.

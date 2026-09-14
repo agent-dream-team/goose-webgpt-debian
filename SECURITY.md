@@ -6,4 +6,6 @@ The production mutable root is `~/.local/share/goose-chatgpt-web-rebuild`. Do no
 
 Do not publish raw logs or evidence that can contain account identity, credentials, private repository content, prompts, or tool output. Report any credential exposure, authentication-boundary failure, unauthorized local-tool execution, or cross-session/provider-history bleed privately to the repository owner.
 
-Current security and lifecycle boundaries are owned by `AGENTS.md`, `docs/persistent-chat-lifecycle.md`, and `docs/persistent-chat-rebuild-plan.md`.
+Current security and lifecycle boundaries are owned by `AGENTS.md`, `docs/persistent-chat-lifecycle.md`, and `docs/persistent-chat-follow-up.md`.
+
+The local CDP/DevTools endpoint is unauthenticated browser-control authority: it must remain bound to loopback, must never be tunneled or port-forwarded, and is accepted only inside the same-user local trust boundary with the shortest practical listener lifetime.

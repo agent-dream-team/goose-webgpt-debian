@@ -6,7 +6,7 @@ status: current
 # Persistent ChatGPT conversation lifecycle
 
 > **Covers:** the non-negotiable lifecycle and recovery invariants for Goose ChatGPT Web persistent provider chats.
-> **Elsewhere:** `docs/persistent-chat-rebuild-plan.md` owns implementation sequencing, qualification evidence, and tunable recovery parameters. `AGENTS.md` makes this decision mandatory reading for lifecycle/recovery work.
+> **Elsewhere:** `docs/persistent-chat-follow-up.md` owns the current implementation and qualification gaps. Historical rebuild evidence lives in Git history rather than the current documentation surface.
 
 ## Status
 
