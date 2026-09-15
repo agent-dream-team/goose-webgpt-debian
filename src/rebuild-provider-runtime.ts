@@ -460,7 +460,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       }
       // admitNext is globally FIFO. Another request may observe that an older queued turn won the
       // slot; this waiter never executes that other turn and simply waits for its own turn.
-      const admitted = broker.admitNext();
+      const admitted = broker.admitNext(turnRef);
       if (admitted?.turn.turnRef === turnRef) return admitted;
       await sleep(POLL_MS, signal);
     }
@@ -626,7 +626,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
           port: server.port,
           accepting_turns: !draining,
           active_http_turns: activeHttpTurns,
-          active_browser_turns: broker.getAccountSlotHolder() ? 1 : 0,
+          active_browser_turns: broker.getActiveAccountSlotCount(),
         });
       }
       if (request.method === "POST" && url.pathname === "/admin/reconcile-operation") {
@@ -721,11 +721,13 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         try {
           broker.releaseSlotAfterPositiveTerminal(turnRef, evidence);
           const abandoned = broker.abandonUnreconciled(turnRef);
+          const accountSlotHolders = broker.getAccountSlotHolders();
           return Response.json({
             status: "ok",
             turn_ref: turnRef,
             turn_state: abandoned.state,
-            account_slot_holder: broker.getAccountSlotHolder(),
+            account_slot_holder: accountSlotHolders[0]?.turnRef ?? null,
+            account_slot_holders: accountSlotHolders,
           });
         } catch (error) {
           if (error instanceof SessionBrokerError) {
@@ -740,9 +742,9 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         }
         if (url.pathname === "/admin/resume") {
           draining = false;
-          return Response.json({ status: "ok", accepting_turns: true, active_http_turns: activeHttpTurns, active_browser_turns: broker.getAccountSlotHolder() ? 1 : 0 });
+          return Response.json({ status: "ok", accepting_turns: true, active_http_turns: activeHttpTurns, active_browser_turns: broker.getActiveAccountSlotCount() });
         }
-        const activeBrowserTurns = broker.getAccountSlotHolder() ? 1 : 0;
+        const activeBrowserTurns = broker.getActiveAccountSlotCount();
         if (activeHttpTurns !== 0 || activeBrowserTurns !== 0) {
           return Response.json({
             status: "busy",
@@ -758,7 +760,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         if (!safeEqualBearer(request.headers.get("authorization") ?? "", options.controlToken)) {
           return new Response("Unauthorized", { status: 401 });
         }
-        if (!draining || activeHttpTurns !== 0 || broker.getAccountSlotHolder()) {
+        if (!draining || activeHttpTurns !== 0 || broker.getActiveAccountSlotCount() !== 0) {
           return Response.json({ status: "refused", accepting_turns: !draining }, { status: 409 });
         }
         setTimeout(() => { void stop(); }, 0);

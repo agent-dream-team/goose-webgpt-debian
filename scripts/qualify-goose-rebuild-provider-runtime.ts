@@ -147,7 +147,7 @@ export async function runGooseRebuildProviderRuntimeQualification(gooseBin = pro
     assert(observedOpRef.length > 0);
     assert.equal(runtime.broker.getOperation(observedOpRef)?.state, "SUCCESS");
     assert.equal(runtime.broker.getTurn(observedTurnRef)?.state, "COMPLETE");
-    assert.equal(runtime.broker.getAccountSlotHolder(), null);
+    assert.equal(runtime.broker.getActiveAccountSlotCount(), 0);
     const epoch = runtime.broker.getCurrentEpoch(observedSessionId);
     assert(epoch);
     assert.equal(epoch.epoch, 1);

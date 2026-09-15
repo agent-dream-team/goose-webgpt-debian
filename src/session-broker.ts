@@ -84,6 +84,11 @@ export interface CompletionClaim {
   revision: number;
 }
 
+export interface AccountSlotOwnership {
+  slotId: 1 | 2;
+  turnRef: string;
+}
+
 export type OperationClaimDecision =
   | { kind: "EXECUTE"; opRef: string; seq: number }
   | { kind: "ATTACH"; opRef: string; seq: number }
@@ -221,8 +226,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS unique_submit_nonce ON turns(submit_nonce);
 CREATE UNIQUE INDEX IF NOT EXISTS one_open_turn_per_epoch
   ON turns(goose_session_id, epoch)
   WHERE state IN ('QUEUED', 'TURN_OUTSTANDING', 'UNRECONCILED');
-CREATE UNIQUE INDEX IF NOT EXISTS one_account_slot_holder ON turns(slot_held) WHERE slot_held = 1;
 CREATE INDEX IF NOT EXISTS queued_turns ON turns(state, queue_seq);
+
+CREATE TABLE IF NOT EXISTS account_slots (
+  slot_id INTEGER PRIMARY KEY CHECK (slot_id IN (1, 2)),
+  turn_ref TEXT UNIQUE,
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (turn_ref) REFERENCES turns(turn_ref)
+);
+INSERT OR IGNORE INTO account_slots(slot_id, turn_ref, updated_at) VALUES (1, NULL, 0);
+INSERT OR IGNORE INTO account_slots(slot_id, turn_ref, updated_at) VALUES (2, NULL, 0);
 
 CREATE TABLE IF NOT EXISTS broker_owner (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -479,28 +492,46 @@ export class SessionBroker {
     });
   }
 
-  admitNext(): { turn: BrokerTurn; initialOpRef: string } | null {
+  admitNext(requestedTurnRef?: string): { turn: BrokerTurn; initialOpRef: string } | null {
     return this.transaction(() => {
-      const holder = this.accountSlotHolder();
-      if (holder) {
-        const turn = this.turnRowRequired(holder);
-        if (turn.state !== "QUEUED") return null;
-        const initialOpRef = this.operationRefAt(turn.turn_ref, 1);
-        if (!initialOpRef) this.fail("JOURNAL_CORRUPT", "Admitted pre-send turn is missing its initial operation ref");
-        return { turn: turnFromRow(turn), initialOpRef };
+      if (requestedTurnRef) {
+        const requested = this.turnRowRequired(requestedTurnRef);
+        if (requested.state !== "QUEUED") this.fail("TURN_STATE", "Only a queued turn can wait for admission");
+        if (this.accountSlotForTurn(requestedTurnRef) !== null) {
+          const initialOpRef = this.operationRefAt(requestedTurnRef, 1);
+          if (!initialOpRef) this.fail("JOURNAL_CORRUPT", "Admitted pre-send turn is missing its initial operation ref");
+          return { turn: turnFromRow(requested), initialOpRef };
+        }
+      } else {
+        const heldQueued = this.db.query(`SELECT turns.* FROM turns
+          JOIN account_slots ON account_slots.turn_ref = turns.turn_ref
+          WHERE turns.state = 'QUEUED' ORDER BY turns.queue_seq ASC LIMIT 1`).get() as TurnRow | null;
+        if (heldQueued) {
+          const initialOpRef = this.operationRefAt(heldQueued.turn_ref, 1);
+          if (!initialOpRef) this.fail("JOURNAL_CORRUPT", "Admitted pre-send turn is missing its initial operation ref");
+          return { turn: turnFromRow(heldQueued), initialOpRef };
+        }
       }
-      const next = this.db.query("SELECT * FROM turns WHERE state = 'QUEUED' ORDER BY queue_seq ASC LIMIT 1")
+
+      const freeSlot = this.db.query("SELECT slot_id FROM account_slots WHERE turn_ref IS NULL ORDER BY slot_id ASC LIMIT 1")
+        .get() as { slot_id: 1 | 2 } | null;
+      if (!freeSlot) return null;
+      const next = this.db.query("SELECT * FROM turns WHERE state = 'QUEUED' AND slot_held = 0 ORDER BY queue_seq ASC LIMIT 1")
         .get() as TurnRow | null;
       if (!next) return null;
       const epoch = this.epochRowRequired(next.goose_session_id, next.epoch);
       if (epoch.is_current !== 1) {
         this.fail("QUEUE_INVARIANT", "Oldest queued turn no longer belongs to the current epoch");
       }
-      const slot = this.db.query("UPDATE turns SET slot_held = 1, updated_at = ? WHERE turn_ref = ? AND slot_held = 0")
-        .run(this.now(), next.turn_ref);
-      if (slot.changes !== 1) this.fail("ACCOUNT_SLOT", "Failed to acquire the account execution slot");
+      const at = this.now();
+      const slot = this.db.query("UPDATE account_slots SET turn_ref = ?, updated_at = ? WHERE slot_id = ? AND turn_ref IS NULL")
+        .run(next.turn_ref, at, freeSlot.slot_id);
+      if (slot.changes !== 1) this.fail("ACCOUNT_SLOT", "Failed to acquire the bounded account execution slot");
+      const held = this.db.query("UPDATE turns SET slot_held = 1, updated_at = ? WHERE turn_ref = ? AND slot_held = 0")
+        .run(at, next.turn_ref);
+      if (held.changes !== 1) this.fail("ACCOUNT_SLOT", "Failed to mark the admitted turn as slot-owning");
       const initialOpRef = this.operationRefAt(next.turn_ref, 1) ?? this.mintOperation(next.turn_ref, 1);
-      return { turn: turnFromRow(next), initialOpRef };
+      return { turn: turnFromRow(this.turnRowRequired(next.turn_ref)), initialOpRef };
     });
   }
 
@@ -510,11 +541,13 @@ export class SessionBroker {
       if (turn.state === "CANCELLED") return turnFromRow(turn);
       if (turn.state !== "QUEUED") this.fail("TURN_STATE", "Only a slot-owning queued turn may be cancelled before send");
       this.requireSlotHolder(turnRef);
+      const at = this.now();
       const result = this.db.query(`UPDATE turns SET state = 'CANCELLED', slot_held = 0, completion_claim_revision = NULL,
         budget_reserved_tokens = CASE WHEN budget_reserved_tokens IS NULL THEN NULL ELSE 0 END,
         revision = revision + 1, updated_at = ? WHERE turn_ref = ? AND slot_held = 1`)
-        .run(this.now(), turnRef);
+        .run(at, turnRef);
       if (result.changes !== 1) this.fail("ACCOUNT_SLOT", "Pre-send cancellation lost its account slot");
+      this.releaseAccountSlotInside(turnRef, at);
       return this.getTurnRequired(turnRef);
     });
   }
@@ -527,12 +560,14 @@ export class SessionBroker {
       if (turn.state !== "QUEUED") {
         this.fail("TURN_STATE", "Retryable cancellation is valid only before durable send activation");
       }
+      const at = this.now();
       const result = this.db.query(`UPDATE turns SET state = 'CANCELLED', slot_held = 0,
         pre_send_retryable_cancelled = 1, completion_claim_revision = NULL,
         budget_reserved_tokens = CASE WHEN budget_reserved_tokens IS NULL THEN NULL ELSE 0 END,
         revision = revision + 1, updated_at = ? WHERE turn_ref = ? AND state = 'QUEUED'`)
-        .run(this.now(), turnRef);
+        .run(at, turnRef);
       if (result.changes !== 1) this.fail("TURN_STATE", "Retryable pre-send cancellation lost the queued turn state");
+      this.releaseAccountSlotIfHeldInside(turnRef, at);
       return this.getTurnRequired(turnRef);
     });
   }
@@ -612,7 +647,7 @@ export class SessionBroker {
     return this.transaction(() => {
       const turn = this.turnRowRequired(turnRef);
       if (turn.state !== "UNRECONCILED") this.fail("TURN_STATE", "Only an unreconciled turn can be quarantined with its slot released");
-      if (this.accountSlotHolder() !== turnRef) {
+      if (this.accountSlotForTurn(turnRef) === null) {
         const recorded = this.recordedSlotDemotionEvidence(turnRef);
         if (recorded !== null) {
           if (recorded !== JSON.stringify(evidence)) {
@@ -649,10 +684,12 @@ export class SessionBroker {
       } else {
         this.bindAcceptedUserTurnId(turn, evidence.acceptedUserTurnId);
       }
+      const at = this.now();
       const result = this.db.query(`UPDATE turns SET positive_terminal_evidence_json = ?, slot_held = 0,
         revision = revision + 1, updated_at = ? WHERE turn_ref = ? AND slot_held = 1`)
-        .run(JSON.stringify(evidence), this.now(), turnRef);
+        .run(JSON.stringify(evidence), at, turnRef);
       if (result.changes !== 1) this.fail("ACCOUNT_SLOT", "Positive-terminal demotion lost its account slot");
+      this.releaseAccountSlotInside(turnRef, at);
       return this.getTurnRequired(turnRef);
     });
   }
@@ -971,6 +1008,7 @@ export class SessionBroker {
         revision = revision + 1, updated_at = ? WHERE turn_ref = ? AND slot_held = 1`)
         .run(at, claim.turnRef);
       if (result.changes !== 1) this.fail("ACCOUNT_SLOT", "Completion lost its account slot");
+      this.releaseAccountSlotInside(claim.turnRef, at);
       this.db.query(`UPDATE remote_epochs SET history_watermark = ?, updated_at = ?
         WHERE goose_session_id = ? AND epoch = ?`)
         .run(evidence.canonicalHistoryWatermark, at, turn.goose_session_id, turn.epoch);
@@ -1005,8 +1043,17 @@ export class SessionBroker {
     return row ? operationFromRow(row) : null;
   }
 
+  getAccountSlotHolders(): AccountSlotOwnership[] {
+    return this.accountSlotHolders();
+  }
+
+  getActiveAccountSlotCount(): number {
+    const row = this.db.query("SELECT COUNT(*) AS count FROM account_slots WHERE turn_ref IS NOT NULL").get() as { count: number };
+    return row.count;
+  }
+
   getAccountSlotHolder(): string | null {
-    return this.accountSlotHolder();
+    return this.accountSlotHolders()[0]?.turnRef ?? null;
   }
 
   private claimBrokerOwnership(): void {
@@ -1069,6 +1116,18 @@ export class SessionBroker {
           CHECK (budget_charge_tokens IS NULL OR budget_charge_tokens >= 0)`);
       }
 
+      const legacySlotHolders = this.db.query("SELECT turn_ref FROM turns WHERE slot_held = 1 ORDER BY queue_seq ASC")
+        .all() as Array<{ turn_ref: string }>;
+      const durableSlotHolders = this.accountSlotHolders();
+      if (durableSlotHolders.length === 0 && legacySlotHolders.length === 1) {
+        this.db.query("UPDATE account_slots SET turn_ref = ?, updated_at = ? WHERE slot_id = 1 AND turn_ref IS NULL")
+          .run(legacySlotHolders[0]!.turn_ref, this.now());
+      } else if (durableSlotHolders.length === 0 && legacySlotHolders.length > 1) {
+        this.fail("JOURNAL_CORRUPT", "Legacy broker contains more account-slot holders than its schema allowed");
+      }
+      this.db.exec("DROP INDEX IF EXISTS one_account_slot_holder");
+      this.assertAccountSlotIntegrity();
+
       const openTurnIndex = this.db.query(`SELECT sql FROM sqlite_master
         WHERE type = 'index' AND name = 'one_open_turn_per_epoch'`).get() as { sql: string | null } | null;
       if (!openTurnIndex?.sql?.includes("abandoned_at IS NULL")) {
@@ -1117,8 +1176,10 @@ export class SessionBroker {
             AND turns.abandoned_at IS NOT NULL
         )`).run(at);
       // QUEUED is strictly before the durable send fence. After process restart its HTTP owner is
-      // gone, so retaining it would let an ownerless FIFO entry capture the global account slot.
+      // gone, so retaining it would let an ownerless FIFO entry retain one of the bounded account slots.
       // Make it retryable-cancelled: exact Goose replay can create a fresh pre-send attempt.
+      this.db.query(`UPDATE account_slots SET turn_ref = NULL, updated_at = ?
+        WHERE turn_ref IN (SELECT turn_ref FROM turns WHERE state = 'QUEUED')`).run(at);
       this.db.query(`UPDATE turns SET state = 'CANCELLED', slot_held = 0,
         pre_send_retryable_cancelled = 1, completion_claim_revision = NULL,
         budget_reserved_tokens = CASE WHEN budget_reserved_tokens IS NULL THEN NULL ELSE 0 END,
@@ -1155,6 +1216,7 @@ export class SessionBroker {
           completion_claim_revision = NULL, revision = revision + 1, updated_at = ? WHERE turn_ref = ?`)
           .run(at, turnRef);
       }
+      this.assertAccountSlotIntegrity();
     });
   }
 
@@ -1309,12 +1371,44 @@ export class SessionBroker {
   }
 
   private requireSlotHolder(turnRef: string): void {
-    if (this.accountSlotHolder() !== turnRef) this.fail("ACCOUNT_SLOT", "Turn does not own the account execution slot");
+    if (this.accountSlotForTurn(turnRef) === null) this.fail("ACCOUNT_SLOT", "Turn does not own an account execution slot");
   }
 
-  private accountSlotHolder(): string | null {
-    const row = this.db.query("SELECT turn_ref FROM turns WHERE slot_held = 1").get() as { turn_ref: string } | null;
-    return row?.turn_ref ?? null;
+  private accountSlotForTurn(turnRef: string): 1 | 2 | null {
+    const row = this.db.query("SELECT slot_id FROM account_slots WHERE turn_ref = ?").get(turnRef) as { slot_id: 1 | 2 } | null;
+    return row?.slot_id ?? null;
+  }
+
+  private accountSlotHolders(): AccountSlotOwnership[] {
+    const rows = this.db.query("SELECT slot_id, turn_ref FROM account_slots WHERE turn_ref IS NOT NULL ORDER BY slot_id ASC")
+      .all() as Array<{ slot_id: 1 | 2; turn_ref: string }>;
+    return rows.map(row => ({ slotId: row.slot_id, turnRef: row.turn_ref }));
+  }
+
+  private releaseAccountSlotInside(turnRef: string, at: number): void {
+    const result = this.db.query("UPDATE account_slots SET turn_ref = NULL, updated_at = ? WHERE turn_ref = ?")
+      .run(at, turnRef);
+    if (result.changes !== 1) this.fail("ACCOUNT_SLOT", "Turn lost its durable account-slot ownership");
+  }
+
+  private releaseAccountSlotIfHeldInside(turnRef: string, at: number): void {
+    const result = this.db.query("UPDATE account_slots SET turn_ref = NULL, updated_at = ? WHERE turn_ref = ?")
+      .run(at, turnRef);
+    if (result.changes > 1) this.fail("JOURNAL_CORRUPT", "Turn owns more than one durable account slot");
+  }
+
+  private assertAccountSlotIntegrity(): void {
+    const slots = this.db.query("SELECT slot_id, turn_ref FROM account_slots ORDER BY slot_id ASC")
+      .all() as Array<{ slot_id: number; turn_ref: string | null }>;
+    if (slots.length !== 2 || slots[0]?.slot_id !== 1 || slots[1]?.slot_id !== 2) {
+      this.fail("JOURNAL_CORRUPT", "Broker must contain exactly durable account slots 1 and 2");
+    }
+    const durable = new Set(slots.flatMap(slot => slot.turn_ref ? [slot.turn_ref] : []));
+    const mirrored = (this.db.query("SELECT turn_ref FROM turns WHERE slot_held = 1").all() as Array<{ turn_ref: string }>)
+      .map(row => row.turn_ref);
+    if (durable.size !== mirrored.length || mirrored.some(turnRef => !durable.has(turnRef))) {
+      this.fail("JOURNAL_CORRUPT", "Durable account-slot ownership disagrees with turn slot markers");
+    }
   }
 
   private currentEpochRow(gooseSessionId: string): EpochRow | null {
