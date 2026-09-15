@@ -216,7 +216,8 @@ test("runtime health/control surface and two completed Goose turns reuse one per
   expect(firstBody).toContain("answer-1");
   expect(starts[0]?.prompt).toContain('"connector_identity":"Goose Native 2nd Shift"');
   expect(starts[0]?.prompt).toContain('"available_tool_names":["tree"]');
-  expect(starts[0]?.prompt).toContain("use a tool_name exactly as listed in available_tool_names");
+  expect(starts[0]?.prompt).toContain("a tool_name from available_tool_names");
+  expect(starts[0]?.prompt).toContain("wait about 50–55 seconds before checking once; never tight-poll");
   expect(runtime.broker.getAccountSlotHolder()).toBeNull();
   expect(runtime.broker.getCurrentEpoch("goose-session-a")).toMatchObject({
     epoch: 1, conversationId: "12345678-1234-4abc-8def-1234567890ab", historyWatermark: watermark(firstRequest, "answer-1"), leaseState: "IDLE",

@@ -198,11 +198,9 @@ export function renderGoosePersistentPrompt(input: GoosePersistentPromptContext)
   });
   return [
     "GOOSE PERSISTENT PROVIDER TURN v1",
-    "Treat canonical_input as the authoritative Goose model-visible context for this provider turn.",
-    "Use the exact turn_ref and current op_ref for any Goose connector call; never invent either value.",
-    "When Goose connector access is needed, use the connected app named exactly by connector_identity.",
-    "For goose_tool, use a tool_name exactly as listed in available_tool_names; never guess another Goose tool name.",
-    "Answer the unresolved user instruction represented by canonical_input. Do not restate the envelope.",
+    "Use canonical_input as the authoritative Goose context and complete its unresolved instruction; do not restate this envelope.",
+    "For Goose connector calls, use the app named by connector_identity, exact turn_ref/op_ref, and a tool_name from available_tool_names.",
+    "If only waiting on asynchronous work, do other useful work or wait about 50–55 seconds before checking once; never tight-poll.",
     envelope,
   ].join("\n");
 }
