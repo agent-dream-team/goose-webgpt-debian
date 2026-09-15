@@ -14,14 +14,16 @@ as_of: 2026-09-15
 
 The non-reboot V1 appliance is installed and operational on DreamBook through `~/.local/bin/goose-chatgpt-web` and the immutable package under `~/.local/lib/goose-chatgpt-web/`.
 
-The currently installed runtime behavior was built from source checkpoint `5aff187bf356b6ca8287347106659489904f1842` (`Retire local conversation budget enforcement`):
+The currently installed runtime behavior was built from source checkpoint `15fbb7e25e00b7eed63e5313a090e79818fa4bf3` (`Support two persistent GCW execution slots`):
 
-- immutable bundle `531d4ef3f9d9fb73fa22695878a2ed5f31cf2ac66ce8179976bc8719034c0860`;
-- AppImage SHA-256 `7f15dff2a9175ee136bd9e9a107cc51d2c267c1ed26dec04f962e1cb9677bebb`;
-- a fresh installed-package Goose/GCW turn completed successfully after activation;
+- immutable bundle `bf526d243be697bf7d116a5c3f3394e3948307f80ffa61223e25753c16b2090d`;
+- AppImage SHA-256 `7bd181efad6cee39144f5ddcf90e556aad73fdd0b95ae04aa735e367187b4311`;
+- runtime-manifest SHA-256 `6a00bca55ec5ac0584341e138503df6c8c285f8e812e7adf90cab69e1a0f3c33`, freshly reproduced from the clean source checkpoint and matching the active runtime manifest and bundle ID;
+- exactly two concurrent persistent browser turns qualified live as one GCW parent/orchestrator plus one native-Goose GCW child/worker, including a tool-capable child and two consecutive stock-Goose async parent/child runs;
+- clean slot release back to zero after the qualified paired runs;
 - local conversation-budget estimates no longer reject tool work, cap otherwise valid output, or force provider-chat rollover.
 
-Repository HEAD may contain later source, documentation, or test robustness fixes. Do not describe those later commits as installed until a package built from them is independently qualified and activated.
+The installed AppImage hash records the exact activated package; byte-for-byte AppImage reproducibility is not claimed. Draft PR #8 retains the detailed source, package, and live-qualification evidence. Repository HEAD may contain later source, documentation, or test robustness fixes. Do not describe source after this checkpoint as installed until a package built from it is independently qualified and activated.
 
 The old DreamBook appliance and its mutable state are retired. The active repository is `agent-dream-team/goose-webgpt-debian`; the separate `luke-m-selway/goose-chatgpt-web` repository is the MBP/macOS target.
 
@@ -57,13 +59,13 @@ A settled stopped/error view with no intended final should receive the standardi
 
 ### 3. Tool/delegation edge qualification
 
-The serial connector/tool path is already usable. Remaining edge qualification includes stale turn-ref rejection, capability lifetime across long work/view recovery, ambiguous side-effect delivery remaining `UNCERTAIN`, final-answer blocking while tool work is unresolved, and one native Goose child-delegation path without GCW owning child-session state.
+The serial connector/tool path is already usable, and the installed package has qualified one tool-capable native-Goose GCW child without GCW owning child-session state. Remaining edge qualification includes stale turn-ref rejection, capability lifetime across long work/view recovery, ambiguous side-effect delivery remaining `UNCERTAIN`, and final-answer blocking while tool work is unresolved.
 
 Native Goose approval-round qualification is deferred while DreamBook remains in Goose `auto`; it becomes required before supporting non-`auto` modes.
 
 ### 4. Retention, isolation, and contention
 
-Continue auditing what local data is allowed into durable ChatGPT history, result-size/redaction/retention behavior, connector authorization boundaries, aged-Project cross-session isolation, and contention between independent Goose sessions. Current source now targets a hard capacity of exactly two concurrent persistent browser turns, intended for one GCW orchestrator plus one native-Goose GCW child. That bounded two-turn behavior still requires independent package/runtime qualification before it becomes installed authority; capacity beyond two remains out of scope.
+Continue auditing what local data is allowed into durable ChatGPT history, result-size/redaction/retention behavior, connector authorization boundaries, aged-Project cross-session isolation, and contention between independent Goose sessions. The installed runtime has a qualified hard capacity of exactly two concurrent persistent browser turns, intended for one GCW orchestrator plus one native-Goose GCW child. Capacity beyond two remains out of scope, and parallel side-effecting connector operations still require separate qualification.
 
 Any observed sibling-chat bleed is a blocking correctness defect for the shared-Project topology and requires a different qualified topology rather than stronger prompt wording alone.
 
