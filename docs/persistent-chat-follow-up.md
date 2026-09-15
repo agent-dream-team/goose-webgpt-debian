@@ -1,7 +1,7 @@
 ---
 type: plan
 status: current
-as_of: 2026-09-14
+as_of: 2026-09-15
 ---
 
 # Goose ChatGPT Web current follow-up plan
@@ -63,7 +63,7 @@ Native Goose approval-round qualification is deferred while DreamBook remains in
 
 ### 4. Retention, isolation, and contention
 
-Continue auditing what local data is allowed into durable ChatGPT history, result-size/redaction/retention behavior, connector authorization boundaries, aged-Project cross-session isolation, and contention between independent Goose sessions for the one ChatGPT account slot.
+Continue auditing what local data is allowed into durable ChatGPT history, result-size/redaction/retention behavior, connector authorization boundaries, aged-Project cross-session isolation, and contention between independent Goose sessions. Current source now targets a hard capacity of exactly two concurrent persistent browser turns, intended for one GCW orchestrator plus one native-Goose GCW child. That bounded two-turn behavior still requires independent package/runtime qualification before it becomes installed authority; capacity beyond two remains out of scope.
 
 Any observed sibling-chat bleed is a blocking correctness defect for the shared-Project topology and requires a different qualified topology rather than stronger prompt wording alone.
 
@@ -82,7 +82,7 @@ This reboot is deliberately deferred to a coordinated multi-system reboot window
 - rebuilding the retired pre-V1 appliance as an implicit rollback route;
 - Codex product compatibility or restoration of inherited Codex operator workflows;
 - a second Goose transcript/context/delegation authority inside GCW;
-- multi-tab concurrent ChatGPT-Web execution;
+- general multi-tab ChatGPT-Web execution beyond the bounded two-turn orchestrator-plus-one-worker provider behavior;
 - parallel side-effecting connector operations without separate qualification;
 - an LLM watcher or recovery arbiter deciding ambiguous state; ambiguity remains durably `UNCERTAIN` and escalates to the operator rather than model judgement;
 - treating Project memory/instructions as a technical security boundary;

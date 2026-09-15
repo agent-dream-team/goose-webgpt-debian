@@ -638,11 +638,19 @@ test("transport loss before send activation frees the slot and exact retry gets 
   expect(runtime.broker.getCurrentEpoch("goose-pre-send")).toMatchObject({ epoch: 1, leaseState: "IDLE", historyWatermark: watermark(requestBody("pre-send-retry"), "fresh-pre-send-retry-ok") });
 });
 
-test("a queued transport owner disappearing behind another session cannot poison global FIFO", async () => {
+test("a queued transport owner disappearing behind two active sessions cannot poison FIFO", async () => {
   const aStarted = deferred<void>();
+  const bStarted = deferred<void>();
+  const dStarted = deferred<void>();
   const finishA = deferred<void>();
-  const cStarted = deferred<void>();
+  const finishB = deferred<void>();
+  const finishD = deferred<void>();
   const starts: string[] = [];
+  const ids: Record<string, string> = {
+    "goose-a": "eeeeeeee-ffff-4000-8aaa-000000000001",
+    "goose-b": "eeeeeeee-ffff-4000-8aaa-000000000002",
+    "goose-d": "eeeeeeee-ffff-4000-8aaa-000000000004",
+  };
   const driver: RebuildPersistentBrowserDriver = {
     createTurn(input) {
       starts.push(input.gooseSessionId);
@@ -652,21 +660,14 @@ test("a queued transport owner disappearing behind another session cannot poison
         run: async () => {
           input.lifecycle.onSendActivated();
           input.lifecycle.onAccepted({
-            canonicalConversationId: input.gooseSessionId === "goose-a"
-              ? "eeeeeeee-ffff-4000-8aaa-000000000001"
-              : "eeeeeeee-ffff-4000-8aaa-000000000003",
+            canonicalConversationId: ids[input.gooseSessionId]!,
             acceptedUserTurnId: `user-${input.gooseSessionId}`,
           });
-          if (input.gooseSessionId === "goose-a") {
-            aStarted.resolve();
-            await finishA.promise;
-          } else if (input.gooseSessionId === "goose-c") {
-            cStarted.resolve();
-          }
+          if (input.gooseSessionId === "goose-a") { aStarted.resolve(); await finishA.promise; }
+          else if (input.gooseSessionId === "goose-b") { bStarted.resolve(); await finishB.promise; }
+          else if (input.gooseSessionId === "goose-d") { dStarted.resolve(); await finishD.promise; }
           return {
-            canonicalConversationId: input.gooseSessionId === "goose-a"
-              ? "eeeeeeee-ffff-4000-8aaa-000000000001"
-              : "eeeeeeee-ffff-4000-8aaa-000000000003",
+            canonicalConversationId: ids[input.gooseSessionId]!,
             acceptedUserTurnId: `user-${input.gooseSessionId}`,
             text: `answer-${input.gooseSessionId}`,
             remoteNonRunning: true,
@@ -678,30 +679,100 @@ test("a queued transport owner disappearing behind another session cannot poison
   const { runtime } = setup(driver);
   const a = post(runtime, requestBody("a"), "goose-a");
   await aStarted.promise;
+  const b = post(runtime, requestBody("b"), "goose-b");
+  await bStarted.promise;
 
-  const bAbort = new AbortController();
-  const b = post(runtime, requestBody("b"), "goose-b", bAbort.signal).catch(error => error);
-  const bQueueDeadline = Date.now() + 2_000;
-  while (runtime.broker.getOpenTurnForSession("goose-b")?.state !== "QUEUED" && Date.now() < bQueueDeadline) await Bun.sleep(10);
-  expect(runtime.broker.getOpenTurnForSession("goose-b")?.state).toBe("QUEUED");
-  bAbort.abort();
-  await b;
-  const bCancelDeadline = Date.now() + 2_000;
-  while (runtime.broker.getOpenTurnForSession("goose-b") !== null && Date.now() < bCancelDeadline) await Bun.sleep(10);
-  expect(runtime.broker.getOpenTurnForSession("goose-b")).toBeNull();
+  const cAbort = new AbortController();
+  const c = post(runtime, requestBody("c"), "goose-c", cAbort.signal).catch(error => error);
+  const cQueueDeadline = Date.now() + 2_000;
+  while (runtime.broker.getOpenTurnForSession("goose-c")?.state !== "QUEUED" && Date.now() < cQueueDeadline) await Bun.sleep(10);
+  expect(runtime.broker.getOpenTurnForSession("goose-c")?.state).toBe("QUEUED");
+  cAbort.abort();
+  await c;
+  const cCancelDeadline = Date.now() + 2_000;
+  while (runtime.broker.getOpenTurnForSession("goose-c") !== null && Date.now() < cCancelDeadline) await Bun.sleep(10);
+  expect(runtime.broker.getOpenTurnForSession("goose-c")).toBeNull();
+
+  const d = post(runtime, requestBody("d"), "goose-d");
+  const dQueueDeadline = Date.now() + 2_000;
+  while (runtime.broker.getOpenTurnForSession("goose-d")?.state !== "QUEUED" && Date.now() < dQueueDeadline) await Bun.sleep(10);
+  expect(starts).toEqual(["goose-a", "goose-b"]);
+  finishA.resolve();
+  await dStarted.promise;
+  expect((await a).status).toBe(200);
+  expect(starts).toEqual(["goose-a", "goose-b", "goose-d"]);
+
+  finishB.resolve();
+  finishD.resolve();
+  expect((await b).status).toBe(200);
+  const dResponse = await d;
+  expect(dResponse.status).toBe(200);
+  expect(await dResponse.text()).toContain("answer-goose-d");
+  expect(runtime.broker.getActiveAccountSlotCount()).toBe(0);
+});
+
+test("runtime admits exactly two sessions while health reports active browser turns from zero through two", async () => {
+  const started = { a: deferred<void>(), b: deferred<void>(), c: deferred<void>() };
+  const finish = { a: deferred<void>(), b: deferred<void>(), c: deferred<void>() };
+  const ids: Record<string, string> = {
+    "goose-a": "ffffffff-1111-4000-8aaa-000000000001",
+    "goose-b": "ffffffff-1111-4000-8aaa-000000000002",
+    "goose-c": "ffffffff-1111-4000-8aaa-000000000003",
+  };
+  const starts: string[] = [];
+  const driver: RebuildPersistentBrowserDriver = {
+    createTurn(input) {
+      starts.push(input.gooseSessionId);
+      const key = input.gooseSessionId.at(-1) as "a" | "b" | "c";
+      return {
+        captureAnswerBoundary: async () => { throw new Error("no tool expected"); },
+        confirmFinal: async evidence => evidence,
+        run: async () => {
+          input.lifecycle.onSendActivated();
+          input.lifecycle.onAccepted({
+            canonicalConversationId: ids[input.gooseSessionId]!,
+            acceptedUserTurnId: `user-${input.gooseSessionId}`,
+          });
+          started[key].resolve();
+          await finish[key].promise;
+          return {
+            canonicalConversationId: ids[input.gooseSessionId]!,
+            acceptedUserTurnId: `user-${input.gooseSessionId}`,
+            text: `answer-${input.gooseSessionId}`,
+            remoteNonRunning: true,
+          };
+        },
+      };
+    },
+  };
+  const { runtime } = setup(driver);
+  expect(await (await fetch(`${runtime.origin}/healthz`)).json()).toMatchObject({ active_browser_turns: 0 });
+
+  const a = post(runtime, requestBody("a"), "goose-a");
+  await started.a.promise;
+  const b = post(runtime, requestBody("b"), "goose-b");
+  await started.b.promise;
+  expect(starts).toEqual(["goose-a", "goose-b"]);
+  expect(await (await fetch(`${runtime.origin}/healthz`)).json()).toMatchObject({ active_browser_turns: 2 });
 
   const c = post(runtime, requestBody("c"), "goose-c");
   const cQueueDeadline = Date.now() + 2_000;
   while (runtime.broker.getOpenTurnForSession("goose-c")?.state !== "QUEUED" && Date.now() < cQueueDeadline) await Bun.sleep(10);
-  expect(starts).toEqual(["goose-a"]);
-  finishA.resolve();
-  await cStarted.promise;
+  expect(runtime.broker.getOpenTurnForSession("goose-c")?.state).toBe("QUEUED");
+  expect(starts).toEqual(["goose-a", "goose-b"]);
+
+  finish.a.resolve();
+  await started.c.promise;
   expect((await a).status).toBe(200);
-  const cResponse = await c;
-  expect(cResponse.status).toBe(200);
-  expect(await cResponse.text()).toContain("answer-goose-c");
-  expect(starts).toEqual(["goose-a", "goose-c"]);
-  expect(runtime.broker.getAccountSlotHolder()).toBeNull();
+  expect(starts).toEqual(["goose-a", "goose-b", "goose-c"]);
+  expect(await (await fetch(`${runtime.origin}/healthz`)).json()).toMatchObject({ active_browser_turns: 2 });
+
+  finish.b.resolve();
+  expect((await b).status).toBe(200);
+  expect(await (await fetch(`${runtime.origin}/healthz`)).json()).toMatchObject({ active_browser_turns: 1 });
+  finish.c.resolve();
+  expect((await c).status).toBe(200);
+  expect(await (await fetch(`${runtime.origin}/healthz`)).json()).toMatchObject({ active_browser_turns: 0 });
 });
 
 test("provider restart recovers an outstanding turn to UNRECONCILED and does not invent browser execution", async () => {

@@ -165,6 +165,36 @@ test("accepted remote turn becomes unreconciled on broker restart without releas
   }
 });
 
+test("restart preserves both post-send slot owners while demoting both turns to unreconciled", () => {
+  const { broker, path } = fixture();
+  createSession(broker, "goose-a");
+  createSession(broker, "goose-b");
+  enqueue(broker, "goose-a", "turn-a", "req-a");
+  enqueue(broker, "goose-b", "turn-b", "req-b");
+  expect(broker.admitNext("turn-a")?.turn.turnRef).toBe("turn-a");
+  accept(broker, "turn-a");
+  expect(broker.admitNext("turn-b")?.turn.turnRef).toBe("turn-b");
+  accept(broker, "turn-b");
+  expect(broker.getAccountSlotHolders()).toEqual([
+    { slotId: 1, turnRef: "turn-a" },
+    { slotId: 2, turnRef: "turn-b" },
+  ]);
+  broker.close();
+
+  const restarted = open(path, "broker-b");
+  try {
+    expect(restarted.getTurn("turn-a")?.state).toBe("UNRECONCILED");
+    expect(restarted.getTurn("turn-b")?.state).toBe("UNRECONCILED");
+    expect(restarted.getAccountSlotHolders()).toEqual([
+      { slotId: 1, turnRef: "turn-a" },
+      { slotId: 2, turnRef: "turn-b" },
+    ]);
+    expect(restarted.getActiveAccountSlotCount()).toBe(2);
+  } finally {
+    restarted.close();
+  }
+});
+
 test("stale claimed operation becomes UNCERTAIN on restart and never redispatches", () => {
   const { broker, path } = fixture();
   createSession(broker);
@@ -329,22 +359,28 @@ test("operator-known terminal reconciliation requires post-owner uncertainty and
   }
 });
 
-test("timeout or silence alone never releases account slot; positive terminal evidence releases only the slot", () => {
+test("timeout or silence alone never releases its slot while the second slot remains independent", () => {
   let now = 1_000;
   const { broker } = fixture("broker-a", () => now);
   try {
     createSession(broker, "goose-a");
     createSession(broker, "goose-b");
+    createSession(broker, "goose-c");
     enqueue(broker, "goose-a", "turn-a", "req-a");
     enqueue(broker, "goose-b", "turn-b", "req-b");
-    broker.admitNext();
+    enqueue(broker, "goose-c", "turn-c", "req-c");
+    expect(broker.admitNext("turn-a")?.turn.turnRef).toBe("turn-a");
     accept(broker, "turn-a");
     broker.bindConversation({ gooseSessionId: "goose-a", epoch: 1, conversationId: "conversation-a" });
     broker.markUnreconciled("turn-a", "ui_stale");
+    expect(broker.admitNext("turn-b")?.turn.turnRef).toBe("turn-b");
     now += 24 * 60 * 60 * 1_000;
 
-    expect(broker.getAccountSlotHolder()).toBe("turn-a");
-    expect(broker.admitNext()).toBeNull();
+    expect(broker.getAccountSlotHolders()).toEqual([
+      { slotId: 1, turnRef: "turn-a" },
+      { slotId: 2, turnRef: "turn-b" },
+    ]);
+    expect(broker.admitNext("turn-c")).toBeNull();
     expect(() => broker.releaseSlotAfterPositiveTerminal("turn-a", {
       ...positiveTerminal,
       remoteUiNonRunningAcrossQualifiedSettle: false,
@@ -352,8 +388,12 @@ test("timeout or silence alone never releases account slot; positive terminal ev
 
     broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
     expect(broker.getCurrentEpoch("goose-a")?.leaseState).toBe("UNRECONCILED");
-    expect(broker.getAccountSlotHolder()).toBeNull();
-    expect(broker.admitNext()?.turn.turnRef).toBe("turn-b");
+    expect(broker.getAccountSlotHolders()).toEqual([{ slotId: 2, turnRef: "turn-b" }]);
+    expect(broker.admitNext("turn-c")?.turn.turnRef).toBe("turn-c");
+    expect(broker.getAccountSlotHolders()).toEqual([
+      { slotId: 1, turnRef: "turn-c" },
+      { slotId: 2, turnRef: "turn-b" },
+    ]);
     expect(broker.getCurrentEpoch("goose-a")?.leaseState).toBe("UNRECONCILED");
   } finally {
     broker.close();
@@ -728,6 +768,44 @@ test("legacy pre-abandonment broker schema migrates additively and can abandon w
   }
 });
 
+test("legacy one-slot broker migrates its outstanding owner into durable slot 1", () => {
+  const { broker, path } = fixture();
+  createSession(broker);
+  enqueue(broker);
+  broker.admitNext();
+  accept(broker);
+  bindConversation(broker);
+  broker.close();
+
+  const legacy = new Database(path, { strict: true });
+  try {
+    legacy.exec(`DROP TABLE account_slots;
+      CREATE UNIQUE INDEX one_account_slot_holder ON turns(slot_held) WHERE slot_held = 1;`);
+    const holder = legacy.query("SELECT turn_ref FROM turns WHERE slot_held = 1").get() as { turn_ref: string };
+    expect(holder.turn_ref).toBe("turn-a");
+  } finally {
+    legacy.close();
+  }
+
+  const restarted = open(path, "broker-legacy-account-slot");
+  try {
+    expect(restarted.getTurn("turn-a")?.state).toBe("UNRECONCILED");
+    expect(restarted.getAccountSlotHolders()).toEqual([{ slotId: 1, turnRef: "turn-a" }]);
+    expect(restarted.getActiveAccountSlotCount()).toBe(1);
+
+    const inspect = new Database(path, { strict: true });
+    try {
+      expect(inspect.query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'one_account_slot_holder'").get()).toBeNull();
+      expect(inspect.query("SELECT turn_ref FROM account_slots WHERE slot_id = 1").get()).toEqual({ turn_ref: "turn-a" });
+      expect(inspect.query("SELECT turn_ref FROM account_slots WHERE slot_id = 2").get()).toEqual({ turn_ref: null });
+    } finally {
+      inspect.close();
+    }
+  } finally {
+    restarted.close();
+  }
+});
+
 test("restart retires a legacy abandoned epoch that was still marked current", () => {
   const { broker, path } = fixture();
   createSession(broker);
@@ -756,6 +834,39 @@ test("restart retires a legacy abandoned epoch that was still marked current", (
     expect(restarted.createEpoch({ gooseSessionId: "goose-a" }).epoch).toBe(2);
   } finally {
     restarted.close();
+  }
+});
+
+test("two independent sessions fill the bounded slots and FIFO refills only the freed slot", () => {
+  const { broker } = fixture();
+  try {
+    for (const session of ["goose-a", "goose-b", "goose-c", "goose-d"]) createSession(broker, session);
+    enqueue(broker, "goose-a", "turn-a", "req-a");
+    enqueue(broker, "goose-b", "turn-b", "req-b");
+    enqueue(broker, "goose-c", "turn-c", "req-c");
+    enqueue(broker, "goose-d", "turn-d", "req-d");
+
+    expect(broker.admitNext("turn-a")?.turn.turnRef).toBe("turn-a");
+    expect(broker.admitNext("turn-b")?.turn.turnRef).toBe("turn-b");
+    expect(broker.getActiveAccountSlotCount()).toBe(2);
+    expect(broker.admitNext("turn-d")).toBeNull();
+
+    broker.cancelBeforeSend("turn-a");
+    expect(broker.getAccountSlotHolders()).toEqual([{ slotId: 2, turnRef: "turn-b" }]);
+    expect(broker.admitNext("turn-d")?.turn.turnRef).toBe("turn-c");
+    expect(broker.getAccountSlotHolders()).toEqual([
+      { slotId: 1, turnRef: "turn-c" },
+      { slotId: 2, turnRef: "turn-b" },
+    ]);
+
+    broker.cancelBeforeSend("turn-b");
+    expect(broker.admitNext("turn-d")?.turn.turnRef).toBe("turn-d");
+    expect(broker.getAccountSlotHolders()).toEqual([
+      { slotId: 1, turnRef: "turn-c" },
+      { slotId: 2, turnRef: "turn-d" },
+    ]);
+  } finally {
+    broker.close();
   }
 });
 
@@ -975,6 +1086,7 @@ test("positive-terminal release does not hide a missing account-slot invariant",
   broker.close();
 
   const db = new Database(path, { strict: true });
+  db.query("UPDATE account_slots SET turn_ref = NULL WHERE turn_ref = 'turn-a'").run();
   db.query("UPDATE turns SET slot_held = 0 WHERE turn_ref = 'turn-a'").run();
   db.close();
 
@@ -1122,7 +1234,7 @@ test("checkpoint progress is durable and invalidates an in-flight completion cla
   }
 });
 
-test("SQLite enforces one global account slot and globally unique submit nonce", () => {
+test("SQLite enforces two durable slot identities, unique owners, and globally unique submit nonce", () => {
   const { broker, path } = fixture();
   createSession(broker, "goose-a");
   createSession(broker, "goose-b");
@@ -1133,8 +1245,11 @@ test("SQLite enforces one global account slot and globally unique submit nonce",
   const db = new Database(path, { strict: true });
   try {
     db.exec("PRAGMA foreign_keys = ON");
-    db.query("UPDATE turns SET slot_held = 1 WHERE turn_ref = 'turn-a'").run();
-    expect(() => db.query("UPDATE turns SET slot_held = 1 WHERE turn_ref = 'turn-b'").run()).toThrow();
+    db.query("UPDATE account_slots SET turn_ref = 'turn-a' WHERE slot_id = 1").run();
+    db.query("UPDATE account_slots SET turn_ref = 'turn-b' WHERE slot_id = 2").run();
+    expect(() => db.query("INSERT INTO account_slots(slot_id, turn_ref, updated_at) VALUES (1, NULL, 1)").run()).toThrow();
+    expect(() => db.query("UPDATE account_slots SET turn_ref = 'turn-a' WHERE slot_id = 2").run()).toThrow();
+    expect(() => db.query("INSERT INTO account_slots(slot_id, turn_ref, updated_at) VALUES (3, NULL, 1)").run()).toThrow();
     expect(() => db.query(`INSERT INTO turns(
       turn_ref, goose_session_id, epoch, request_hash, submit_nonce, state, revision, created_at, updated_at
     ) VALUES ('turn-collision', 'goose-b', 1, 'req-collision', 'nonce-turn-a', 'CANCELLED', 0, 1, 1)`).run()).toThrow();
