@@ -65,6 +65,8 @@ export interface RebuildBrowserTurnLifecycle {
   onSendActivated(): void | Promise<void>;
   /** Called only after semantic submission + canonical conversation/user-turn identity are proven. */
   onAccepted(evidence: RebuildBrowserAcceptedEvidence): void | Promise<void>;
+  /** Called when recovery reopens the same accepted remote turn without sending anything new. */
+  onRebound?(evidence: RebuildBrowserAcceptedEvidence): void | Promise<void>;
 }
 
 export interface RebuildPersistentBrowserTurnInput {
@@ -75,11 +77,15 @@ export interface RebuildPersistentBrowserTurnInput {
   submitNonce: string;
   prompt: string;
   existingConversationId: string | null;
+  /** Reattach to an already accepted remote turn without sending another Goose prompt. */
+  resumeAccepted?: {
+    canonicalConversationId: string;
+    acceptedUserTurnId: string;
+  };
   preSendAbortSignal: AbortSignal;
   gooseWork: {
+    /** Semantic progress guides observation cadence only; it never authorizes tool retirement. */
     snapshot(): ChatGptExternalTurnProgressSnapshot;
-    /** Quarantine only if the caller still observes this exact stale semantic-progress revision. */
-    quarantineStalledToolWork(expectedRevision: number): Promise<boolean>;
   };
   lifecycle: RebuildBrowserTurnLifecycle;
 }
@@ -91,8 +97,8 @@ export interface RebuildPersistentBrowserTurnExecution {
   confirmFinal(candidate: RebuildBrowserFinalEvidence): Promise<RebuildBrowserFinalEvidence>;
   /** Must freshly observe the exact persistent surface after qualified renderer catch-up/quiescence. */
   captureAnswerBoundary(opRef: string): Promise<string>;
-  /** Detach the disposable observer after an authenticated authoritative owner-terminal signal. */
-  terminateOwner?(reason: string): Promise<void>;
+  /** Detach only the process-local browser/execution attachment; both persistent chats remain durable. */
+  detachExecution?(reason: string): Promise<void>;
 }
 
 export interface RebuildPersistentBrowserDriver {
@@ -131,7 +137,7 @@ interface ActiveExecution {
   sendActivated: boolean;
   latestBoundaryOpRef: string | null;
   final: Promise<string>;
-  ownerTermination: Promise<void> | null;
+  executionDetach: Promise<void> | null;
 }
 
 interface CompletedResponse {
@@ -220,7 +226,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     activity.activeOpRef = null;
     if (activity.progress.snapshot().activeToolCalls > 0) activity.progress.recordToolResult();
   };
-  const quarantineToolActivity = (
+  const quarantineDetachedToolActivity = (
     turnRef: string,
     reason: string,
     expectedRevision?: number,
@@ -321,10 +327,10 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
   const ensureEpoch = (sessionId: string): RemoteEpoch =>
     broker.getCurrentEpoch(sessionId) ?? broker.createEpoch({ gooseSessionId: sessionId });
 
-  const terminateBrowserOwner = (active: ActiveExecution, reason: string): Promise<void> => {
-    if (active.ownerTermination) return active.ownerTermination;
-    active.ownerTermination = active.browser.terminateOwner?.(reason) ?? Promise.resolve();
-    return active.ownerTermination;
+  const detachBrowserExecution = (active: ActiveExecution, reason: string): Promise<void> => {
+    if (active.executionDetach) return active.executionDetach;
+    active.executionDetach = active.browser.detachExecution?.(reason) ?? Promise.resolve();
+    return active.executionDetach;
   };
 
   const durableToolResult = (opRef: string): string => {
@@ -333,6 +339,90 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       throw new Error(`Canonical epoch seed cannot resolve durable connector result for ${opRef}`);
     }
     return connectorStoredResultOutput(operation.resultJson);
+  };
+
+  const toolProgressSnapshot = (turnRef: string): ChatGptExternalTurnProgressSnapshot => {
+    const local = toolActivityByTurn.get(turnRef);
+    if (local) return local.progress.snapshot();
+    // After process/runtime attachment loss, unresolved durable Goose work must continue to block
+    // provider-internal continuation even though the process-local activity broadcaster is gone.
+    if (broker.hasBlockingOperation(turnRef)) {
+      return { revision: 0, lastToolBatchRevision: 0, activeToolCalls: 1 };
+    }
+    return { revision: 0, lastToolBatchRevision: 0, activeToolCalls: 0 };
+  };
+
+  const cacheCompletedResponse = (turn: BrokerTurn, sse: string) => {
+    completedResponses.delete(turn.gooseSessionId);
+    completedResponses.set(turn.gooseSessionId, {
+      turnRef: turn.turnRef,
+      requestHash: turn.requestHash,
+      sse,
+    });
+    while (completedResponses.size > COMPLETED_RESPONSE_CACHE_LIMIT) {
+      const oldestSession = completedResponses.keys().next().value as string | undefined;
+      if (oldestSession === undefined) break;
+      completedResponses.delete(oldestSession);
+    }
+  };
+
+  const finalizeExecutionEvidence = async (
+    turn: BrokerTurn,
+    active: ActiveExecution,
+    evidence: RebuildBrowserFinalEvidence,
+  ): Promise<string> => {
+    const conversationId = normalizeCanonicalChatGptConversationId(evidence.canonicalConversationId);
+    const acceptedUserTurnId = validatePersistentChatTurnIdentity(evidence.acceptedUserTurnId, "accepted user turn");
+    const current = broker.getTurn(turn.turnRef);
+    if (!current) throw new Error("Broker turn disappeared before browser completion");
+    const currentEpoch = broker.getCurrentEpoch(turn.gooseSessionId);
+    if (!currentEpoch
+      || currentEpoch.epoch !== turn.epoch
+      || currentEpoch.conversationId !== conversationId
+      || current.acceptedUserTurnId !== acceptedUserTurnId) {
+      throw new Error("Browser final identity does not match durable broker identity");
+    }
+    if (evidence.remoteNonRunning !== true) throw new Error("Browser final evidence is incomplete");
+    const digest = finalDigest(evidence.text);
+    broker.recordFinalDigest(turn.turnRef, digest);
+    const claim = broker.beginCompletion(turn.turnRef);
+    const confirmed = await active.browser.confirmFinal(evidence);
+    const confirmedConversationId = normalizeCanonicalChatGptConversationId(confirmed.canonicalConversationId);
+    const confirmedUserTurnId = validatePersistentChatTurnIdentity(confirmed.acceptedUserTurnId, "accepted user turn");
+    if (confirmedConversationId !== conversationId
+      || confirmedUserTurnId !== acceptedUserTurnId
+      || confirmed.remoteNonRunning !== true
+      || finalDigest(confirmed.text) !== digest) {
+      throw new Error("Fresh browser final confirmation does not match the completion candidate");
+    }
+    const confirmedTurn = broker.getTurn(turn.turnRef);
+    if (!confirmedTurn?.checkpointJson) throw new Error("Broker projection checkpoint disappeared before completion");
+    broker.commitCompletion(claim, {
+      connectorFinal: "UNAVAILABLE",
+      canonicalConversationId: confirmedConversationId,
+      acceptedUserTurnId: confirmedUserTurnId,
+      noUnresolvedGooseWork: true,
+      remoteNonRunning: true,
+      observedFinalDigest: digest,
+      canonicalHistoryWatermark: encodeGooseCanonicalHistoryWatermark({
+        checkpoint: decodeGooseResponsesProjectionCheckpoint(confirmedTurn.checkpointJson),
+        finalAssistantText: confirmed.text,
+      }),
+      answerBoundary: active.latestBoundaryOpRef
+        ? {
+            opRef: active.latestBoundaryOpRef,
+            contentAdvanced: confirmed.contentAdvancedAfterLastTool === true,
+            ...(confirmed.qualifiedTerminalAfterLastTool === true ? { qualifiedTerminal: true } : {}),
+          }
+        : null,
+    });
+    const finalSse = buildRebuildResponsesSse({
+      model: options.model,
+      text: confirmed.text,
+      id: deterministicResponseId(turn.turnRef, "final"),
+    });
+    cacheCompletedResponse(turn, finalSse);
+    return finalSse;
   };
 
   const startExecution = (
@@ -376,12 +466,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       existingConversationId: epoch.conversationId,
       preSendAbortSignal: preSendAbort.signal,
       gooseWork: {
-        snapshot: () => toolActivity(turn.turnRef).progress.snapshot(),
-        quarantineStalledToolWork: async expectedRevision => quarantineToolActivity(
-          turn.turnRef,
-          "goose_tool_semantic_progress_stalled",
-          expectedRevision,
-        ),
+        snapshot: () => toolProgressSnapshot(turn.turnRef),
       },
       lifecycle: {
         onSendActivated: () => {
@@ -410,7 +495,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       sendActivated,
       latestBoundaryOpRef: null,
       final: Promise.resolve("") as Promise<string>,
-      ownerTermination: null,
+      executionDetach: null,
     };
     executions.set(turn.turnRef, active);
 
@@ -421,74 +506,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     if (requestSignal.aborted) onInitialDisconnect();
     active.final = Promise.resolve()
       .then(() => browser.run())
-      .then(async evidence => {
-        const conversationId = normalizeCanonicalChatGptConversationId(evidence.canonicalConversationId);
-        const acceptedUserTurnId = validatePersistentChatTurnIdentity(evidence.acceptedUserTurnId, "accepted user turn");
-        const current = broker.getTurn(turn.turnRef);
-        if (!current) throw new Error("Broker turn disappeared before browser completion");
-        const currentEpoch = broker.getCurrentEpoch(turn.gooseSessionId);
-        if (!currentEpoch
-          || currentEpoch.epoch !== turn.epoch
-          || currentEpoch.conversationId !== conversationId
-          || current.acceptedUserTurnId !== acceptedUserTurnId) {
-          throw new Error("Browser final identity does not match durable broker identity");
-        }
-        if (evidence.remoteNonRunning !== true) {
-          throw new Error("Browser final evidence is incomplete");
-        }
-        const digest = finalDigest(evidence.text);
-        broker.recordFinalDigest(turn.turnRef, digest);
-        const claim = broker.beginCompletion(turn.turnRef);
-        const confirmed = await browser.confirmFinal(evidence);
-        const confirmedConversationId = normalizeCanonicalChatGptConversationId(confirmed.canonicalConversationId);
-        const confirmedUserTurnId = validatePersistentChatTurnIdentity(confirmed.acceptedUserTurnId, "accepted user turn");
-        if (confirmedConversationId !== conversationId
-          || confirmedUserTurnId !== acceptedUserTurnId
-          || confirmed.remoteNonRunning !== true
-          || finalDigest(confirmed.text) !== digest) {
-          throw new Error("Fresh browser final confirmation does not match the completion candidate");
-        }
-        const confirmedTurn = broker.getTurn(turn.turnRef);
-        if (!confirmedTurn?.checkpointJson) throw new Error("Broker projection checkpoint disappeared before completion");
-        broker.commitCompletion(claim, {
-          // Gate E has not yet qualified a connector-final digest/summary acknowledgement.
-          // The local browser-final digest is durable, but it must not borrow that separate authority.
-          connectorFinal: "UNAVAILABLE",
-          canonicalConversationId: confirmedConversationId,
-          acceptedUserTurnId: confirmedUserTurnId,
-          noUnresolvedGooseWork: true,
-          remoteNonRunning: true,
-          observedFinalDigest: digest,
-          canonicalHistoryWatermark: encodeGooseCanonicalHistoryWatermark({
-            checkpoint: decodeGooseResponsesProjectionCheckpoint(confirmedTurn.checkpointJson),
-            finalAssistantText: confirmed.text,
-          }),
-          answerBoundary: active.latestBoundaryOpRef
-            ? {
-                opRef: active.latestBoundaryOpRef,
-                contentAdvanced: confirmed.contentAdvancedAfterLastTool === true,
-                ...(confirmed.qualifiedTerminalAfterLastTool === true ? { qualifiedTerminal: true } : {}),
-              }
-            : null,
-        });
-        const finalSse = buildRebuildResponsesSse({
-          model: options.model,
-          text: confirmed.text,
-          id: deterministicResponseId(turn.turnRef, "final"),
-        });
-        completedResponses.delete(turn.gooseSessionId);
-        completedResponses.set(turn.gooseSessionId, {
-          turnRef: turn.turnRef,
-          requestHash: turn.requestHash,
-          sse: finalSse,
-        });
-        while (completedResponses.size > COMPLETED_RESPONSE_CACHE_LIMIT) {
-          const oldestSession = completedResponses.keys().next().value as string | undefined;
-          if (oldestSession === undefined) break;
-          completedResponses.delete(oldestSession);
-        }
-        return finalSse;
-      })
+      .then(evidence => finalizeExecutionEvidence(turn, active, evidence))
       .catch(async error => {
         const current = broker.getTurn(turn.turnRef);
         if (current?.state === "QUEUED") {
@@ -499,13 +517,95 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
           try { broker.markUnreconciled(turn.turnRef, "persistent_browser_turn_failed"); } catch {}
         }
         if (current?.state !== "QUEUED") {
-          try { await terminateBrowserOwner(active, "runtime_terminal_failure"); } catch {}
+          try { await detachBrowserExecution(active, "runtime_attachment_failed"); } catch {}
         }
         if (executions.get(turn.turnRef) === active) executions.delete(turn.turnRef);
         throw error;
       })
       .finally(() => {
         requestSignal.removeEventListener("abort", onInitialDisconnect);
+        if (executions.get(turn.turnRef) === active) executions.delete(turn.turnRef);
+        if (toolActivityByTurn.get(turn.turnRef)?.activeOpRef === null) toolActivityByTurn.delete(turn.turnRef);
+      });
+    void active.final.catch(() => {});
+    return active;
+  };
+
+  const startRebindExecution = (turn: BrokerTurn): ActiveExecution => {
+    const existing = executions.get(turn.turnRef);
+    if (existing) return existing;
+    if (turn.state !== "UNRECONCILED") {
+      throw new SessionBrokerError("TURN_STATE", "Persistent pair rebind requires an unreconciled turn");
+    }
+    if (broker.hasBlockingOperation(turn.turnRef)) {
+      throw new SessionBrokerError("UNRESOLVED_OPERATION", "Persistent pair rebind requires prior tool/result reconciliation");
+    }
+    const epoch = broker.getCurrentEpoch(turn.gooseSessionId);
+    if (!epoch || epoch.epoch !== turn.epoch || !epoch.conversationId || !turn.acceptedUserTurnId) {
+      throw new SessionBrokerError("RECOVERY_IDENTITY", "Persistent pair rebind requires durable Goose and ChatGPT identities");
+    }
+    const initialOperation = broker.getInitialOperationForTurn(turn.turnRef);
+    const latestTerminal = broker.getLatestTerminalOperationForTurn(turn.turnRef);
+    const preSendAbort = new AbortController();
+    let active!: ActiveExecution;
+    const browser = options.browserDriver.createTurn({
+      turnRef: turn.turnRef,
+      gooseSessionId: turn.gooseSessionId,
+      epoch: turn.epoch,
+      initialOpRef: initialOperation.opRef,
+      submitNonce: turn.submitNonce,
+      prompt: "",
+      existingConversationId: epoch.conversationId,
+      resumeAccepted: {
+        canonicalConversationId: epoch.conversationId,
+        acceptedUserTurnId: turn.acceptedUserTurnId,
+      },
+      preSendAbortSignal: preSendAbort.signal,
+      gooseWork: { snapshot: () => toolProgressSnapshot(turn.turnRef) },
+      lifecycle: {
+        onSendActivated: () => {
+          throw new Error("Persistent pair rebind must never resend the original Goose prompt");
+        },
+        onAccepted: () => {
+          throw new Error("Persistent pair rebind must never create a replacement ChatGPT user turn");
+        },
+        onRebound: evidence => {
+          const conversationId = normalizeCanonicalChatGptConversationId(evidence.canonicalConversationId);
+          const acceptedUserTurnId = validatePersistentChatTurnIdentity(
+            evidence.acceptedUserTurnId, "reattached accepted user turn",
+          );
+          broker.rebindVerifiedRemoteTurn({
+            turnRef: turn.turnRef,
+            canonicalConversationId: conversationId,
+            acceptedUserTurnId,
+            remoteIdentityVerified: true,
+          });
+        },
+      },
+    });
+    active = {
+      turnRef: turn.turnRef,
+      browser,
+      preSendAbort,
+      sendActivated: true,
+      latestBoundaryOpRef: latestTerminal?.answerBoundaryJson ? latestTerminal.opRef : null,
+      final: Promise.resolve("") as Promise<string>,
+      executionDetach: null,
+    };
+    executions.set(turn.turnRef, active);
+    active.final = Promise.resolve()
+      .then(() => browser.run())
+      .then(evidence => finalizeExecutionEvidence(turn, active, evidence))
+      .catch(async error => {
+        const current = broker.getTurn(turn.turnRef);
+        if (current?.state === "TURN_OUTSTANDING") {
+          try { broker.markUnreconciled(turn.turnRef, "persistent_pair_rebind_failed"); } catch {}
+        }
+        try { await detachBrowserExecution(active, "runtime_attachment_failed"); } catch {}
+        if (executions.get(turn.turnRef) === active) executions.delete(turn.turnRef);
+        throw error;
+      })
+      .finally(() => {
         if (executions.get(turn.turnRef) === active) executions.delete(turn.turnRef);
         if (toolActivityByTurn.get(turn.turnRef)?.activeOpRef === null) toolActivityByTurn.delete(turn.turnRef);
       });
@@ -590,7 +690,22 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     let turn = broker.getOpenTurnForSession(sessionId);
 
     if (turn?.state === "UNRECONCILED") {
-      return jsonError(409, "turn_unreconciled", "The persistent remote turn requires explicit recovery before more Goose work");
+      if (turn.requestHash !== checkpoint.requestHash) {
+        return jsonError(409, "rebind_request_conflict", "Persistent pair rebind requires the exact original Goose Responses request");
+      }
+      if (broker.hasBlockingOperation(turn.turnRef)) {
+        return jsonError(409, "rebind_blocked", "Persistent pair rebind requires unresolved Goose tool/result state to be reconciled first");
+      }
+      let active: ActiveExecution;
+      try { active = startRebindExecution(turn); }
+      catch (error) {
+        if (error instanceof SessionBrokerError) {
+          return Response.json({ error: { type: "invalid_request_error", code: error.code, message: error.message } }, { status: 409 });
+        }
+        throw error;
+      }
+      const stage = baton.openStage({ turnRef: turn.turnRef, body });
+      return await serveStage(stage, active, request.signal);
     }
     if (turn?.state === "TURN_OUTSTANDING") {
       const active = executions.get(turn.turnRef);
@@ -616,12 +731,19 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         }
       }
 
-      let epoch = ensureEpoch(sessionId);
+      const epoch = ensureEpoch(sessionId);
       if (epoch.conversationId) {
         const history = epoch.historyWatermark
           ? classifyGooseCanonicalHistory(body, epoch.historyWatermark)
           : { kind: "ROLLOVER" as const, reason: "bound_epoch_missing_history_watermark", items: [] };
-        if (history.kind !== "APPEND") epoch = broker.createEpoch({ gooseSessionId: sessionId });
+        if (history.kind !== "APPEND") {
+          const reason = history.kind === "ROLLOVER" ? history.reason : "bound_epoch_unexpected_seed";
+          return jsonError(
+            409,
+            "paired_handoff_required",
+            `Canonical Goose history is no longer append-compatible (${reason}); start a fresh Goose session and ChatGPT conversation together from a deliberate handoff`,
+          );
+        }
       }
       turn = broker.enqueueTurn({
         gooseSessionId: sessionId,
@@ -663,31 +785,31 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     return await serveStage(stage, active, request.signal);
   };
 
-  const terminateAuthoritativeOwner = async (input: {
+  const detachAuthoritativeExecution = async (input: {
     turnRef: string;
     gooseSessionId: string;
-    reason: "terminal_response" | "cancelled";
+    reason: "controller_detached" | "transport_lost";
   }): Promise<BrokerTurn> => {
     const turn = broker.getTurn(input.turnRef);
     if (!turn || turn.gooseSessionId !== input.gooseSessionId) {
-      throw new SessionBrokerError("TURN_IDENTITY", "Owner termination identity does not match the broker turn");
+      throw new SessionBrokerError("TURN_IDENTITY", "Execution detach identity does not match the broker turn");
     }
     if (turn.state !== "TURN_OUTSTANDING" && turn.state !== "UNRECONCILED") {
-      throw new SessionBrokerError("TURN_STATE", "Owner termination requires a remotely outstanding turn");
+      throw new SessionBrokerError("TURN_STATE", "Execution detach requires a remotely outstanding turn");
     }
     const active = executions.get(input.turnRef);
     if (!active) {
       if (turn.state === "UNRECONCILED") return turn;
-      throw new SessionBrokerError("TURN_EXECUTION", "Outstanding browser execution is unavailable");
+      throw new SessionBrokerError("TURN_EXECUTION", "Outstanding process-local execution attachment is unavailable");
     }
-    if (!active.browser.terminateOwner) {
-      throw new SessionBrokerError("TURN_EXECUTION", "Browser driver cannot detach authoritative terminal owners");
+    if (!active.browser.detachExecution) {
+      throw new SessionBrokerError("TURN_EXECUTION", "Browser driver cannot detach the process-local execution attachment");
     }
-    const durableReason = `goose_owner_${input.reason}`;
-    quarantineToolActivity(input.turnRef, durableReason);
+    const durableReason = `goose_execution_${input.reason}`;
+    quarantineDetachedToolActivity(input.turnRef, durableReason);
     const current = broker.getTurn(input.turnRef);
     if (current?.state === "TURN_OUTSTANDING") broker.markUnreconciled(input.turnRef, durableReason);
-    await terminateBrowserOwner(active, input.reason);
+    await detachBrowserExecution(active, input.reason);
     await active.final.catch(() => {});
     return broker.getTurn(input.turnRef)!;
   };
@@ -722,16 +844,16 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
           active_browser_turns: broker.getActiveAccountSlotCount(),
         });
       }
-      if (request.method === "POST" && url.pathname === "/admin/terminate-turn-owner") {
+      if (request.method === "POST" && url.pathname === "/admin/detach-turn-execution") {
         if (!safeEqualBearer(request.headers.get("authorization") ?? "", options.controlToken)) {
           return new Response("Unauthorized", { status: 401 });
         }
         let body: unknown;
         try { body = await readJsonRequestBody(request); } catch {
-          return jsonError(400, "invalid_owner_termination", "Owner termination body must be valid JSON");
+          return jsonError(400, "invalid_execution_detach", "Execution detach body must be valid JSON");
         }
         if (!body || typeof body !== "object" || Array.isArray(body)) {
-          return jsonError(400, "invalid_owner_termination", "Owner termination must be an object");
+          return jsonError(400, "invalid_execution_detach", "Execution detach must be an object");
         }
         const terminal = body as Record<string, unknown>;
         const turnRef = terminal.turn_ref;
@@ -739,15 +861,15 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         const reason = terminal.reason;
         if (typeof turnRef !== "string" || !turnRef
           || typeof gooseSessionId !== "string" || !validSessionId(gooseSessionId)
-          || (reason !== "terminal_response" && reason !== "cancelled")) {
+          || (reason !== "controller_detached" && reason !== "transport_lost")) {
           return jsonError(
             400,
-            "invalid_owner_termination",
-            "Owner termination requires turn_ref, goose_session_id, and a supported reason",
+            "invalid_execution_detach",
+            "Execution detach requires turn_ref, goose_session_id, and a supported reason",
           );
         }
         try {
-          const turn = await terminateAuthoritativeOwner({ turnRef, gooseSessionId, reason });
+          const turn = await detachAuthoritativeExecution({ turnRef, gooseSessionId, reason });
           return Response.json({
             status: "ok",
             turn_ref: turn.turnRef,
@@ -805,62 +927,6 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
             op_ref: opRef,
             operation_state: terminal.operation.state,
             next_op_ref: terminal.nextOpRef,
-          });
-        } catch (error) {
-          if (error instanceof SessionBrokerError) {
-            return Response.json({ status: "rejected", code: error.code }, { status: 409 });
-          }
-          throw error;
-        }
-      }
-      if (request.method === "POST" && url.pathname === "/admin/abandon-unreconciled") {
-        if (!safeEqualBearer(request.headers.get("authorization") ?? "", options.controlToken)) {
-          return new Response("Unauthorized", { status: 401 });
-        }
-        let body: unknown;
-        try { body = await readJsonRequestBody(request); } catch {
-          return jsonError(400, "invalid_recovery_request", "Recovery request body must be valid JSON");
-        }
-        if (!body || typeof body !== "object" || Array.isArray(body)) {
-          return jsonError(400, "invalid_recovery_request", "Recovery request must be an object");
-        }
-        const recovery = body as Record<string, unknown>;
-        const turnRef = recovery.turn_ref;
-        const evidenceValue = recovery.positive_terminal_evidence;
-        if (typeof turnRef !== "string" || !turnRef || !evidenceValue || typeof evidenceValue !== "object" || Array.isArray(evidenceValue)) {
-          return jsonError(400, "invalid_recovery_request", "Abandon request requires turn_ref and positive_terminal_evidence");
-        }
-        const rawEvidence = evidenceValue as Record<string, unknown>;
-        let evidence: PositiveTerminalEvidence;
-        try {
-          evidence = {
-            canonicalConversationId: normalizeCanonicalChatGptConversationId(
-              typeof rawEvidence.canonical_conversation_id === "string" ? rawEvidence.canonical_conversation_id : "",
-            ),
-            acceptedUserTurnId: validatePersistentChatTurnIdentity(
-              typeof rawEvidence.accepted_user_turn_id === "string" ? rawEvidence.accepted_user_turn_id : "",
-              "accepted user turn",
-            ),
-            remoteUiNonRunningAcrossQualifiedSettle: rawEvidence.remote_ui_non_running_across_qualified_settle === true,
-            noUnresolvedGooseWork: rawEvidence.no_unresolved_goose_work === true,
-            noContradictoryActivity: rawEvidence.no_contradictory_activity === true,
-          };
-        } catch {
-          return jsonError(400, "invalid_recovery_request", "Positive-terminal recovery identity is invalid");
-        }
-        if (executions.has(turnRef) || toolActivityByTurn.has(turnRef)) {
-          return jsonError(409, "recovery_owner_active", "Process-local turn/tool ownership must be gone before abandonment");
-        }
-        try {
-          broker.releaseSlotAfterPositiveTerminal(turnRef, evidence);
-          const abandoned = broker.abandonUnreconciled(turnRef);
-          const accountSlotHolders = broker.getAccountSlotHolders();
-          return Response.json({
-            status: "ok",
-            turn_ref: turnRef,
-            turn_state: abandoned.state,
-            account_slot_holder: accountSlotHolders[0]?.turnRef ?? null,
-            account_slot_holders: accountSlotHolders,
           });
         } catch (error) {
           if (error instanceof SessionBrokerError) {

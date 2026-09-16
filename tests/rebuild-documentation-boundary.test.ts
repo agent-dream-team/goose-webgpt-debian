@@ -22,16 +22,18 @@ test("persistent-chat lifecycle authority preserves recovery and paired-handoff 
 
   expect(agents).toContain("Read `docs/persistent-chat-lifecycle.md`");
   for (const invariant of [
-    "Persistent provider chats are recovered, not abandoned.",
-    "Refresh is an observation/recovery tool, not a retry loop.",
+    "The server-side ChatGPT conversation is durable.",
+    "The local Goose session is durable too.",
+    "One Goose session and one ChatGPT conversation form a persistent context pair.",
     "GCW continuation prompts are provider-internal recovery artifacts.",
-    "One Goose chat and one ChatGPT provider chat remain context partners until handoff.",
+    "Timers, heartbeats, and semantic-silence watchers may escalate observation only.",
+    "Deliberate handoff is the only normal way to replace the pair.",
     "Provider-chat instructions must promote graceful context rollover.",
-    "Timers, heartbeats, and watchers may trigger observation or escalation only.",
   ]) expect(lifecycle).toContain(invariant);
   expect(lifecycle).toContain("do not click ChatGPT Retry");
-  expect(lifecycle).toContain("fresh ChatGPT conversation and a fresh Goose session");
+  expect(lifecycle).toContain("fresh Goose session and a fresh ChatGPT conversation");
   expect(followUp).toContain("### 1. Paired context handoff");
+  expect(followUp).toContain("`paired_handoff_required`");
   expect(followUp).toContain("### 2. Persistent-chat recovery fault matrix");
   expect(followUp).toContain("### 6. Reboot reconstruction");
   expect(followUp).toContain("Do not reboot DreamBook for GCW qualification without explicit operator approval.");

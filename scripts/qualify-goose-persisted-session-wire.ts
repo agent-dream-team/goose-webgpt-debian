@@ -10,6 +10,7 @@ const MODEL = "gpt-4.1";
 
 type ObservedRequest = {
   sessionId: string;
+  body: Record<string, unknown>;
   input: Array<Record<string, unknown>>;
 };
 
@@ -34,6 +35,8 @@ export async function runGoosePersistedSessionWireQualification(gooseBin = proce
 
   const root = mkdtempSync(join(tmpdir(), "cgw-goose-persisted-wire-"));
   const observed: ObservedRequest[] = [];
+  let listeningPort = 0;
+  let providerRestarts = 0;
   const server = createServer(async (request, response) => {
     if (request.method === "GET" && request.url === "/v1/models") {
       response.setHeader("content-type", "application/json");
@@ -47,12 +50,21 @@ export async function runGoosePersistedSessionWireQualification(gooseBin = proce
     }
     let raw = "";
     for await (const chunk of request) raw += chunk.toString();
-    const body = JSON.parse(raw) as { input?: Array<Record<string, unknown>> };
+    const body = JSON.parse(raw) as Record<string, unknown> & { input?: Array<Record<string, unknown>> };
     const sessionId = request.headers["agent-session-id"];
     if (typeof sessionId !== "string") throw new Error("Goose did not send one scalar agent-session-id");
     assert(Array.isArray(body.input), "Goose Responses request did not include array input");
-    observed.push({ sessionId, input: body.input });
-    const text = observed.length === 1 ? "PERSISTED_FIRST_OK" : "PERSISTED_SECOND_OK";
+    observed.push({ sessionId, body, input: body.input });
+    if (observed.length === 1) {
+      request.socket.destroy();
+      server.close(() => {
+        setTimeout(() => {
+          server.listen(listeningPort, "127.0.0.1", () => { providerRestarts += 1; });
+        }, 350);
+      });
+      return;
+    }
+    const text = observed.length === 2 ? "PERSISTED_FIRST_OK" : "PERSISTED_SECOND_OK";
     response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
     response.end(buildResponsesSse({ text, responseId: `resp_persisted_${observed.length}` }));
   });
@@ -63,7 +75,8 @@ export async function runGoosePersistedSessionWireQualification(gooseBin = proce
   });
   const address = server.address();
   assert(address && typeof address === "object");
-  const origin = `http://127.0.0.1:${address.port}`;
+  listeningPort = address.port;
+  const origin = `http://127.0.0.1:${listeningPort}`;
   const sessionName = `cgw-persisted-wire-${Date.now()}`;
   const env = {
     ...process.env,
@@ -87,10 +100,13 @@ export async function runGoosePersistedSessionWireQualification(gooseBin = proce
     assert.equal(second.code, 0, second.stderr);
     assert(second.stdout.includes("PERSISTED_SECOND_OK"));
 
-    assert.equal(observed.length, 2, `Expected two Responses requests, got ${observed.length}`);
-    assert.equal(observed[1]!.sessionId, observed[0]!.sessionId, "Goose changed agent-session-id across persisted resume");
-    const firstInput = observed[0]!.input;
-    const secondInput = observed[1]!.input;
+    assert.equal(providerRestarts, 1, "Qualification provider did not complete the forced stop/restart cycle");
+    assert.equal(observed.length, 3, `Expected dropped request, exact retry, and persisted resume; got ${observed.length}`);
+    assert.equal(observed[1]!.sessionId, observed[0]!.sessionId, "Goose changed agent-session-id while retrying the dropped request");
+    assert.deepEqual(observed[1]!.body, observed[0]!.body, "Goose changed the logical Responses request while reconnecting");
+    assert.equal(observed[2]!.sessionId, observed[0]!.sessionId, "Goose changed agent-session-id across persisted resume");
+    const firstInput = observed[1]!.input;
+    const secondInput = observed[2]!.input;
     assert.equal(firstInput.length, 2, "Fresh persisted session did not begin with exactly system,user input");
     assert(secondInput.length > firstInput.length, "Persisted resume did not extend canonical input");
     assert.deepEqual(secondInput.slice(0, firstInput.length), firstInput, "Persisted resume rewrote the represented input prefix");
@@ -101,6 +117,8 @@ export async function runGoosePersistedSessionWireQualification(gooseBin = proce
     return {
       gooseVersion,
       sessionIdStable: true,
+      droppedRequestRetriedExactly: true,
+      providerRestartRecovered: true,
       firstInputCount: firstInput.length,
       secondInputCount: secondInput.length,
       secondInputTypes: secondInput.map(item => item.type),

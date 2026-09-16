@@ -743,86 +743,26 @@ test("positive-terminal slot demotion alone preserves the quarantined lease and 
   }
 });
 
-test("explicit abandonment requires prior positive-terminal slot demotion evidence", () => {
-  const { broker, path } = fixture();
-  try {
-    createSession(broker);
-    enqueue(broker);
-    broker.admitNext();
-    accept(broker);
-    bindConversation(broker);
-    broker.markUnreconciled("turn-a", "stopped_incomplete");
-
-    expect(() => broker.abandonUnreconciled("turn-a")).toThrow(SessionBrokerError);
-
-    const inspect = new Database(path, { strict: true });
-    try {
-      inspect.query("UPDATE turns SET slot_held = 0 WHERE turn_ref = 'turn-a'").run();
-      expect(() => inspect.query("UPDATE turns SET abandoned_at = 1 WHERE turn_ref = 'turn-a'").run()).toThrow();
-    } finally {
-      inspect.close();
-    }
-    let failure: unknown;
-    try {
-      broker.abandonUnreconciled("turn-a");
-    } catch (error) {
-      failure = error;
-    }
-    expect(failure).toBeInstanceOf(SessionBrokerError);
-    expect((failure as SessionBrokerError).code).toBe("POSITIVE_TERMINAL_REQUIRED");
-    expect(broker.getTurn("turn-a")?.state).toBe("UNRECONCILED");
-  } finally {
-    broker.close();
-  }
-});
-
-test("explicit abandonment ends only the quarantined conversation lease and permits epoch rollover", () => {
-  const { broker, path } = fixture();
-  try {
-    createSession(broker);
-    enqueue(broker);
-    broker.admitNext();
-    accept(broker);
-    bindConversation(broker);
-    broker.markUnreconciled("turn-a", "irrecoverable_remote_identity");
-    broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
-
-    expect(broker.abandonUnreconciled("turn-a").state).toBe("ABANDONED");
-    expect(broker.abandonUnreconciled("turn-a").state).toBe("ABANDONED");
-    expect(broker.getCurrentEpoch("goose-a")).toBeNull();
-    expect(broker.createEpoch({ gooseSessionId: "goose-a", historyWatermark: "wm-new" }).epoch).toBe(2);
-
-    const inspect = new Database(path, { strict: true });
-    try {
-      const retained = inspect.query(`SELECT state, abandoned_at, unreconciled_reason, positive_terminal_evidence_json
-        FROM turns WHERE turn_ref = 'turn-a'`).get() as {
-          state: string; abandoned_at: number | null; unreconciled_reason: string | null; positive_terminal_evidence_json: string | null;
-        };
-      expect(retained.state).toBe("UNRECONCILED");
-      expect(retained.abandoned_at).not.toBeNull();
-      expect(retained.unreconciled_reason).toBe("irrecoverable_remote_identity");
-      expect(retained.positive_terminal_evidence_json).toBe(JSON.stringify(positiveTerminal));
-    } finally {
-      inspect.close();
-    }
-  } finally {
-    broker.close();
-  }
-});
-
-test("abandoned quarantine remains terminal across broker restart", () => {
+test("legacy abandoned rows remain readable and terminal across broker restart", () => {
   const { broker, path } = fixture();
   createSession(broker);
   enqueue(broker);
   broker.admitNext();
   accept(broker);
   bindConversation(broker);
-  broker.markUnreconciled("turn-a", "irrecoverable_remote_identity");
+  broker.markUnreconciled("turn-a", "legacy_abandoned_pair");
   broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
-  broker.abandonUnreconciled("turn-a");
   broker.close();
 
-  const restarted = open(path, "broker-b");
+  const legacy = new Database(path, { strict: true });
+  try {
+    legacy.query("UPDATE turns SET abandoned_at = 1 WHERE turn_ref = 'turn-a'").run();
+    legacy.query("UPDATE remote_epochs SET is_current = 0 WHERE goose_session_id = 'goose-a' AND epoch = 1").run();
+  } finally {
+    legacy.close();
+  }
+
+  const restarted = open(path, "broker-legacy-abandoned");
   try {
     expect(restarted.getTurn("turn-a")?.state).toBe("ABANDONED");
     expect(restarted.getAccountSlotHolder()).toBeNull();
@@ -833,15 +773,9 @@ test("abandoned quarantine remains terminal across broker restart", () => {
   }
 });
 
-test("legacy pre-abandonment broker schema migrates additively and can abandon without table rebuild", () => {
+test("legacy pre-abandonment schema migrates abandoned_at compatibility without a current abandonment API", () => {
   const { broker, path } = fixture();
   createSession(broker);
-  enqueue(broker);
-  broker.admitNext();
-  accept(broker);
-  bindConversation(broker);
-  broker.markUnreconciled("turn-a", "irrecoverable_remote_identity");
-  broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
   broker.close();
 
   const legacy = new Database(path, { strict: true });
@@ -868,9 +802,6 @@ test("legacy pre-abandonment broker schema migrates additively and can abandon w
     } finally {
       inspect.close();
     }
-    expect(restarted.abandonUnreconciled("turn-a").state).toBe("ABANDONED");
-    expect(restarted.getCurrentEpoch("goose-a")).toBeNull();
-    expect(restarted.createEpoch({ gooseSessionId: "goose-a" }).epoch).toBe(2);
   } finally {
     restarted.close();
   }
@@ -923,13 +854,11 @@ test("restart retires a legacy abandoned epoch that was still marked current", (
   bindConversation(broker);
   broker.markUnreconciled("turn-a", "legacy_abandoned_current_epoch");
   broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
-  broker.abandonUnreconciled("turn-a");
   broker.close();
 
-  // Recreate the exact durable shape written by the pre-fix checkpoint: the turn is already
-  // abandoned, but its remote epoch was accidentally left current. Broker open must repair it.
   const legacy = new Database(path, { strict: true });
   try {
+    legacy.query("UPDATE turns SET abandoned_at = 1 WHERE turn_ref = 'turn-a'").run();
     legacy.query("UPDATE remote_epochs SET is_current = 1 WHERE goose_session_id = 'goose-a' AND epoch = 1").run();
   } finally {
     legacy.close();
@@ -1644,17 +1573,17 @@ test("boundary-bearing MINTED op stays non-executed until exact running-turn rec
     })).toEqual({ kind: "UNCERTAIN", opRef: initialOpRef, seq: 1 });
     expect(restarted.getOperation(initialOpRef)?.state).toBe("MINTED");
 
-    expect(() => restarted.resumeVerifiedRemoteTurn({
+    expect(() => restarted.rebindVerifiedRemoteTurn({
       turnRef: "turn-a",
       canonicalConversationId: "wrong-conversation",
       acceptedUserTurnId: "user-turn-a",
-      remoteRunning: true,
+      remoteIdentityVerified: true,
     })).toThrow(SessionBrokerError);
-    expect(restarted.resumeVerifiedRemoteTurn({
+    expect(restarted.rebindVerifiedRemoteTurn({
       turnRef: "turn-a",
       canonicalConversationId: "conversation-a",
       acceptedUserTurnId: "user-turn-a",
-      remoteRunning: true,
+      remoteIdentityVerified: true,
     }).state).toBe("TURN_OUTSTANDING");
     expect(restarted.claimOperation({
       turnRef: "turn-a",
@@ -1696,7 +1625,7 @@ test("an older request fingerprint may become a new logical turn after interveni
   }
 });
 
-test("verified running-turn recovery enforces runtime running evidence and identity on idempotent calls", () => {
+test("verified persistent-pair rebind enforces remote identity and remains idempotent", () => {
   const { broker } = fixture();
   try {
     createSession(broker);
@@ -1706,25 +1635,25 @@ test("verified running-turn recovery enforces runtime running evidence and ident
     bindConversation(broker);
     broker.markUnreconciled("turn-a", "transport_lost");
 
-    expect(() => broker.resumeVerifiedRemoteTurn({
+    expect(() => broker.rebindVerifiedRemoteTurn({
       turnRef: "turn-a",
       canonicalConversationId: "conversation-a",
       acceptedUserTurnId: "user-turn-a",
-      remoteRunning: false as true,
+      remoteIdentityVerified: false as true,
     })).toThrow(SessionBrokerError);
 
-    expect(broker.resumeVerifiedRemoteTurn({
+    expect(broker.rebindVerifiedRemoteTurn({
       turnRef: "turn-a",
       canonicalConversationId: "conversation-a",
       acceptedUserTurnId: "user-turn-a",
-      remoteRunning: true,
+      remoteIdentityVerified: true,
     }).state).toBe("TURN_OUTSTANDING");
 
-    expect(() => broker.resumeVerifiedRemoteTurn({
+    expect(() => broker.rebindVerifiedRemoteTurn({
       turnRef: "turn-a",
       canonicalConversationId: "wrong-conversation",
       acceptedUserTurnId: "user-turn-a",
-      remoteRunning: true,
+      remoteIdentityVerified: true,
     })).toThrow(SessionBrokerError);
   } finally {
     broker.close();

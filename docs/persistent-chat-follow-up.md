@@ -1,7 +1,7 @@
 ---
 type: plan
 status: current
-as_of: 2026-09-15
+as_of: 2026-09-16
 ---
 
 # Goose ChatGPT Web current follow-up plan
@@ -31,9 +31,9 @@ The old DreamBook appliance and its mutable state are retired. The active reposi
 
 Goose owns the logical session/transcript, context lifecycle, tools, approvals, delegation, recipes, and project execution. GCW owns only the ChatGPT-Web provider surface and the provider-local state required to operate and recover it.
 
-The durable remote identity is the server-side ordinary ChatGPT conversation identified by its canonical `/c/<uuid>` id. Browser tabs, renderer processes, Playwright handles, and helper processes are disposable views.
+The durable identities are symmetric: the local persisted Goose session/transcript and the server-side ordinary ChatGPT conversation identified by its canonical `/c/<uuid>` id. Browser tabs, renderer processes, Playwright handles, helpers, HTTP requests, connector attachments, and other process-local owners are disposable attachments/views.
 
-One Goose session and one ChatGPT provider conversation remain a context pair until deliberate handoff. View failure, elapsed time, repeated recovery, or local estimates do not independently replace the provider conversation.
+One Goose session and one ChatGPT provider conversation remain a context pair until deliberate handoff. Attachment loss means reconnect/rebind the same pair. View failure, elapsed time, repeated recovery, local estimates, or process restart do not independently replace either chat. Time-based watchers may escalate observation but do not retire tool authority; `UNCERTAIN` is reserved for genuinely ambiguous correlated execution/result state and must be reconciled against durable broker evidence plus the persistent Goose session before the pair resumes.
 
 The dedicated `CGW Provider Sessions` Project with project-only memory is an accepted behavioral topology, not a hard security boundary. Cross-chat isolation must continue to be tested rather than assumed.
 
@@ -45,15 +45,15 @@ The current lifecycle decision supersedes older independent provider-epoch rollo
 
 Qualify this for ordinary context pressure and for non-append-compatible history such as compaction/truncation/fork-style divergence. Richer and multimodal history must not be silently repaired by rolling only the provider chat.
 
-Any remaining source path that automatically creates a replacement provider epoch under the same Goose session because of history rewrite or local context estimates is implementation debt until narrowed to initial pair creation or deliberate paired handoff.
+Current candidate source no longer creates a replacement provider epoch under an existing Goose session when canonical history diverges. It returns `paired_handoff_required` and leaves the existing pair intact. Remaining work is to qualify and automate the deliberate paired-handoff transaction itself; this source behavior is not installed authority until separately packaged and activated.
 
 ### 2. Persistent-chat recovery fault matrix
 
 Qualify the accepted recovery loop end to end:
 
-`observe -> hard refresh -> settle -> reassess -> continue same chat if stopped`
+`observe -> refresh/hard refresh view -> settle -> reassess -> continue same ChatGPT chat if stopped`
 
-Cover stale/lost browser views, connection/error UI, genuine mid-turn stops, Browser/Electron death, broker/connector restart, page loss during active tool work, exact-request replay, duplicate admission attempts, authentication/workspace mismatch, and repeated continuation recovery.
+The refresh loop exists only to reveal authoritative server-side state. It must preserve or reconstruct the attachment to the same local Goose session and the same canonical ChatGPT conversation. Cover stale/lost browser views, connection/error UI, genuine mid-turn stops, Browser/Electron death, broker/connector restart, page loss during active tool work, exact-request replay, duplicate admission attempts, authentication/workspace mismatch, attachment rebind, and repeated continuation recovery.
 
 A settled stopped/error view with no intended final should receive the standardized GCW-internal continuation in the same ChatGPT conversation. Do not click ChatGPT Retry, resend the original Goose prompt, or abandon the persistent conversation merely because observation failed.
 

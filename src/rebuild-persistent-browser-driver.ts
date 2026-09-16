@@ -99,7 +99,7 @@ export interface RebuildPersistentBrowserDriverOptions {
   postToolAnswerGraceMs?: number;
   staleObservationFirstRefreshMs?: number;
   staleObservationSubsequentRefreshMs?: number;
-  semanticProgressStallMs?: number;
+  semanticObservationRefreshMs?: number;
   dependencies?: {
     notifyTurn?: NotifyTurn;
     connectSurface?: ConnectSurface;
@@ -276,9 +276,9 @@ export function createRebuildPersistentBrowserDriver(
   const confirmationSettleMs = options.confirmationSettleMs ?? DEFAULT_CONFIRM_SETTLE_MS;
   const staleObservationFirstRefreshMs = options.staleObservationFirstRefreshMs ?? DEFAULT_STALE_OBSERVATION_FIRST_REFRESH_MS;
   const staleObservationSubsequentRefreshMs = options.staleObservationSubsequentRefreshMs ?? DEFAULT_STALE_OBSERVATION_SUBSEQUENT_REFRESH_MS;
-  const semanticProgressStallMs = options.semanticProgressStallMs ?? CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS;
-  if (!Number.isFinite(semanticProgressStallMs) || semanticProgressStallMs < 0) {
-    throw new Error("Persistent browser semantic-progress stall threshold is invalid");
+  const semanticObservationRefreshMs = options.semanticObservationRefreshMs ?? CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS;
+  if (!Number.isFinite(semanticObservationRefreshMs) || semanticObservationRefreshMs < 0) {
+    throw new Error("Persistent browser semantic-observation refresh threshold is invalid");
   }
   const notifyTurn = options.dependencies?.notifyTurn ?? notifyLauncherTurn;
   const connectSurface = options.dependencies?.connectSurface ?? connectLauncherBrowserHost;
@@ -321,7 +321,7 @@ export function createRebuildPersistentBrowserDriver(
       let launcherEnded = false;
       let connectorBound = false;
       let surfaceRecreated = false;
-      let ownerTermination: Error | undefined;
+      let executionDetached: Error | undefined;
 
       const closeConnection = async () => {
         if (!connection) return;
@@ -364,7 +364,7 @@ export function createRebuildPersistentBrowserDriver(
         heartbeat.unref?.();
       };
       const requireLiveSurface = (): Page => {
-        if (ownerTermination) throw ownerTermination;
+        if (executionDetached) throw executionDetached;
         if (!page || page.isClosed()) throw new Error("Persistent ChatGPT browser surface is unavailable");
         return page;
       };
@@ -403,14 +403,7 @@ export function createRebuildPersistentBrowserDriver(
           acceptedUserTurnId: observationUserTurnId,
         };
       };
-      const recoveryAllowed = async (expectedProgressRevision?: number): Promise<boolean> => {
-        const progress = input.gooseWork.snapshot();
-        if (progress.activeToolCalls > 0) {
-          if (chatGptExternalProgressIsRecent(progress, Date.now(), semanticProgressStallMs)) return false;
-          const expected = expectedProgressRevision ?? progress.revision;
-          if (!await input.gooseWork.quarantineStalledToolWork(expected)) return false;
-          if (input.gooseWork.snapshot().activeToolCalls > 0) return false;
-        }
+      const viewRecoveryAllowed = async (): Promise<boolean> => {
         if (await approvalFenceVisible(requireLiveSurface())) {
           throw new Error("HUMAN_REQUIRED: ChatGPT approval or permission UI blocks stale-observation recovery");
         }
@@ -433,9 +426,6 @@ export function createRebuildPersistentBrowserDriver(
       };
       const recoverLostAcceptedSurface = async (cause: unknown): Promise<boolean> => {
         if (!sendActivated || !acceptedConversationId || !observationUserTurnId) return false;
-        const progress = input.gooseWork.snapshot();
-        if (progress.activeToolCalls > 0
-          && chatGptExternalProgressIsRecent(progress, Date.now(), semanticProgressStallMs)) return false;
         const currentPage = page;
         if (!currentPage || (!currentPage.isClosed() && !isTargetClosedError(cause))) return false;
         stopHeartbeat();
@@ -501,8 +491,8 @@ export function createRebuildPersistentBrowserDriver(
         assistantTurnId = derivedAssistant;
         resetCompletionTracker();
       };
-      const reopenAcceptedSurface = async (expectedProgressRevision?: number): Promise<boolean> => {
-        if (!await recoveryAllowed(expectedProgressRevision)) return false;
+      const reopenAcceptedSurface = async (): Promise<boolean> => {
+        if (!await viewRecoveryAllowed()) return false;
         const binding = observationBinding();
         // Elapsed time only authorizes the next observation tier; it never proves completion or resend safety.
         await closeConnection();
@@ -528,8 +518,9 @@ export function createRebuildPersistentBrowserDriver(
         abortIfRequested(input.preSendAbortSignal);
         await sendButton.press("Enter", { noWaitAfter: true, timeout: 0 });
       };
-      const sendRecoveryContinuation = async (expectedProgressRevision?: number): Promise<boolean> => {
-        if (!await recoveryAllowed(expectedProgressRevision)) return false;
+      const sendRecoveryContinuation = async (): Promise<boolean> => {
+        if (input.gooseWork.snapshot().activeToolCalls > 0) return false;
+        if (!await viewRecoveryAllowed()) return false;
         if (!acceptedConversationId) throw new Error("Persistent ChatGPT recovery continuation has no durable conversation");
         const currentPage = requireLiveSurface();
         assertExactExistingConversation(currentPage, acceptedConversationId, "Recovery continuation surface");
@@ -675,7 +666,7 @@ export function createRebuildPersistentBrowserDriver(
           const semanticProgress = input.gooseWork.snapshot();
           const toolWorkInFlight = semanticProgress.activeToolCalls > 0;
           const toolProgressLive = toolWorkInFlight
-            && chatGptExternalProgressIsRecent(semanticProgress, Date.now(), semanticProgressStallMs);
+            && chatGptExternalProgressIsRecent(semanticProgress, Date.now(), semanticObservationRefreshMs);
           const stoppedWithoutIntendedFinal = !running && (
             projection.text.trim().length === 0
             || (boundaryRevision > 0 && projection.text === lastBoundaryText)
@@ -731,10 +722,9 @@ export function createRebuildPersistentBrowserDriver(
                   ? staleObservationFirstRefreshMs
                   : staleObservationSubsequentRefreshMs;
               if (now - staleObservation.since >= recoveryThresholdMs) {
-                const expectedProgressRevision = staleObservation.progressRevision;
                 if ((staleObservationKind === "missing-completion-action" || staleObservationKind === "stopped-no-final")
                   && staleObservationRecoveryStage === "refreshed") {
-                  if (!await sendRecoveryContinuation(expectedProgressRevision)) {
+                  if (!await sendRecoveryContinuation()) {
                     staleObservation = undefined;
                     continue;
                   }
@@ -742,7 +732,7 @@ export function createRebuildPersistentBrowserDriver(
                 } else {
                   // Browser state is only a view. Reconstruct that view in the same canonical
                   // conversation, settle it, then reassess instead of retiring the provider chat.
-                  if (!await reopenAcceptedSurface(expectedProgressRevision)) {
+                  if (!await reopenAcceptedSurface()) {
                     staleObservation = undefined;
                     continue;
                   }
@@ -798,9 +788,9 @@ export function createRebuildPersistentBrowserDriver(
 
       return {
         captureAnswerBoundary: observeStableBoundary,
-        terminateOwner: async reason => {
-          if (ownerTermination) return;
-          ownerTermination = new Error(`Persistent browser owner terminated: ${reason}`);
+        detachExecution: async reason => {
+          if (executionDetached) return;
+          executionDetached = new Error(`Persistent browser execution attachment detached: ${reason}`);
           stopHeartbeat();
           await closeConnection();
           await endLauncher("failed").catch(() => {});
@@ -877,6 +867,41 @@ export function createRebuildPersistentBrowserDriver(
                 currentPage, expectedExistingConversation,
                 surfaceRecreated ? "Recreated BrowserHost surface" : "Retained BrowserHost surface",
               );
+            }
+            if (input.resumeAccepted) {
+              if (!expectedExistingConversation) {
+                throw new Error("Persistent browser reattach requires an existing canonical conversation");
+              }
+              const resumeConversationId = normalizeCanonicalChatGptConversationId(input.resumeAccepted.canonicalConversationId);
+              const resumeUserTurnId = validatePersistentChatTurnIdentity(
+                input.resumeAccepted.acceptedUserTurnId,
+                "reattached accepted user turn",
+              );
+              if (resumeConversationId !== expectedExistingConversation) {
+                throw new Error("Persistent browser reattach conversation does not match the durable epoch");
+              }
+              acceptedConversationId = resumeConversationId;
+              acceptedUserTurnId = resumeUserTurnId;
+              observationUserTurnId = resumeUserTurnId;
+              sendActivated = true;
+              const rebindDeadline = Date.now() + timeoutMs;
+              let rebound = false;
+              while (Date.now() < rebindDeadline) {
+                const snapshot = await captureSnapshot(currentPage);
+                if (acceptedUserAnchorPresent(snapshot, resumeUserTurnId)) {
+                  rebound = true;
+                  break;
+                }
+                await sleep(pollMs);
+              }
+              if (!rebound) {
+                throw new Error("Persistent browser reattach could not prove the durable accepted user-turn anchor");
+              }
+              await input.lifecycle.onRebound?.({
+                canonicalConversationId: resumeConversationId,
+                acceptedUserTurnId: resumeUserTurnId,
+              });
+              return await waitForFinalCandidate();
             }
             let preparedComposer: Locator | undefined;
             if (!input.existingConversationId || surfaceRecreated) {

@@ -107,17 +107,14 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", line =
     return out({ type: "lifecycle", event: "accepted", evidence: accepted });
   }
   if (message.type === "lifecycle_ack" && message.event === "accepted") {
-    return out({ type: "quarantine_tool", requestId: 7, expectedRevision: latestProgress.revision });
-  }
-  if (message.type === "quarantine_tool_ack") {
-    if (!message.quarantined || message.snapshot.activeToolCalls !== 0) {
-      return out({ type: "error", message: "quarantine acknowledgement invalid" });
+    if (!latestProgress || latestProgress.activeToolCalls !== 1 || latestProgress.revision !== 1) {
+      return out({ type: "error", message: "semantic progress snapshot missing" });
     }
     return out({ type: "candidate", evidence: final });
   }
-  if (message.type === "terminate_owner") {
-    out({ type: "owner_terminated" });
-    return out({ type: "error", message: "authoritative owner terminated" });
+  if (message.type === "detach_execution") {
+    out({ type: "execution_detached" });
+    return out({ type: "error", message: "process-local execution detached" });
   }
   if (message.type === "confirm") {
     out({ type: "confirmed", evidence: final });
@@ -129,8 +126,41 @@ out({ type: "ready", version: 1 });
   return path;
 }
 
-function ownerTerminationWorkerFixture(): string {
-  const root = mkdtempSync(join(tmpdir(), "cgw-node-browser-driver-owner-test-"));
+function rebindWorkerFixture(): string {
+  const root = mkdtempSync(join(tmpdir(), "cgw-node-browser-driver-rebind-test-"));
+  ROOTS.push(root);
+  const path = join(root, "worker.mjs");
+  writeFileSync(path, `
+import { createInterface } from "node:readline";
+const out = value => process.stdout.write(JSON.stringify(value) + "\\n");
+const accepted = { canonicalConversationId: ${JSON.stringify(CONVERSATION)}, acceptedUserTurnId: "user-fixture" };
+const final = { ...accepted, text: "rebound fixture final", remoteNonRunning: true };
+createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", line => {
+  const message = JSON.parse(line);
+  if (message.type === "start") {
+    if (message.input.prompt !== "" || message.input.existingConversationId !== accepted.canonicalConversationId
+      || message.input.resumeAccepted?.canonicalConversationId !== accepted.canonicalConversationId
+      || message.input.resumeAccepted?.acceptedUserTurnId !== accepted.acceptedUserTurnId) {
+      return out({ type: "error", message: "rebind start contract missing" });
+    }
+    return out({ type: "lifecycle", event: "rebound", evidence: accepted });
+  }
+  if (message.type === "lifecycle_ack" && message.event === "rebound") {
+    if (!message.ok) return out({ type: "error", message: message.message || "rebind rejected" });
+    return out({ type: "candidate", evidence: final });
+  }
+  if (message.type === "confirm") {
+    out({ type: "confirmed", evidence: final });
+    return setImmediate(() => process.exit(0));
+  }
+});
+out({ type: "ready", version: 1 });
+`, { mode: 0o600 });
+  return path;
+}
+
+function executionDetachWorkerFixture(): string {
+  const root = mkdtempSync(join(tmpdir(), "cgw-node-browser-driver-detach-test-"));
   ROOTS.push(root);
   const path = join(root, "worker.mjs");
   writeFileSync(path, `
@@ -143,9 +173,9 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", line =
   if (message.type === "lifecycle_ack" && message.event === "send_activated") {
     return out({ type: "lifecycle", event: "accepted", evidence: accepted });
   }
-  if (message.type === "terminate_owner") {
-    out({ type: "owner_terminated" });
-    return out({ type: "error", message: "authoritative owner terminated" });
+  if (message.type === "detach_execution") {
+    out({ type: "execution_detached" });
+    return out({ type: "error", message: "process-local execution detached" });
   }
 });
 out({ type: "ready", version: 1 });
@@ -165,7 +195,6 @@ function turnInput(overrides: Partial<RebuildPersistentBrowserTurnInput> = {}): 
     preSendAbortSignal: new AbortController().signal,
     gooseWork: {
       snapshot: () => ({ revision: 0, lastToolBatchRevision: 0, activeToolCalls: 0 }),
-      quarantineStalledToolWork: async () => false,
     },
     lifecycle: {
       onSendActivated: () => {},
@@ -246,31 +275,42 @@ test("boundary refusal rejects only that request while the browser turn remains 
   expect(await execution.confirmFinal(candidate)).toEqual(candidate);
 });
 
-test("worker stale-progress quarantine round-trips through the authoritative parent snapshot", async () => {
-  let progress = { revision: 1, lastToolBatchRevision: 1, activeToolCalls: 1, lastProgressAt: 1 };
-  let quarantines = 0;
+test("worker receives semantic progress snapshots without acquiring tool-retirement authority", async () => {
+  const progress = { revision: 1, lastToolBatchRevision: 1, activeToolCalls: 1, lastProgressAt: 1 };
   const execution = driver(recoveryControlWorkerFixture()).createTurn(turnInput({
-    gooseWork: {
-      snapshot: () => ({ ...progress }),
-      quarantineStalledToolWork: async expectedRevision => {
-        expect(expectedRevision).toBe(1);
-        quarantines += 1;
-        progress = { ...progress, revision: 2, activeToolCalls: 0 };
-        return true;
-      },
-    },
+    gooseWork: { snapshot: () => ({ ...progress }) },
   }));
 
   const candidate = await execution.run();
   expect(candidate.text).toBe("recovered fixture final");
-  expect(quarantines).toBe(1);
   expect(await execution.confirmFinal(candidate)).toEqual(candidate);
 });
 
-test("authoritative owner termination is acknowledged by the worker before process cleanup", async () => {
+test("node worker rebind passes the persisted pair and acknowledges rebound without send or acceptance", async () => {
+  const events: string[] = [];
+  const execution = driver(rebindWorkerFixture()).createTurn(turnInput({
+    prompt: "",
+    existingConversationId: CONVERSATION,
+    resumeAccepted: {
+      canonicalConversationId: CONVERSATION,
+      acceptedUserTurnId: "user-fixture",
+    },
+    lifecycle: {
+      onSendActivated: () => { throw new Error("rebind must not send"); },
+      onAccepted: () => { throw new Error("rebind must not create a replacement accepted turn"); },
+      onRebound: evidence => { events.push(`rebound:${evidence.acceptedUserTurnId}`); },
+    },
+  }));
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("rebound fixture final");
+  expect(events).toEqual(["rebound:user-fixture"]);
+  expect(await execution.confirmFinal(candidate)).toEqual(candidate);
+});
+
+test("process-local execution detach is acknowledged before worker cleanup", async () => {
   let resolveAccepted!: () => void;
   const accepted = new Promise<void>(resolve => { resolveAccepted = resolve; });
-  const execution = driver(ownerTerminationWorkerFixture()).createTurn(turnInput({
+  const execution = driver(executionDetachWorkerFixture()).createTurn(turnInput({
     lifecycle: { onSendActivated: () => {}, onAccepted: () => resolveAccepted() },
   }));
   const running = execution.run();
@@ -280,6 +320,6 @@ test("authoritative owner termination is acknowledged by the worker before proce
     error => error as Error,
   );
 
-  await execution.terminateOwner?.("terminal_response");
-  expect((await rejection).message).toContain("authoritative owner terminated");
+  await execution.detachExecution?.("transport_lost");
+  expect((await rejection).message).toContain("process-local browser execution detached");
 });

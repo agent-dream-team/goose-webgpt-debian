@@ -252,29 +252,25 @@ test("runtime health/control surface and two completed Goose turns reuse one per
   expect((await resume.json() as any).accepting_turns).toBe(true);
 });
 
-test("canonical divergence rolls to a fresh epoch and seeds the full current projection", async () => {
+test("canonical divergence preserves the existing pair and requires a paired handoff", async () => {
   const starts: RebuildPersistentBrowserTurnInput[] = [];
-  const conversations = [
-    "11111111-2222-4333-8444-555555555555",
-    "66666666-7777-4888-8999-aaaaaaaaaaaa",
-  ];
+  const conversationId = "11111111-2222-4333-8444-555555555555";
   const driver: RebuildPersistentBrowserDriver = {
     createTurn(input) {
       starts.push(input);
-      const ordinal = starts.length;
       return {
         captureAnswerBoundary: async () => { throw new Error("no tool expected"); },
         confirmFinal: async evidence => evidence,
         run: async () => {
           input.lifecycle.onSendActivated();
           input.lifecycle.onAccepted({
-            canonicalConversationId: conversations[ordinal - 1]!,
-            acceptedUserTurnId: `user-rollover-${ordinal}`,
+            canonicalConversationId: conversationId,
+            acceptedUserTurnId: "user-paired-handoff-1",
           });
           return {
-            canonicalConversationId: conversations[ordinal - 1]!,
-            acceptedUserTurnId: `user-rollover-${ordinal}`,
-            text: `rollover-answer-${ordinal}`,
+            canonicalConversationId: conversationId,
+            acceptedUserTurnId: "user-paired-handoff-1",
+            text: "paired-handoff-answer-1",
             remoteNonRunning: true,
           };
         },
@@ -283,23 +279,17 @@ test("canonical divergence rolls to a fresh epoch and seeds the full current pro
   };
   const { runtime } = setup(driver);
   const firstRequest = requestBody("first");
-  expect((await post(runtime, firstRequest, "goose-rollover")).status).toBe(200);
-  expect(runtime.broker.getCurrentEpoch("goose-rollover")?.epoch).toBe(1);
+  expect((await post(runtime, firstRequest, "goose-paired-handoff")).status).toBe(200);
+  expect(runtime.broker.getCurrentEpoch("goose-paired-handoff")?.epoch).toBe(1);
 
-  // The prior canonical prefix was revised rather than append-extended. Gate F must not repoint the
-  // existing conversation; it creates a fresh epoch seeded from this current Goose projection.
   const diverged = requestBody("revised-current-projection");
-  const second = await post(runtime, diverged, "goose-rollover");
-  expect(second.status).toBe(200);
-  expect(await second.text()).toContain("rollover-answer-2");
-  expect(starts).toHaveLength(2);
-  expect(starts[1]?.epoch).toBe(2);
-  expect(starts[1]?.existingConversationId).toBeNull();
-  expect(starts[1]?.prompt).toContain("revised-current-projection");
-  expect(starts[1]?.prompt).toContain('"mode":"seed"');
-  expect(runtime.broker.getCurrentEpoch("goose-rollover")).toMatchObject({
-    epoch: 2,
-    conversationId: conversations[1],
+  const second = await post(runtime, diverged, "goose-paired-handoff");
+  expect(second.status).toBe(409);
+  expect(await second.json()).toMatchObject({ error: { code: "paired_handoff_required" } });
+  expect(starts).toHaveLength(1);
+  expect(runtime.broker.getCurrentEpoch("goose-paired-handoff")).toMatchObject({
+    epoch: 1,
+    conversationId,
     leaseState: "IDLE",
   });
 });
@@ -343,7 +333,7 @@ for (const scenario of [
     ],
     expected: ["branch point", "resumed branch instruction"],
   },
-] as const) test(`Gate F ${scenario.name} starts a fresh epoch seeded only from the current projection`, async () => {
+] as const) test(`Gate F ${scenario.name} preserves the pair and requires a paired handoff`, async () => {
   const starts: RebuildPersistentBrowserTurnInput[] = [];
   const conversations = [
     "21111111-2222-4333-8444-555555555555",
@@ -378,18 +368,14 @@ for (const scenario of [
   expect(runtime.broker.getCurrentEpoch(`goose-${scenario.name.replaceAll(" ", "-")}`)?.epoch).toBe(1);
 
   const rewritten = { ...initial, input: scenario.nextInput };
-  const second = await post(runtime, rewritten, `goose-${scenario.name.replaceAll(" ", "-")}`);
-  expect(second.status).toBe(200);
-  expect(await second.text()).toContain("rewrite-answer-2");
-  expect(starts).toHaveLength(2);
-  expect(starts[1]?.epoch).toBe(2);
-  expect(starts[1]?.existingConversationId).toBeNull();
-  expect(starts[1]?.prompt).toContain('"mode":"seed"');
-  for (const text of scenario.expected) expect(starts[1]?.prompt).toContain(text);
-  expect(starts[1]?.prompt).not.toContain("rewrite-answer-2");
-  expect(runtime.broker.getCurrentEpoch(`goose-${scenario.name.replaceAll(" ", "-")}`)).toMatchObject({
-    epoch: 2,
-    conversationId: conversations[1],
+  const sessionId = `goose-${scenario.name.replaceAll(" ", "-")}`;
+  const second = await post(runtime, rewritten, sessionId);
+  expect(second.status).toBe(409);
+  expect(await second.json()).toMatchObject({ error: { code: "paired_handoff_required" } });
+  expect(starts).toHaveLength(1);
+  expect(runtime.broker.getCurrentEpoch(sessionId)).toMatchObject({
+    epoch: 1,
+    conversationId: conversations[0],
     leaseState: "IDLE",
   });
 });
@@ -583,27 +569,27 @@ test("runtime resolves connector-qualified Goose tool aliases before the exact s
   }
 });
 
-test("authenticated owner termination quarantines a claimed tool once and retains its slot through late-result rejection", async () => {
+test("authenticated execution detach quarantines only genuinely unresolved tool correlation and retains its slot", async () => {
   let invokeTool!: (input: RebuildPersistentBrowserTurnInput) => Promise<any>;
   const toolSettled = deferred<any>();
-  const ownerTerminated = deferred<void>();
-  let terminations = 0;
+  const executionDetached = deferred<void>();
+  let detachments = 0;
   const conversationId = "bbbbbbbb-cccc-4ddd-8eee-000000000123";
   const driver: RebuildPersistentBrowserDriver = {
     createTurn(input) {
       return {
         captureAnswerBoundary: async opRef => JSON.stringify({ kind: "owner-terminal-boundary", opRef }),
         confirmFinal: async evidence => evidence,
-        terminateOwner: async () => {
-          terminations += 1;
-          ownerTerminated.resolve();
+        detachExecution: async () => {
+          detachments += 1;
+          executionDetached.resolve();
         },
         run: async () => {
           input.lifecycle.onSendActivated();
           input.lifecycle.onAccepted({ canonicalConversationId: conversationId, acceptedUserTurnId: "user-owner-terminal" });
           toolSettled.resolve(await invokeTool(input));
-          await ownerTerminated.promise;
-          throw new Error("authoritative owner terminated");
+          await executionDetached.promise;
+          throw new Error("process-local execution detached");
         },
       };
     },
@@ -625,46 +611,46 @@ test("authenticated owner termination quarantines a claimed tool once and retain
     const turn = runtime.broker.getOpenTurnForSession("goose-owner-terminal")!;
     expect(runtime.broker.getOperation(call.callId)?.state).toBe("CLAIMED");
 
-    const wrongIdentity = await fetch(`${runtime.origin}/admin/terminate-turn-owner`, {
+    const wrongIdentity = await fetch(`${runtime.origin}/admin/detach-turn-execution`, {
       method: "POST",
       headers: { authorization: "Bearer control-token", "content-type": "application/json" },
       body: JSON.stringify({
-        turn_ref: turn.turnRef, goose_session_id: "wrong-session", reason: "terminal_response",
+        turn_ref: turn.turnRef, goose_session_id: "wrong-session", reason: "transport_lost",
       }),
     });
     expect(wrongIdentity.status).toBe(409);
     expect(runtime.broker.getOperation(call.callId)?.state).toBe("CLAIMED");
 
-    const terminated = await fetch(`${runtime.origin}/admin/terminate-turn-owner`, {
+    const terminated = await fetch(`${runtime.origin}/admin/detach-turn-execution`, {
       method: "POST",
       headers: { authorization: "Bearer control-token", "content-type": "application/json" },
       body: JSON.stringify({
-        turn_ref: turn.turnRef, goose_session_id: "goose-owner-terminal", reason: "terminal_response",
+        turn_ref: turn.turnRef, goose_session_id: "goose-owner-terminal", reason: "transport_lost",
       }),
     });
     expect(terminated.status).toBe(200);
     expect(await terminated.json()).toMatchObject({
       status: "ok", turn_state: "UNRECONCILED", slot_retained: true,
-      unreconciled_reason: "goose_owner_terminal_response",
+      unreconciled_reason: "goose_execution_transport_lost",
     });
     expect((await toolSettled.promise).structuredContent).toMatchObject({ ok: false, output: "UNCERTAIN" });
     expect(runtime.broker.getOperation(call.callId)).toMatchObject({ state: "UNCERTAIN", ownerId: null });
     expect(runtime.broker.getAccountSlotHolders().some(holder => holder.turnRef === turn.turnRef)).toBeTrue();
-    expect(terminations).toBe(1);
+    expect(detachments).toBe(1);
 
-    const repeated = await fetch(`${runtime.origin}/admin/terminate-turn-owner`, {
+    const repeated = await fetch(`${runtime.origin}/admin/detach-turn-execution`, {
       method: "POST",
       headers: { authorization: "Bearer control-token", "content-type": "application/json" },
       body: JSON.stringify({
-        turn_ref: turn.turnRef, goose_session_id: "goose-owner-terminal", reason: "terminal_response",
+        turn_ref: turn.turnRef, goose_session_id: "goose-owner-terminal", reason: "transport_lost",
       }),
     });
     expect(repeated.status).toBe(200);
-    expect(terminations).toBe(1);
+    expect(detachments).toBe(1);
 
     const late = await post(runtime, continuationBody(initial, call.callId, "late-tool-output"), "goose-owner-terminal");
     expect(late.status).toBe(409);
-    expect(await late.text()).toContain("turn_unreconciled");
+    expect(await late.text()).toContain("rebind_request_conflict");
 
     const reconciled = await fetch(`${runtime.origin}/admin/reconcile-operation`, {
       method: "POST",
@@ -696,74 +682,6 @@ test("authenticated owner termination quarantines a claimed tool once and retain
     await connector.client.close().catch(() => {});
   }
 });
-
-test("semantic-progress expiry quarantines the claim and detaches after unresolved browser final", async () => {
-  let invokeTool!: (input: RebuildPersistentBrowserTurnInput) => Promise<any>;
-  let expireStalled!: RebuildPersistentBrowserTurnInput["gooseWork"]["quarantineStalledToolWork"];
-  let progressSnapshot!: RebuildPersistentBrowserTurnInput["gooseWork"]["snapshot"];
-  const toolSettled = deferred<any>();
-  const detached = deferred<void>();
-  let detachments = 0;
-  const driver: RebuildPersistentBrowserDriver = {
-    createTurn(input) {
-      expireStalled = input.gooseWork.quarantineStalledToolWork;
-      progressSnapshot = input.gooseWork.snapshot;
-      return {
-        captureAnswerBoundary: async opRef => JSON.stringify({ kind: "semantic-timeout-boundary", opRef }),
-        confirmFinal: async evidence => evidence,
-        terminateOwner: async () => {
-          detachments += 1;
-          detached.resolve();
-        },
-        run: async () => {
-          input.lifecycle.onSendActivated();
-          input.lifecycle.onAccepted({
-            canonicalConversationId: "bbbbbbbb-cccc-4ddd-8eee-000000000124",
-            acceptedUserTurnId: "user-semantic-timeout",
-          });
-          toolSettled.resolve(await invokeTool(input));
-          return {
-            canonicalConversationId: "bbbbbbbb-cccc-4ddd-8eee-000000000124",
-            acceptedUserTurnId: "user-semantic-timeout",
-            text: "remote final after uncertain tool",
-            remoteNonRunning: true,
-          };
-        },
-      };
-    },
-  };
-  const { runtime, authorization } = setup(driver);
-  const connector = connectorClient(runtime, authorization);
-  await connector.client.connect(connector.transport);
-  invokeTool = input => connector.client.callTool({ name: "goose_tool", arguments: {
-    turn_ref: input.turnRef,
-    op_ref: input.initialOpRef,
-    tool_name: "tree",
-    arguments: { path: "." },
-  } });
-
-  try {
-    const first = await post(runtime, requestBody("semantic-timeout"), "goose-semantic-timeout");
-    const call = responseFunctionCall(await first.text());
-    const staleRevision = progressSnapshot().revision;
-    expect(progressSnapshot().activeToolCalls).toBe(1);
-    expect(await expireStalled(staleRevision)).toBeTrue();
-    expect(await expireStalled(staleRevision)).toBeFalse();
-    expect((await toolSettled.promise).structuredContent).toMatchObject({ ok: false, output: "UNCERTAIN" });
-    await detached.promise;
-
-    expect(detachments).toBe(1);
-    expect(runtime.broker.getOperation(call.callId)?.state).toBe("UNCERTAIN");
-    expect(runtime.broker.getOpenTurnForSession("goose-semantic-timeout")).toMatchObject({
-      state: "UNRECONCILED", unreconciledReason: "goose_tool_semantic_progress_stalled",
-    });
-    expect(runtime.broker.getAccountSlotHolders().some(holder => holder.turnRef
-      === runtime.broker.getOpenTurnForSession("goose-semantic-timeout")?.turnRef)).toBeTrue();
-  } finally {
-    await connector.client.close().catch(() => {});
-  }
-});
-
 
 test("transport loss before send activation frees the slot and exact retry gets a fresh pre-send attempt", async () => {
   const firstStarted = deferred<void>();
@@ -956,7 +874,7 @@ test("runtime admits exactly two sessions while health reports active browser tu
   expect(await (await fetch(`${runtime.origin}/healthz`)).json()).toMatchObject({ active_browser_turns: 0 });
 });
 
-test("provider restart recovers an outstanding turn to UNRECONCILED and does not invent browser execution", async () => {
+test("provider restart rebinds the same Goose turn to the same ChatGPT conversation on exact request replay", async () => {
   const root = mkdtempSync(join(tmpdir(), "cgw-rebuild-provider-restart-"));
   roots.push(root);
   const brokerPath = join(root, "broker.sqlite");
@@ -964,6 +882,9 @@ test("provider restart recovers an outstanding turn to UNRECONCILED and does not
   const authorization = `Bearer ${"z".repeat(64)}`;
   writeFileSync(authorizationFile, `${authorization}\n`, { mode: 0o600 });
   chmodSync(authorizationFile, 0o600);
+  const body = requestBody("restart");
+  const checkpoint = gooseResponsesProjectionCheckpoint(body);
+  const conversationId = "aaaaaaaa-bbbb-4ccc-8ddd-000000000777";
   const seed = new SessionBroker(brokerPath, {
     projectId: "project-restart",
     instanceId: "seed",
@@ -973,13 +894,20 @@ test("provider restart recovers an outstanding turn to UNRECONCILED and does not
     makeOpRef: () => "op-restart",
   });
   seed.createEpoch({ gooseSessionId: "goose-restart" });
-  const seeded = seed.enqueueTurn({ gooseSessionId: "goose-restart", requestHash: "request-restart", checkpointJson: '{"version":1}' });
+  const seeded = seed.enqueueTurn({
+    gooseSessionId: "goose-restart",
+    requestHash: checkpoint.requestHash,
+    checkpointJson: encodeGooseResponsesProjectionCheckpoint(checkpoint),
+  });
   seed.admitNext();
   seed.markSendActivated(seeded.turnRef);
+  seed.bindConversation({ gooseSessionId: "goose-restart", epoch: 1, conversationId });
   seed.markAccepted(seeded.turnRef, "user-restart");
   seed.close();
 
   let browserStarts = 0;
+  let rebound = 0;
+  let sends = 0;
   const runtime = startRebuildProviderRuntime({
     port: 0,
     model: "gpt-4.1",
@@ -991,15 +919,109 @@ test("provider restart recovers an outstanding turn to UNRECONCILED and does not
     terminalReplayWindowMs: 60_000,
     connectorPort: 0,
     connectorAuthorizationFile: authorizationFile,
-    browserDriver: { createTurn() { browserStarts += 1; throw new Error("must not start"); } },
+    browserDriver: {
+      createTurn(input) {
+        browserStarts += 1;
+        expect(input.prompt).toBe("");
+        expect(input.existingConversationId).toBe(conversationId);
+        expect(input.resumeAccepted).toEqual({
+          canonicalConversationId: conversationId,
+          acceptedUserTurnId: "user-restart",
+        });
+        return {
+          captureAnswerBoundary: async () => { throw new Error("no tool expected"); },
+          confirmFinal: async evidence => evidence,
+          run: async () => {
+            sends += 0;
+            await input.lifecycle.onRebound?.({
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId: "user-restart",
+            });
+            rebound += 1;
+            return {
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId: "user-restart",
+              text: "rebound-final",
+              remoteNonRunning: true,
+            };
+          },
+        };
+      },
+    },
   });
   runtimes.push(runtime);
   expect(runtime.broker.getTurn("turn-restart")?.state).toBe("UNRECONCILED");
   expect(runtime.broker.getAccountSlotHolder()).toBe("turn-restart");
-  const response = await post(runtime, requestBody("restart"), "goose-restart");
+
+  const response = await post(runtime, body, "goose-restart");
+  expect(response.status).toBe(200);
+  expect(await response.text()).toContain("rebound-final");
+  expect(browserStarts).toBe(1);
+  expect(rebound).toBe(1);
+  expect(sends).toBe(0);
+  expect(runtime.broker.getTurn("turn-restart")?.state).toBe("COMPLETE");
+  expect(runtime.broker.getCurrentEpoch("goose-restart")).toMatchObject({
+    conversationId,
+    leaseState: "IDLE",
+  });
+  expect(runtime.broker.getAccountSlotHolder()).toBeNull();
+});
+
+test("provider restart refuses pair rebind while a prior tool result remains genuinely ambiguous", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-rebuild-provider-restart-blocked-"));
+  roots.push(root);
+  const brokerPath = join(root, "broker.sqlite");
+  const authorizationFile = join(root, "connector-auth.txt");
+  writeFileSync(authorizationFile, `Bearer ${"y".repeat(64)}\n`, { mode: 0o600 });
+  chmodSync(authorizationFile, 0o600);
+  const body = requestBody("restart-blocked");
+  const checkpoint = gooseResponsesProjectionCheckpoint(body);
+  const seed = new SessionBroker(brokerPath, {
+    projectId: "project-restart-blocked",
+    instanceId: "seed",
+    terminalReplayWindowMs: 60_000,
+    makeTurnRef: () => "turn-restart-blocked",
+    makeSubmitNonce: () => "nonce-restart-blocked",
+    makeOpRef: () => "op-restart-blocked",
+  });
+  seed.createEpoch({ gooseSessionId: "goose-restart-blocked" });
+  const turn = seed.enqueueTurn({
+    gooseSessionId: "goose-restart-blocked",
+    requestHash: checkpoint.requestHash,
+    checkpointJson: encodeGooseResponsesProjectionCheckpoint(checkpoint),
+  });
+  const admitted = seed.admitNext()!;
+  seed.markSendActivated(turn.turnRef);
+  seed.bindConversation({
+    gooseSessionId: "goose-restart-blocked", epoch: 1,
+    conversationId: "aaaaaaaa-bbbb-4ccc-8ddd-000000000778",
+  });
+  seed.markAccepted(turn.turnRef, "user-restart-blocked");
+  seed.recordAnswerBoundary(turn.turnRef, admitted.initialOpRef, '{"chars":1}');
+  expect(seed.claimOperation({ turnRef: turn.turnRef, opRef: admitted.initialOpRef, inputHash: "input" }).kind).toBe("EXECUTE");
+  seed.close();
+
+  let browserStarts = 0;
+  const runtime = startRebuildProviderRuntime({
+    port: 0,
+    model: "gpt-4.1",
+    contextWindow: 200_000,
+    controlToken: "control-token",
+    projectId: "project-restart-blocked",
+    connectorIdentity: "Goose Native 2nd Shift",
+    brokerPath,
+    terminalReplayWindowMs: 60_000,
+    connectorPort: 0,
+    connectorAuthorizationFile: authorizationFile,
+    browserDriver: { createTurn() { browserStarts += 1; throw new Error("must not rebind before reconciliation"); } },
+  });
+  runtimes.push(runtime);
+  expect(runtime.broker.getOperation(admitted.initialOpRef)?.state).toBe("UNCERTAIN");
+  const response = await post(runtime, body, "goose-restart-blocked");
   expect(response.status).toBe(409);
-  expect((await response.json() as any).error.code).toBe("turn_unreconciled");
+  expect((await response.json() as any).error.code).toBe("rebind_blocked");
   expect(browserStarts).toBe(0);
+  expect(runtime.broker.getAccountSlotHolder()).toBe("turn-restart-blocked");
 });
 
 test("a live initial Responses owner rejects a concurrent duplicate without starting a second browser execution", async () => {
@@ -1109,7 +1131,7 @@ test("busy drain fails atomically without blocking the active turn or its follow
   expect(resume.status).toBe(200);
 });
 
-test("authenticated recovery reconciles only post-owner known operation evidence and then abandons with positive terminal proof", async () => {
+test("authenticated recovery reconciles post-owner known operation evidence without retiring the persistent pair", async () => {
   const root = mkdtempSync(join(tmpdir(), "cgw-rebuild-recovery-admin-"));
   roots.push(root);
   const authorizationFile = join(root, "connector-auth.txt");
@@ -1195,180 +1217,28 @@ test("authenticated recovery reconciles only post-owner known operation evidence
   expect(terminal.resultJson).not.toContain("proof-secret");
   expect(restarted.broker.getAccountSlotHolder()).toBe(admitted.turn.turnRef);
 
-  const insufficient = await fetch(`${restarted.origin}/admin/abandon-unreconciled`, {
-    method: "POST",
-    headers: { authorization: "Bearer control-token", "content-type": "application/json" },
-    body: JSON.stringify({
-      turn_ref: admitted.turn.turnRef,
-      positive_terminal_evidence: {
-        canonical_conversation_id: "87654321-4321-4abc-8def-1234567890ab", accepted_user_turn_id: "user-recovery",
-        remote_ui_non_running_across_qualified_settle: true, no_unresolved_goose_work: false, no_contradictory_activity: true,
-      },
-    }),
+  expect(restarted.broker.getOpenTurnForSession("goose-recovery")).toMatchObject({
+    state: "UNRECONCILED",
+    acceptedUserTurnId: "user-recovery",
   });
-  expect(insufficient.status).toBe(409);
-  expect(await insufficient.json()).toMatchObject({ status: "rejected", code: "POSITIVE_TERMINAL_REQUIRED" });
-
-  const abandoned = await fetch(`${restarted.origin}/admin/abandon-unreconciled`, {
-    method: "POST",
-    headers: { authorization: "Bearer control-token", "content-type": "application/json" },
-    body: JSON.stringify({
-      turn_ref: admitted.turn.turnRef,
-      positive_terminal_evidence: {
-        canonical_conversation_id: "87654321-4321-4abc-8def-1234567890ab", accepted_user_turn_id: "user-recovery",
-        remote_ui_non_running_across_qualified_settle: true, no_unresolved_goose_work: true, no_contradictory_activity: true,
-      },
-    }),
+  expect(restarted.broker.getCurrentEpoch("goose-recovery")).toMatchObject({
+    epoch: 1,
+    conversationId: "87654321-4321-4abc-8def-1234567890ab",
+    leaseState: "UNRECONCILED",
   });
-  expect(abandoned.status).toBe(200);
-  expect(await abandoned.json()).toMatchObject({ status: "ok", turn_state: "ABANDONED", account_slot_holder: null });
-  expect(restarted.broker.getCurrentEpoch("goose-recovery")).toBeNull();
 });
 
-test("authenticated abandonment can retire a verified pre-identity orphan without a separate recovery API", async () => {
+test("current runtime exposes no persistent-pair abandonment endpoint", async () => {
   const driver: RebuildPersistentBrowserDriver = {
-    createTurn() { throw new Error("orphan abandonment test must not create browser work"); },
+    createTurn() { throw new Error("endpoint absence test must not create browser work"); },
   };
   const { runtime } = setup(driver);
-  const sessionId = "goose-pre-identity-orphan";
-  runtime.broker.createEpoch({ gooseSessionId: sessionId });
-  const turn = runtime.broker.enqueueTurn({
-    gooseSessionId: sessionId,
-    requestHash: "orphan-request",
-  });
-  runtime.broker.admitNext();
-  runtime.broker.markSendActivated(turn.turnRef);
-  runtime.broker.markUnreconciled(turn.turnRef, "browser_lost_before_identity_capture");
-
-  const abandoned = await fetch(`${runtime.origin}/admin/abandon-unreconciled`, {
+  const response = await fetch(`${runtime.origin}/admin/abandon-unreconciled`, {
     method: "POST",
     headers: { authorization: "Bearer control-token", "content-type": "application/json" },
-    body: JSON.stringify({
-      turn_ref: turn.turnRef,
-      positive_terminal_evidence: {
-        canonical_conversation_id: "12345678-1234-4abc-8def-1234567890ab",
-        accepted_user_turn_id: "user-recovered-orphan",
-        remote_ui_non_running_across_qualified_settle: true,
-        no_unresolved_goose_work: true,
-        no_contradictory_activity: true,
-      },
-    }),
+    body: JSON.stringify({ turn_ref: "legacy-turn" }),
   });
-  expect(abandoned.status).toBe(200);
-  expect(await abandoned.json()).toMatchObject({
-    status: "ok", turn_state: "ABANDONED", account_slot_holder: null,
-  });
-  expect(runtime.broker.getTurn(turn.turnRef)?.acceptedUserTurnId).toBe("user-recovered-orphan");
-  expect(runtime.broker.getCurrentEpoch(sessionId)).toBeNull();
-});
-
-test("authenticated orphan abandonment rejects malformed recovery identity before broker mutation", async () => {
-  const driver: RebuildPersistentBrowserDriver = {
-    createTurn() { throw new Error("malformed orphan recovery test must not create browser work"); },
-  };
-  const { runtime } = setup(driver);
-  const sessionId = "goose-malformed-orphan";
-  runtime.broker.createEpoch({ gooseSessionId: sessionId });
-  const turn = runtime.broker.enqueueTurn({
-    gooseSessionId: sessionId,
-    requestHash: "malformed-orphan-request",
-  });
-  runtime.broker.admitNext();
-  runtime.broker.markSendActivated(turn.turnRef);
-  runtime.broker.markUnreconciled(turn.turnRef, "browser_lost_before_identity_capture");
-
-  const recover = async (canonicalConversationId: string, acceptedUserTurnId: string) => await fetch(
-    `${runtime.origin}/admin/abandon-unreconciled`,
-    {
-      method: "POST",
-      headers: { authorization: "Bearer control-token", "content-type": "application/json" },
-      body: JSON.stringify({
-        turn_ref: turn.turnRef,
-        positive_terminal_evidence: {
-          canonical_conversation_id: canonicalConversationId,
-          accepted_user_turn_id: acceptedUserTurnId,
-          remote_ui_non_running_across_qualified_settle: true,
-          no_unresolved_goose_work: true,
-          no_contradictory_activity: true,
-        },
-      }),
-    },
-  );
-
-  const badConversation = await recover("https://chatgpt.com/c/not-a-uuid", "user-recovered-orphan");
-  expect(badConversation.status).toBe(400);
-  expect(await badConversation.json()).toMatchObject({ error: { code: "invalid_recovery_request" } });
-  expect(runtime.broker.getCurrentEpoch(sessionId)?.conversationId).toBeNull();
-  expect(runtime.broker.getTurn(turn.turnRef)?.acceptedUserTurnId).toBeNull();
-  expect(runtime.broker.getAccountSlotHolder()).toBe(turn.turnRef);
-
-  const badUser = await recover("12345678-1234-4abc-8def-1234567890ab", "bad user\nturn");
-  expect(badUser.status).toBe(400);
-  expect(await badUser.json()).toMatchObject({ error: { code: "invalid_recovery_request" } });
-  expect(runtime.broker.getCurrentEpoch(sessionId)?.conversationId).toBeNull();
-  expect(runtime.broker.getTurn(turn.turnRef)?.acceptedUserTurnId).toBeNull();
-  expect(runtime.broker.getAccountSlotHolder()).toBe(turn.turnRef);
-});
-
-test("abandoned current epoch forces the next Goose turn onto a fresh seeded conversation", async () => {
-  const starts: RebuildPersistentBrowserTurnInput[] = [];
-  const driver: RebuildPersistentBrowserDriver = {
-    createTurn(input) {
-      starts.push(input);
-      return {
-        captureAnswerBoundary: async () => { throw new Error("no tool expected"); },
-        confirmFinal: async evidence => evidence,
-        run: async () => {
-          input.lifecycle.onSendActivated();
-          input.lifecycle.onAccepted({
-            canonicalConversationId: "22222222-3333-4444-8555-666666666666",
-            acceptedUserTurnId: "user-after-abandon",
-          });
-          return {
-            canonicalConversationId: "22222222-3333-4444-8555-666666666666",
-            acceptedUserTurnId: "user-after-abandon",
-            text: "after-abandon-ok",
-            remoteNonRunning: true,
-          };
-        },
-      };
-    },
-  };
-  const { runtime } = setup(driver);
-  const sessionId = "goose-abandon-rollover";
-  runtime.broker.createEpoch({ gooseSessionId: sessionId });
-  const abandoned = runtime.broker.enqueueTurn({
-    gooseSessionId: sessionId,
-    requestHash: "abandoned-request",
-  });
-  runtime.broker.admitNext();
-  runtime.broker.markSendActivated(abandoned.turnRef);
-  runtime.broker.markAccepted(abandoned.turnRef, "user-abandoned");
-  runtime.broker.bindConversation({
-    gooseSessionId: sessionId, epoch: 1, conversationId: "11111111-2222-4333-8444-555555555555",
-  });
-  runtime.broker.markUnreconciled(abandoned.turnRef, "retired_remote_conversation");
-  runtime.broker.releaseSlotAfterPositiveTerminal(abandoned.turnRef, {
-    canonicalConversationId: "11111111-2222-4333-8444-555555555555",
-    acceptedUserTurnId: "user-abandoned",
-    remoteUiNonRunningAcrossQualifiedSettle: true,
-    noUnresolvedGooseWork: true,
-    noContradictoryActivity: true,
-  });
-  expect(runtime.broker.abandonUnreconciled(abandoned.turnRef).state).toBe("ABANDONED");
-  expect(runtime.broker.getCurrentEpoch(sessionId)).toBeNull();
-
-  const next = requestBody("after abandonment");
-  const response = await post(runtime, next, sessionId);
-  expect(response.status).toBe(200);
-  expect(await response.text()).toContain("after-abandon-ok");
-  expect(starts).toHaveLength(1);
-  expect(starts[0]).toMatchObject({ epoch: 2, existingConversationId: null });
-  expect(starts[0]?.prompt).toContain('"mode":"seed"');
-  expect(starts[0]?.prompt).toContain("after abandonment");
-  expect(runtime.broker.getCurrentEpoch(sessionId)).toMatchObject({
-    epoch: 2, conversationId: "22222222-3333-4444-8555-666666666666", leaseState: "IDLE",
-  });
+  expect(response.status).toBe(404);
 });
 
 test("connector work cannot claim before canonical conversation and accepted user identity are durable", async () => {
@@ -1546,31 +1416,51 @@ test("browser construction failure after durable send activation quarantines ins
 
   const retry = await post(runtime, requestBody("construction-after-send"), "goose-construction-after-send");
   expect(retry.status).toBe(409);
-  expect((await retry.json() as any).error.code).toBe("turn_unreconciled");
+  expect((await retry.json() as any).error.code).toBe("RECOVERY_IDENTITY");
   expect(starts).toBe(1);
 });
 
-test("accepted browser terminal failure becomes UNRECONCILED and cannot be replayed", async () => {
+test("accepted browser attachment failure rebinds the same persisted pair on exact replay", async () => {
   let starts = 0;
+  const conversationId = "aaaaaaaa-bbbb-4ccc-8ddd-000000000777";
   const driver: RebuildPersistentBrowserDriver = {
     createTurn(input) {
       starts += 1;
+      const ordinal = starts;
       return {
         captureAnswerBoundary: async () => { throw new Error("no tool expected"); },
         confirmFinal: async evidence => evidence,
         run: async () => {
-          input.lifecycle.onSendActivated();
-          input.lifecycle.onAccepted({
-            canonicalConversationId: "aaaaaaaa-bbbb-4ccc-8ddd-000000000777",
+          if (ordinal === 1) {
+            input.lifecycle.onSendActivated();
+            input.lifecycle.onAccepted({
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId: "user-upstream-terminal",
+            });
+            throw new ChatGptUpstreamTerminalError("regenerate-error");
+          }
+          expect(input.prompt).toBe("");
+          expect(input.resumeAccepted).toEqual({
+            canonicalConversationId: conversationId,
             acceptedUserTurnId: "user-upstream-terminal",
           });
-          throw new ChatGptUpstreamTerminalError("regenerate-error");
+          await input.lifecycle.onRebound?.({
+            canonicalConversationId: conversationId,
+            acceptedUserTurnId: "user-upstream-terminal",
+          });
+          return {
+            canonicalConversationId: conversationId,
+            acceptedUserTurnId: "user-upstream-terminal",
+            text: "same-pair-rebound-ok",
+            remoteNonRunning: true,
+          };
         },
       };
     },
   };
   const { runtime } = setup(driver);
-  const first = await post(runtime, requestBody("upstream-terminal"), "goose-upstream-terminal");
+  const body = requestBody("upstream-terminal");
+  const first = await post(runtime, body, "goose-upstream-terminal");
   expect(first.status).toBe(502);
   expect((await first.json() as any).error.code).toBe("upstream_server_error");
   const open = runtime.broker.getOpenTurnForSession("goose-upstream-terminal");
@@ -1578,10 +1468,11 @@ test("accepted browser terminal failure becomes UNRECONCILED and cannot be repla
   expect(open?.unreconciledReason).toBe("persistent_browser_turn_failed");
   expect(runtime.broker.getAccountSlotHolder()).toBe(open?.turnRef ?? null);
 
-  const retry = await post(runtime, requestBody("upstream-terminal"), "goose-upstream-terminal");
-  expect(retry.status).toBe(409);
-  expect((await retry.json() as any).error.code).toBe("turn_unreconciled");
-  expect(starts).toBe(1);
+  const retry = await post(runtime, body, "goose-upstream-terminal");
+  expect(retry.status).toBe(200);
+  expect(await retry.text()).toContain("same-pair-rebound-ok");
+  expect(starts).toBe(2);
+  expect(runtime.broker.getAccountSlotHolder()).toBeNull();
 });
 
 test("invalid browser acceptance identity cannot partially bind durable remote identity", async () => {

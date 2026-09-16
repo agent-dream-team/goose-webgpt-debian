@@ -30,14 +30,17 @@ type StartMessage = {
     submitNonce: string;
     prompt: string;
     existingConversationId: string | null;
+    resumeAccepted?: {
+      canonicalConversationId: string;
+      acceptedUserTurnId: string;
+    };
   };
 };
 
 type InputMessage = StartMessage
-  | { type: "lifecycle_ack"; event: "send_activated" | "accepted"; ok: boolean; message?: string }
+  | { type: "lifecycle_ack"; event: "send_activated" | "accepted" | "rebound"; ok: boolean; message?: string }
   | { type: "tool_progress"; snapshot: ChatGptExternalTurnProgressSnapshot }
-  | { type: "quarantine_tool_ack"; requestId: number; quarantined: boolean; snapshot: ChatGptExternalTurnProgressSnapshot }
-  | { type: "terminate_owner"; reason: string }
+  | { type: "detach_execution"; reason: string }
   | { type: "abort" }
   | { type: "boundary"; requestId: number; opRef: string }
   | { type: "confirm"; candidate: RebuildBrowserFinalEvidence }
@@ -55,13 +58,11 @@ let toolProgress: ChatGptExternalTurnProgressSnapshot = {
   lastToolBatchRevision: 0,
   activeToolCalls: 0,
 };
-let quarantineRequestId = 0;
 let started = false;
 let candidate: RebuildBrowserFinalEvidence | undefined;
 let confirmed = false;
-let ownerTerminating = false;
-const lifecycleWaiters = new Map<"send_activated" | "accepted", Deferred>();
-const quarantineWaiters = new Map<number, Deferred<boolean>>();
+let executionDetaching = false;
+const lifecycleWaiters = new Map<"send_activated" | "accepted" | "rebound", Deferred>();
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -72,7 +73,7 @@ function write(message: unknown): void {
 }
 
 function waitForLifecycleAck(
-  event: "send_activated" | "accepted",
+  event: "send_activated" | "accepted" | "rebound",
   evidence?: RebuildBrowserAcceptedEvidence,
 ): Promise<void> {
   if (lifecycleWaiters.has(event)) {
@@ -87,10 +88,16 @@ function waitForLifecycleAck(
 function start(message: StartMessage): void {
   if (started) throw new Error("Node browser worker already owns a turn");
   const { config, input } = message;
+  const resumeAccepted = input.resumeAccepted;
   if (!config.descriptorPath || !config.projectId || !config.projectName
     || !config.connectorName || !config.connectorMentionQuery
     || !input.turnRef || !input.gooseSessionId || !input.initialOpRef || !input.submitNonce
-    || typeof input.prompt !== "string" || !Number.isSafeInteger(input.epoch) || input.epoch < 1) {
+    || typeof input.prompt !== "string" || !Number.isSafeInteger(input.epoch) || input.epoch < 1
+    || (resumeAccepted !== undefined && (
+      !resumeAccepted || typeof resumeAccepted !== "object"
+      || typeof resumeAccepted.canonicalConversationId !== "string" || !resumeAccepted.canonicalConversationId
+      || typeof resumeAccepted.acceptedUserTurnId !== "string" || !resumeAccepted.acceptedUserTurnId
+    ))) {
     throw new Error("Node browser worker start message is invalid");
   }
   started = true;
@@ -112,25 +119,21 @@ function start(message: StartMessage): void {
     preSendAbortSignal: abortController.signal,
     gooseWork: {
       snapshot: () => ({ ...toolProgress }),
-      quarantineStalledToolWork: expectedRevision => new Promise<boolean>((resolve, reject) => {
-        quarantineRequestId += 1;
-        quarantineWaiters.set(quarantineRequestId, { resolve, reject });
-        write({ type: "quarantine_tool", requestId: quarantineRequestId, expectedRevision });
-      }),
     },
     lifecycle: {
       onSendActivated: () => waitForLifecycleAck("send_activated"),
       onAccepted: evidence => waitForLifecycleAck("accepted", evidence),
+      onRebound: evidence => waitForLifecycleAck("rebound", evidence),
     },
   });
   void execution.run().then(evidence => {
     candidate = evidence;
     write({ type: "candidate", evidence });
   }).catch(error => {
-    // Authoritative owner termination deliberately tears down the disposable browser observer.
-    // Its explicit owner_terminated frame is the parent protocol fence; do not race that
+    // Explicit execution detach deliberately tears down only the disposable browser observer.
+    // Its execution_detached frame is the parent protocol fence; do not race that
     // acknowledgement with the expected run() rejection caused by closing the surface.
-    if (!ownerTerminating) write({ type: "error", message: errorMessage(error) });
+    if (!executionDetaching) write({ type: "error", message: errorMessage(error) });
   });
 }
 
@@ -152,20 +155,11 @@ async function handle(message: InputMessage): Promise<void> {
     if (message.snapshot.revision >= toolProgress.revision) toolProgress = { ...message.snapshot };
     return;
   }
-  if (message.type === "quarantine_tool_ack") {
-    const waiter = quarantineWaiters.get(message.requestId);
-    if (!waiter) throw new Error("Node browser worker received an unknown quarantine acknowledgement");
-    quarantineWaiters.delete(message.requestId);
-    assertChatGptTurnProgressSnapshot(message.snapshot);
-    if (message.snapshot.revision >= toolProgress.revision) toolProgress = { ...message.snapshot };
-    waiter.resolve(message.quarantined);
-    return;
-  }
-  if (message.type === "terminate_owner") {
-    if (!execution?.terminateOwner) throw new Error("Node browser worker cannot detach its owner");
-    ownerTerminating = true;
-    await execution.terminateOwner(message.reason);
-    write({ type: "owner_terminated" });
+  if (message.type === "detach_execution") {
+    if (!execution?.detachExecution) throw new Error("Node browser worker cannot detach its process-local execution");
+    executionDetaching = true;
+    await execution.detachExecution(message.reason);
+    write({ type: "execution_detached" });
     return;
   }
   if (message.type === "abort") {

@@ -26,12 +26,11 @@ export interface RebuildNodeBrowserDriverOptions {
 type WorkerMessage =
   | { type: "ready"; version: 1 }
   | { type: "lifecycle"; event: "send_activated" }
-  | { type: "lifecycle"; event: "accepted"; evidence: RebuildBrowserAcceptedEvidence }
+  | { type: "lifecycle"; event: "accepted" | "rebound"; evidence: RebuildBrowserAcceptedEvidence }
   | { type: "candidate"; evidence: RebuildBrowserFinalEvidence }
   | { type: "confirmed"; evidence: RebuildBrowserFinalEvidence }
   | { type: "boundary"; requestId: number; boundaryJson?: string; error?: string }
-  | { type: "quarantine_tool"; requestId: number; expectedRevision: number }
-  | { type: "owner_terminated" }
+  | { type: "execution_detached" }
   | { type: "error"; message: string };
 
 interface Deferred<T> {
@@ -83,7 +82,7 @@ export function createRebuildNodeBrowserDriver(
       const ready = deferred<void>();
       const runResult = deferred<RebuildBrowserFinalEvidence>();
       const confirmResult = deferred<RebuildBrowserFinalEvidence>();
-      const ownerTerminationResult = deferred<void>();
+      const executionDetachResult = deferred<void>();
       const boundaries = new Map<number, Deferred<string>>();
       let messageChain = Promise.resolve();
       let stderrTail = "";
@@ -94,7 +93,7 @@ export function createRebuildNodeBrowserDriver(
         ready.reject(error);
         runResult.reject(error);
         confirmResult.reject(error);
-        ownerTerminationResult.reject(error);
+        executionDetachResult.reject(error);
         for (const pending of boundaries.values()) pending.reject(error);
         boundaries.clear();
         if (toolTimer) clearInterval(toolTimer);
@@ -131,7 +130,11 @@ export function createRebuildNodeBrowserDriver(
       const handleLifecycle = async (message: Extract<WorkerMessage, { type: "lifecycle" }>) => {
         try {
           if (message.event === "send_activated") await input.lifecycle.onSendActivated();
-          else await input.lifecycle.onAccepted(message.evidence);
+          else if (message.event === "accepted") await input.lifecycle.onAccepted(message.evidence);
+          else {
+            if (!input.lifecycle.onRebound) throw new Error("Node browser rebind has no parent lifecycle handler");
+            await input.lifecycle.onRebound(message.evidence);
+          }
           await send({ type: "lifecycle_ack", event: message.event, ok: true });
         } catch (error) {
           // A parent durability refusal is already authoritative for this turn. Do not send a
@@ -178,25 +181,13 @@ export function createRebuildNodeBrowserDriver(
           pending.resolve(message.boundaryJson);
           return;
         }
-        if (message.type === "quarantine_tool") {
-          const quarantined = await input.gooseWork.quarantineStalledToolWork(message.expectedRevision);
-          const snapshot = input.gooseWork.snapshot();
-          latestToolProgressRevision = snapshot.revision;
-          await send({
-            type: "quarantine_tool_ack",
-            requestId: message.requestId,
-            quarantined,
-            snapshot,
-          });
-          return;
-        }
-        if (message.type === "owner_terminated") {
-          ownerTerminationResult.resolve();
+        if (message.type === "execution_detached") {
+          executionDetachResult.resolve();
           if (!terminal) {
             // The acknowledgement is the terminal fence. Settle parent promises here because
             // stopping the disposable child may race with its later diagnostic error frame.
             terminal = true;
-            const error = new Error("authoritative owner terminated Node browser worker");
+            const error = new Error("process-local browser execution detached");
             runResult.reject(error);
             confirmResult.reject(error);
             for (const pending of boundaries.values()) pending.reject(error);
@@ -253,6 +244,7 @@ export function createRebuildNodeBrowserDriver(
             submitNonce: input.submitNonce,
             prompt: input.prompt,
             existingConversationId: input.existingConversationId,
+            ...(input.resumeAccepted ? { resumeAccepted: input.resumeAccepted } : {}),
           },
         });
         const abort = () => { void send({ type: "abort" }).catch(() => {}); };
@@ -270,10 +262,10 @@ export function createRebuildNodeBrowserDriver(
       };
 
       return {
-        terminateOwner: async reason => {
-          if (!runStarted) throw new Error("Node browser owner termination requires an active run");
-          await send({ type: "terminate_owner", reason });
-          try { await ownerTerminationResult.promise; }
+        detachExecution: async reason => {
+          if (!runStarted) throw new Error("Node browser execution detach requires an active run");
+          await send({ type: "detach_execution", reason });
+          try { await executionDetachResult.promise; }
           finally { stopWorker(); }
         },
         run: async () => {

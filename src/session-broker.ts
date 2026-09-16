@@ -614,17 +614,17 @@ export class SessionBroker {
     return this.transaction(() => this.markUnreconciledInside(turnRef, reason));
   }
 
-  resumeVerifiedRemoteTurn(input: {
+  rebindVerifiedRemoteTurn(input: {
     turnRef: string;
     canonicalConversationId: string;
     acceptedUserTurnId: string;
-    remoteRunning: true;
+    remoteIdentityVerified: true;
   }): BrokerTurn {
-    if (input.remoteRunning !== true) this.fail("RECOVERY_EVIDENCE", "Recovery requires positive remote-running evidence");
+    if (input.remoteIdentityVerified !== true) this.fail("RECOVERY_EVIDENCE", "Rebind requires positive remote identity evidence");
     return this.transaction(() => {
       const turn = this.turnRowRequired(input.turnRef);
       if (turn.abandoned_at !== null || (turn.state !== "UNRECONCILED" && turn.state !== "TURN_OUTSTANDING")) {
-        this.fail("TURN_STATE", "Only an unreconciled or already-running remote turn may pass verified rebind");
+        this.fail("TURN_STATE", "Only an unreconciled or already-attached remote turn may pass verified rebind");
       }
       this.requireSlotHolder(input.turnRef);
       const epoch = this.epochRowRequired(turn.goose_session_id, turn.epoch);
@@ -698,44 +698,6 @@ export class SessionBroker {
     });
   }
 
-  abandonUnreconciled(turnRef: string): BrokerTurn {
-    return this.transaction(() => {
-      const turn = this.turnRowRequired(turnRef);
-      if (turn.abandoned_at !== null) return turnFromRow(turn);
-      if (turn.state !== "UNRECONCILED") {
-        this.fail("TURN_STATE", "Only an unreconciled conversation may be explicitly abandoned");
-      }
-      if (turn.slot_held !== 0) {
-        this.fail("ACCOUNT_SLOT", "Explicit abandonment requires prior positive-terminal account-slot release");
-      }
-      if (this.recordedSlotDemotionEvidence(turnRef) === null) {
-        this.fail("POSITIVE_TERMINAL_REQUIRED", "Explicit abandonment requires durable positive-terminal demotion evidence");
-      }
-      if (turn.final_digest) {
-        this.fail("FINAL_DIGEST_PRESENT", "A turn with accepted final content must use normal completion reconciliation");
-      }
-      if (turn.completion_claim_revision !== null) {
-        this.fail("COMPLETION_IN_FLIGHT", "Cannot abandon a conversation while a completion claim exists");
-      }
-      if (this.hasUnresolvedOperation(turnRef)) {
-        this.fail("UNRESOLVED_OPERATION", "Cannot abandon a conversation with claimed or uncertain operations");
-      }
-      const at = this.now();
-      const result = this.db.query(`UPDATE turns SET abandoned_at = ?, completion_claim_revision = NULL,
-        revision = revision + 1, updated_at = ?
-        WHERE turn_ref = ? AND state = 'UNRECONCILED' AND slot_held = 0 AND abandoned_at IS NULL`)
-        .run(at, at, turnRef);
-      if (result.changes !== 1) this.fail("TURN_STATE", "Explicit abandonment lost the quarantined turn state");
-      // Abandonment is the durable decision that this remote conversation will never be resumed.
-      // Retire the epoch in the same transaction so the next logical Goose turn must seed a fresh
-      // conversation rather than attempting to append to a launcher lease we intentionally ended.
-      const retired = this.db.query(`UPDATE remote_epochs SET is_current = 0, updated_at = ?
-        WHERE goose_session_id = ? AND epoch = ? AND is_current = 1`)
-        .run(at, turn.goose_session_id, turn.epoch);
-      if (retired.changes !== 1) this.fail("STALE_EPOCH", "Abandoned turn no longer owns the current remote epoch");
-      return this.getTurnRequired(turnRef);
-    });
-  }
 
   recordProgress(turnRef: string, checkpointJson?: string): BrokerTurn {
     return this.transaction(() => {
@@ -1077,6 +1039,26 @@ export class SessionBroker {
 
   getOperation(opRef: string): BrokerOperation | null {
     const row = this.operationRow(opRef);
+    return row ? operationFromRow(row) : null;
+  }
+
+  getInitialOperationForTurn(turnRef: string): BrokerOperation {
+    this.turnRowRequired(turnRef);
+    const row = this.db.query("SELECT * FROM operations WHERE turn_ref = ? ORDER BY seq ASC LIMIT 1")
+      .get(turnRef) as OperationRow | null;
+    if (!row) this.fail("UNKNOWN_OP_REF", "Turn has no operation journal");
+    return operationFromRow(row);
+  }
+
+  hasBlockingOperation(turnRef: string): boolean {
+    this.turnRowRequired(turnRef);
+    return this.hasUnresolvedOperation(turnRef);
+  }
+
+  getLatestTerminalOperationForTurn(turnRef: string): BrokerOperation | null {
+    this.turnRowRequired(turnRef);
+    const row = this.db.query(`SELECT * FROM operations WHERE turn_ref = ?
+      AND state IN ('SUCCESS', 'FAILURE') ORDER BY seq DESC LIMIT 1`).get(turnRef) as OperationRow | null;
     return row ? operationFromRow(row) : null;
   }
 
