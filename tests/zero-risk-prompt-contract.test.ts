@@ -30,7 +30,6 @@ test("Zero Risk prompt carries only a neutral request id while MCP metadata owns
   const compiled = compileChatGptWebPrompt(request(), capabilities, requestId, {
     manualControl: true,
   });
-  expect(compiled.multipart).toBeUndefined();
   expect(compiled.text).toContain("<codex_zero_risk_request_json>");
   expect(compiled.text).toContain(`\"request_id\":\"${requestId}\"`);
   expect(compiled.text).not.toContain("turn_token");
@@ -61,10 +60,6 @@ test("Zero Risk prompt fails closed without Full harness or an exact manual bind
   expect(() => compileChatGptWebPrompt(request(), capabilities, undefined, {
     manualControl: true,
   })).toThrow("requires a broker request id");
-  expect(() => compileChatGptWebPrompt(request(), capabilities, requestId, {
-    manualControl: true,
-    experimentalMultipartParts: 2,
-  })).toThrow("does not support rolling or multipart browser transport");
 });
 
 test("active Zero Risk compaction returns its checkpoint through the bound completion control", () => {

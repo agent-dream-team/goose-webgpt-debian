@@ -1274,41 +1274,6 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test("prompt preparation preserves its error instead of exposing a revoked MCP token", async () => {
-    const socketPath = brokerTestEndpoint(`cgw-prepare-error-${process.pid}-${Date.now()}`);
-    const provider: CodexProviderConfig = {
-      adapter: "chatgpt-web",
-      baseUrl: `browser://prepare-error-${Date.now()}`,
-      chatgptWeb: {
-        brokerSocketPath: socketPath,
-        localToolsEnabled: true,
-        experimentalBiggerContext: true,
-        solAvailable: false,
-        threadEnvironmentStatePath: join(tempRoot, "prepare-error-environment.json"),
-        lunaCheckpointStatePath: join(tempRoot, "prepare-error-checkpoint.json"),
-      },
-    };
-    const worker = ChatGptBrowserWorker.forProvider(provider);
-    const originalRun = worker.run.bind(worker);
-    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
-      await turn.prepare();
-      throw new Error("Invalid Luna multipart preparation unexpectedly succeeded");
-    };
-    try {
-      const request = rawWireRequest(environmentXml);
-      request.modelId = "gpt-5.6-luna";
-      request.options.reasoning = "low";
-      const events: AdapterEvent[] = [];
-      await expect(createChatGptWebAdapter(provider).runTurn!(
-        request, { headers: new Headers() }, event => events.push(event),
-      )).rejects.toThrow("Bigger Context is unavailable for Luna");
-      expect(events.some(event => event.type === "tool_call_start")).toBeFalse();
-    } finally {
-      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
-      await TurnBroker.forSocket(socketPath).close();
-    }
-  });
-
   test("a non-retryable browser failure remains replayable without starting another browser turn", async () => {
     const socketPath = brokerTestEndpoint(`cgw-h4-nonretryable-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {

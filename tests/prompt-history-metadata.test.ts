@@ -68,23 +68,3 @@ test("inline Web context preserves assistant phase and MCP namespace metadata", 
   expect(envelope.messages[2]?.phase).toBe("final_answer");
   expect(envelope.messages[3]).not.toHaveProperty("phase");
 });
-
-test("multipart Web context preserves the same history metadata", () => {
-  const compiled = compileChatGptWebPrompt(
-    parsed(),
-    capabilities,
-    turnToken,
-    { experimentalMultipartParts: 2 },
-  );
-  const records = compiled.multipart!.parts.flatMap(part => {
-    const decoded = JSON.parse(part) as { records: Array<Record<string, unknown>> };
-    return decoded.records;
-  });
-  const messages = records
-    .filter(record => record.kind === "message")
-    .map(record => record.message as Record<string, unknown>);
-  expect(messages[0]?.phase).toBe("commentary");
-  expect((messages[0]?.content as Array<Record<string, unknown>>)[1]?.namespace).toBe("mcp__inventory");
-  expect(messages[1]?.tool_namespace).toBe("mcp__inventory");
-  expect(messages[2]?.phase).toBe("final_answer");
-});

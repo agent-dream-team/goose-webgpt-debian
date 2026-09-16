@@ -97,7 +97,6 @@ export interface AppConfig {
   headed: boolean;
   solAvailable: boolean;
   proAvailable: boolean;
-  experimentalBiggerContext: boolean;
   /** Explicitly install the additional Pro-sized model row while Zero Risk is active. */
   zeroRiskProEnabled: boolean;
   /** Optional adapter-silence budget for the Responses watchdog. */
@@ -226,7 +225,6 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     headed: true,
     solAvailable: true,
     proAvailable: false,
-    experimentalBiggerContext: false,
     zeroRiskProEnabled: false,
     autoApproveToolCalls: false,
     controlToken: randomBytes(32).toString("base64url"),
@@ -539,10 +537,6 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (parsed.solAvailable !== undefined && typeof parsed.solAvailable !== "boolean") {
     throw new Error(`Invalid solAvailable in ${path}`);
   }
-  if (parsed.experimentalBiggerContext !== undefined
-    && typeof parsed.experimentalBiggerContext !== "boolean") {
-    throw new Error(`Invalid experimentalBiggerContext in ${path}`);
-  }
   if (parsed.zeroRiskProEnabled !== undefined && typeof parsed.zeroRiskProEnabled !== "boolean") {
     throw new Error(`Invalid zeroRiskProEnabled in ${path}`);
   }
@@ -550,13 +544,10 @@ function parseConfig(value: unknown, path: string): AppConfig {
     && (!Number.isFinite(parsed.stallTimeoutSec) || parsed.stallTimeoutSec <= 0)) {
     throw new Error(`Invalid stallTimeoutSec in ${path}`);
   }
+  delete (parsed as unknown as Record<string, unknown>).experimentalBiggerContext;
   const solAvailable = parsed.solAvailable !== false;
   const proAvailable = parsed.proAvailable === true;
-  const experimentalBiggerContext = parsed.experimentalBiggerContext === true;
   const zeroRiskProEnabled = parsed.zeroRiskProEnabled === true;
-  if (browserInteractionMode === "manual" && experimentalBiggerContext) {
-    throw new Error(`Zero Risk does not support Bigger Context in ${path}`);
-  }
   if (proAvailable && !solAvailable) {
     throw new Error(`Invalid ChatGPT account capabilities in ${path}: Pro requires Sol`);
   }
@@ -571,7 +562,6 @@ function parseConfig(value: unknown, path: string): AppConfig {
     subagentProtocol,
     solAvailable,
     proAvailable,
-    experimentalBiggerContext,
     zeroRiskProEnabled,
   } as AppConfig;
 }
@@ -625,7 +615,6 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       localToolsEnabled: config.mode === "full",
       solAvailable: manual ? false : config.solAvailable,
       proAvailable: manual ? false : config.proAvailable,
-      experimentalBiggerContext: manual ? false : config.experimentalBiggerContext,
       ...(config.stallTimeoutSec !== undefined ? { stallTimeoutSec: config.stallTimeoutSec } : {}),
       autoApproveToolCalls: manual ? false : config.autoApproveToolCalls,
     },

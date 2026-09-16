@@ -53,7 +53,6 @@ test("persistent rebuild service owns stable private state and supervisor health
     headed: true,
     solAvailable: true,
     proAvailable: false,
-    experimentalBiggerContext: false,
     zeroRiskProEnabled: false,
     autoApproveToolCalls: false,
     controlToken: "rebuild-service-control-token-0123456789abcdef",

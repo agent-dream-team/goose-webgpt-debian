@@ -29,7 +29,7 @@ import { createChatGptStructuredOutputValidator } from "./output-validation";
 import { chatGptWebTurnRetryPolicy } from "./retry-policy";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult, type TurnBrokerOwner } from "./turn-broker";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptInstructionLineage, chatGptThreadOwnershipKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnRoundKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
-import { estimateChatGptWebUsage, resolveBiggerContextMultipartParts } from "./usage";
+import { estimateChatGptWebUsage } from "./usage";
 import { ChatGptThreadEnvironmentStore } from "./thread-environment";
 import {
   ChatGptLunaCheckpointStore,
@@ -348,10 +348,6 @@ export function createChatGptWebAdapter(
   const zeroRiskManualControl = dependencies.zeroRiskManualControl ?? launcherZeroRiskManualControl;
   const structuredBroker = broker instanceof TurnBroker ? broker : undefined;
   const timeoutMs = provider.chatgptWeb?.turnTimeoutMs;
-  const experimentalBiggerContext = provider.chatgptWeb?.experimentalBiggerContext;
-  if (experimentalBiggerContext !== undefined && typeof experimentalBiggerContext !== "boolean") {
-    throw new Error("ChatGPT Bigger Context preference must be a boolean");
-  }
   const configuredCapabilities: ChatGptWebCapabilities = {
     localToolsEnabled: provider.chatgptWeb?.localToolsEnabled === true,
     solAvailable: provider.chatgptWeb?.solAvailable !== false,
@@ -427,18 +423,9 @@ export function createChatGptWebAdapter(
         await releaseLauncherRetainedConversation(retainedLauncherDescriptor, conversationKey);
       }
       : undefined;
-    const compileOptionsFor = (input: CodexParsedRequest) => {
-      if (manualRequest) return {};
-      const experimentalMultipartParts = experimentalBiggerContext
-        ? resolveBiggerContextMultipartParts(input, turnCapabilities)
-        : undefined;
-      return {
-        captureLunaCheckpoint,
-        ...(experimentalMultipartParts !== undefined
-          ? { experimentalMultipartParts }
-          : {}),
-      };
-    };
+    const compileOptionsFor = (_input: CodexParsedRequest) => (manualRequest
+      ? {}
+      : { captureLunaCheckpoint });
     if (captureLunaCheckpoint) {
       console.info(
         `[chatgpt-web] Luna rolling checkpoint applied=${checkpointInput.applied}${checkpointInput.reason ? ` reason=${checkpointInput.reason}` : ""}`,
@@ -500,9 +487,6 @@ export function createChatGptWebAdapter(
         hooks.onCompactionProgress?.();
       },
     };
-    const multipartProgressLifecycle = hooks.onCompactionProgress
-      ? { onMultipartStageAcknowledged: hooks.onCompactionProgress }
-      : {};
     if (manualRequest) {
       if (!environment) throw new Error("ChatGPT Zero Risk requires a trusted Codex environment");
       if (!retainedLauncherDescriptor) throw new Error("ChatGPT Zero Risk requires the Launcher browser host");
@@ -541,17 +525,6 @@ export function createChatGptWebAdapter(
               { manualControl: true },
             )
             : undefined;
-          for (const candidate of [compiled, resumeCompiled]) {
-            if (!candidate) continue;
-            if (candidate.multipart) {
-              throw new ChatGptWebAdapterError("ChatGPT Zero Risk does not support multipart browser transport", {
-                status: 409,
-                errorType: "invalid_request_error",
-                code: "manual_multipart_unsupported",
-                retryable: false,
-              });
-            }
-          }
           tokenSettled = true;
           token.resolve(activeToken);
           if (!parsed._compactionRequest) {
@@ -686,7 +659,6 @@ export function createChatGptWebAdapter(
         abortSignal: browserAbort.signal,
         ...(parsed._compactionRequest ? { compaction: true } : {}),
         ...submissionLifecycle,
-        ...multipartProgressLifecycle,
         onReasoningSummary: (text, continuation) => trace.push({ kind: "reasoning", text, ...(continuation ? { continuation: true } : {}) }),
         onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
         onTextDelta: delta => text.push(delta),
@@ -750,7 +722,6 @@ export function createChatGptWebAdapter(
       abortSignal: browserAbort.signal,
       ...(parsed._compactionRequest ? { compaction: true } : {}),
       ...submissionLifecycle,
-      ...multipartProgressLifecycle,
       onReasoningSummary: (text, continuation) => trace.push({ kind: "reasoning", text, ...(continuation ? { continuation: true } : {}) }),
       onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
       onTextDelta: delta => text.push(delta),
@@ -926,9 +897,8 @@ export function createChatGptWebAdapter(
                   const sourceConversationKey = chatGptConversationKey(parsed, executionNamespace);
                   const runFreshCompactionFallback = async (reason: string): Promise<string> => {
                     console.warn(`[chatgpt-web] retained compaction fallback=${reason}`);
-                    // The fallback is a new bounded phase. Each exact multipart acknowledgement
-                    // and the final accepted compact prompt re-arms the five-minute liveness budget;
-                    // transport time cannot consume the model-generation window.
+                    // The fallback is a new bounded phase. Accepted compaction progress re-arms
+                    // the five-minute liveness budget so transport time does not consume generation time.
                     armHandoffDeadline();
                     const fallbackRuntime = startRuntime(
                       parsed,
@@ -1098,7 +1068,7 @@ export function createChatGptWebAdapter(
             emit({ type: "text_delta", text: summary, phase: "final_answer" });
             emitBrowserCompletion(
               { type: "final", answer: summary },
-              estimateChatGptWebUsage(parsed, { answer: summary, reasoning: [] }, turnCapabilities, experimentalBiggerContext),
+              estimateChatGptWebUsage(parsed, { answer: summary, reasoning: [] }, turnCapabilities),
               emit,
             );
             chatGptWebTurnRetryPolicy.clear(retryKey);
@@ -1191,7 +1161,7 @@ export function createChatGptWebAdapter(
               session.setFinalEvents(session.roundEvents(roundKey));
               emitRoundBatch(buffer => emitBrowserCompletion(
                 settled,
-                estimateChatGptWebUsage(currentUsageInput(parsed), { answer: settled.answer, reasoning }, turnCapabilities, experimentalBiggerContext),
+                estimateChatGptWebUsage(currentUsageInput(parsed), { answer: settled.answer, reasoning }, turnCapabilities),
                 buffer,
               ));
               session.completeRound(roundKey);
@@ -1213,7 +1183,7 @@ export function createChatGptWebAdapter(
                   if (replay.length === 0) emitRoundEvents(session.eventsForOutstandingReplay());
                   emitRoundBatch(buffer => emitToolBatch(
                     outstanding,
-                    estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning, toolRequests: outstanding }, turnCapabilities, experimentalBiggerContext),
+                    estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning, toolRequests: outstanding }, turnCapabilities),
                     buffer,
                   ));
                   session.completeRound(roundKey);
@@ -1297,7 +1267,7 @@ export function createChatGptWebAdapter(
                 }
                 emitRoundBatch(buffer => emitBrowserCompletion(
                   completedOutcome,
-                  estimateChatGptWebUsage(currentUsageInput(parsed), { answer: completedOutcome.answer, reasoning: roundReasoning }, turnCapabilities, experimentalBiggerContext),
+                  estimateChatGptWebUsage(currentUsageInput(parsed), { answer: completedOutcome.answer, reasoning: roundReasoning }, turnCapabilities),
                   buffer,
                 ));
                 session.completeRound(roundKey);
@@ -1355,7 +1325,7 @@ export function createChatGptWebAdapter(
                 session.setOutstanding(next.requests, roundReasoning, session.roundEvents(roundKey));
                 emitRoundBatch(buffer => emitToolBatch(
                   next.requests,
-                  estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning: roundReasoning, toolRequests: next.requests }, turnCapabilities, experimentalBiggerContext),
+                  estimateChatGptWebUsage(currentUsageInput(parsed), { reasoning: roundReasoning, toolRequests: next.requests }, turnCapabilities),
                   buffer,
                 ));
                 session.completeRound(roundKey);

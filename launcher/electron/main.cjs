@@ -676,7 +676,6 @@ function registerIpc({ logger, stateStore }) {
       mcpGuideStep: 0,
       codexRestartRequired: true,
       browserInteractionMode: "automatic",
-      experimentalBiggerContext: false,
       zeroRiskProEnabled: false,
     });
     send("launcher:state-changed", state);
@@ -751,7 +750,6 @@ function registerIpc({ logger, stateStore }) {
       : await runSetup();
     const state = stateStore.update({
       browserInteractionMode: interactionMode,
-      ...(interactionMode === "manual" ? { experimentalBiggerContext: false } : {}),
       zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
       coreSetupComplete: true,
       codexCatalogVerified: IS_DEV_PROFILE,
@@ -778,18 +776,6 @@ function registerIpc({ logger, stateStore }) {
       state: stateStore.update({ autoStart: desired }),
       ...autostart,
     };
-  });
-  handle("launcher:bigger-context", async (_event, enabled) => {
-    requireLegacyCodexAction("Codex Bigger Context setup");
-    const result = await runtimeHost.setBiggerContext(enabled === true);
-    const state = stateStore.update({
-      experimentalBiggerContext: result.enabled,
-      codexCatalogVerified: IS_DEV_PROFILE ? true : false,
-      codexRestartRequired: IS_DEV_PROFILE ? false : true,
-    });
-    send("launcher:state-changed", state);
-    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
-    return state;
   });
   handle("launcher:zero-risk-pro", async (_event, enabled) => {
     requireLegacyCodexAction("Zero Risk setup");
@@ -821,8 +807,7 @@ function registerIpc({ logger, stateStore }) {
         ? current
         : stateStore.update({
             browserInteractionMode: "automatic",
-            experimentalBiggerContext: false,
-            zeroRiskProEnabled: false,
+                  zeroRiskProEnabled: false,
           });
       if (state !== current) send("launcher:state-changed", state);
       return { state, credentialsRequired: false, targetMode: "automatic" };
@@ -849,7 +834,6 @@ function registerIpc({ logger, stateStore }) {
     );
     const state = stateStore.update({
       browserInteractionMode: mode,
-      ...(mode === "manual" ? { experimentalBiggerContext: false } : {}),
       ...(result.configured ? {
         codexCatalogVerified: IS_DEV_PROFILE,
         codexRestartRequired: !IS_DEV_PROFILE,
@@ -1147,7 +1131,6 @@ async function start() {
       ...(config?.mode !== "full" ? { mcpSetupComplete: false, mcpGuideStep: 0 } : {}),
       codexRestartRequired: false,
       autoStart: false,
-      experimentalBiggerContext: config?.experimentalBiggerContext === true,
       zeroRiskProEnabled: config?.zeroRiskProEnabled === true,
     });
     send("launcher:state-changed", state);
@@ -1175,7 +1158,6 @@ async function start() {
         coreSetupComplete: true,
         codexCatalogVerified: false,
         codexRestartRequired: true,
-        experimentalBiggerContext: runtimeHost.runtimeConfigSnapshot().config?.experimentalBiggerContext === true,
         zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
         ...(upgrade.mode === "full" ? {
           mcpRuntimeInstalled: true,
@@ -1197,12 +1179,10 @@ async function start() {
     }
     const configuredRuntime = runtimeHost.runtimeConfigSnapshot();
     if (configuredRuntime.configured) {
-      const enabled = configuredRuntime.config?.experimentalBiggerContext === true;
       const zeroRiskProEnabled = configuredRuntime.config?.zeroRiskProEnabled === true;
       const saved = stateStore.read();
-      if (saved.experimentalBiggerContext !== enabled
-        || saved.zeroRiskProEnabled !== zeroRiskProEnabled) {
-        const state = stateStore.update({ experimentalBiggerContext: enabled, zeroRiskProEnabled });
+      if (saved.zeroRiskProEnabled !== zeroRiskProEnabled) {
+        const state = stateStore.update({ zeroRiskProEnabled });
         send("launcher:state-changed", state);
       }
     }
@@ -1221,7 +1201,6 @@ async function start() {
       const patch = {
         coreSetupComplete: true,
         mcpRuntimeInstalled: config.mode === "full",
-        experimentalBiggerContext: config.experimentalBiggerContext === true,
         zeroRiskProEnabled: config.zeroRiskProEnabled === true,
         ...(runtime.bridgeRouteChanged ? {
           codexCatalogVerified: false,

@@ -115,7 +115,7 @@ test("setup browser-interaction flags are explicit and mutually exclusive", asyn
   }
 });
 
-test("manual setup rejects capability refresh and Bigger Context", async () => {
+test("manual setup rejects capability refresh and removed Bigger Context flags", async () => {
   const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-manual-invalid-"));
   try {
     const env = {
@@ -141,7 +141,7 @@ test("manual setup rejects capability refresh and Bigger Context", async () => {
       "--acknowledge-unofficial",
     ], env);
     expect(bigger.exitCode).toBe(1);
-    expect(bigger.stderr).toContain("does not support Bigger Context");
+    expect(bigger.stderr).toContain("Unknown arguments: --bigger-context");
 
     const browserOnly = await runCli([
       "setup",

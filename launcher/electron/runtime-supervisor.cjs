@@ -291,10 +291,6 @@ function validateConfig(config, descriptorPath, platform = process.platform, lau
       throw new Error(`Runtime configuration has an invalid ${key}`);
     }
   }
-  if (config.experimentalBiggerContext !== undefined
-    && typeof config.experimentalBiggerContext !== "boolean") {
-    throw new Error("Runtime configuration has an invalid experimentalBiggerContext");
-  }
   if (config.stallTimeoutSec !== undefined
     && (!Number.isFinite(config.stallTimeoutSec) || config.stallTimeoutSec <= 0)) {
     throw new Error("Runtime configuration has an invalid stallTimeoutSec");

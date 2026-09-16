@@ -25,7 +25,6 @@ test("launcher state persists onboarding, language, and autostart atomically", (
       keepRunningOnClose: true,
       showBrowserDuringTurns: true,
       browserInteractionMode: "automatic",
-      experimentalBiggerContext: false,
       zeroRiskProEnabled: false,
       browserSmokePassed: false,
       browserSmokeVersion: null,
@@ -51,7 +50,6 @@ test("launcher state persists onboarding, language, and autostart atomically", (
       keepRunningOnClose: false,
       showBrowserDuringTurns: true,
       browserInteractionMode: "automatic",
-      experimentalBiggerContext: false,
       zeroRiskProEnabled: false,
       browserSmokePassed: true,
       browserSmokeVersion: "0.2.0",
@@ -98,6 +96,7 @@ test("persisted sidebar corruption is repaired without changing the rest of laun
       onboardingComplete: "yes",
       autoStart: "yes",
       bridgeEnabled: false,
+      experimentalBiggerContext: true,
       browserSmokePassed: "yes",
       browserSmokeVersion: { invalid: true },
       sidebarOpen: "yes",
@@ -116,7 +115,6 @@ test("persisted sidebar corruption is repaired without changing the rest of laun
       keepRunningOnClose: true,
       showBrowserDuringTurns: true,
       browserInteractionMode: "automatic",
-      experimentalBiggerContext: false,
       zeroRiskProEnabled: false,
       browserSmokePassed: false,
       browserSmokeVersion: null,
@@ -125,6 +123,7 @@ test("persisted sidebar corruption is repaired without changing the rest of laun
       mcpGuideStep: 0,
       sessionRefreshReminderAt: null,
     });
+    assert.equal(Object.hasOwn(createStateStore(file).read(), "experimentalBiggerContext"), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

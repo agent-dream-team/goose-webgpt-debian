@@ -6,7 +6,7 @@ import { ChatGptBrowserWorker } from "../src/adapters/chatgpt-web/browser-worker
 import { resolveChatGptWebModelMode } from "../src/adapters/chatgpt-web/model";
 import { ChatGptExternalTurnProgress } from "../src/adapters/chatgpt-web/turn-progress";
 
-test.each([[true, false, true], [false, false, true], [true, true, true], [true, false, false]])("browser turns preserve recovery, ordering and final-only tools (owned=%s, tools=%s, multipart=%s)", async (owned, tools, multipart) => {
+test.each([[true, false], [false, false], [true, true]])("browser turns preserve recovery, ordering and final-only tools (owned=%s, tools=%s)", async (owned, tools) => {
   const diagnostics = mkdtempSync(join(tmpdir(), "compaction-observation-"));
   const finalResponse = new Error("fixture reached final response observation");
   const capabilities = { localToolsEnabled: tools, solAvailable: true, proAvailable: true };
@@ -40,21 +40,18 @@ test.each([[true, false, true], [false, false, true], [true, true, true], [true,
     },
     attachFiles: async () => { actions.push("files"); },
     sendAttachedPrompt: async (...args: unknown[]) => {
-      // Context ingestion cannot mistake tool activity for acknowledgement of a part.
-      expect(args[4]).toBe(stage === "send" ? progress : undefined);
-      if (stage !== "send") expect(args[5]).toBeUndefined();
+      expect(args[4]).toBe(progress);
       recoveryCallbacks.push(args[7]);
       actions.push("send");
       return "user_turn";
     },
     waitForNewAssistantTurn: async (...args: unknown[]) => {
-      expect(args[4]).toBe(stage === "send" ? progress : undefined);
+      expect(args[4]).toBe(progress);
       recoveryCallbacks.push(args[7]);
       actions.push("observe");
       if (stage === "send") throw finalResponse;
       return {};
     },
-    waitForMultipartAcknowledgement: async () => { actions.push("ack"); },
   });
   try {
     await expect(worker.runBrowserTurn({
@@ -68,21 +65,16 @@ test.each([[true, false, true], [false, false, true], [true, true, true], [true,
         begin: async () => { throw new Error("fixture must stop before completion"); },
         commit: async () => { throw new Error("fixture must stop before completion"); },
       } : undefined,
-      prepare: async () => ({ text: "Summarize the context", images: [], multipart: multipart ? { parts: ['{"part":1}', '{"part":2}', '{"part":3}'], commit: "Summarize" } : undefined, release: () => { released = true; } }),
+      prepare: async () => ({ text: "Summarize the context", images: [], release: () => { released = true; } }),
     }, owned ? "owned-surface" : undefined, page)).rejects.toBe(finalResponse);
     expect(recoveryCallbacks.map(callback => typeof callback)).toEqual(
-      Array(multipart ? 6 : 2).fill(owned ? "function" : "undefined"),
+      Array(2).fill(owned ? "function" : "undefined"),
     );
     expect(actions).toEqual([
-      ...(multipart ? [
-        "effort:low",
-        "attach:plain", "send", "observe", "ack",
-        "attach:plain", "send", "observe", "ack",
-      ] : []),
       "effort:high",
       tools ? "attach:tools" : "attach:plain", "files", "send", "observe",
     ]);
-    expect(sendBudgets).toEqual(multipart ? [180_000, 180_000, 180_000] : [20_000]);
+    expect(sendBudgets).toEqual([20_000]);
     expect(released).toBe(true);
   } finally {
     rmSync(diagnostics, { recursive: true, force: true });
