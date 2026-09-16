@@ -1501,3 +1501,228 @@ test("invalid browser acceptance identity cannot partially bind durable remote i
   expect(runtime.broker.getCurrentEpoch("goose-invalid-browser-identity")?.conversationId).toBeNull();
   expect(runtime.broker.getAccountSlotHolder()).toBe(turn?.turnRef ?? null);
 });
+
+test("positive-terminal recovery releases scarce capacity without abandoning the persistent pair", async () => {
+  const driver: RebuildPersistentBrowserDriver = {
+    createTurn() { throw new Error("slot-release recovery must not create browser work"); },
+  };
+  const { runtime } = setup(driver);
+  const sessionId = "goose-slot-release";
+  const body = requestBody("slot-release");
+  const checkpoint = gooseResponsesProjectionCheckpoint(body);
+  runtime.broker.createEpoch({ gooseSessionId: sessionId });
+  const turn = runtime.broker.enqueueTurn({
+    gooseSessionId: sessionId,
+    requestHash: checkpoint.requestHash,
+    checkpointJson: encodeGooseResponsesProjectionCheckpoint(checkpoint),
+  });
+  runtime.broker.admitNext(turn.turnRef);
+  runtime.broker.markSendActivated(turn.turnRef);
+  runtime.broker.markUnreconciled(turn.turnRef, "browser_lost_before_identity_capture");
+
+  const conversationId = "aaaaaaaa-bbbb-4ccc-8ddd-000000000901";
+  const response = await fetch(`${runtime.origin}/admin/release-unreconciled-slot`, {
+    method: "POST",
+    headers: { authorization: "Bearer control-token", "content-type": "application/json" },
+    body: JSON.stringify({
+      turn_ref: turn.turnRef,
+      positive_terminal_evidence: {
+        canonical_conversation_id: conversationId,
+        accepted_user_turn_id: "user-slot-release",
+        remote_ui_non_running_across_qualified_settle: true,
+        no_unresolved_goose_work: true,
+        no_contradictory_activity: true,
+      },
+    }),
+  });
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({
+    status: "ok",
+    turn_ref: turn.turnRef,
+    turn_state: "UNRECONCILED",
+    pair_retained: true,
+    account_slot_holders: [],
+  });
+  expect(runtime.broker.getTurn(turn.turnRef)).toMatchObject({
+    state: "UNRECONCILED", acceptedUserTurnId: "user-slot-release",
+  });
+  expect(runtime.broker.getCurrentEpoch(sessionId)).toMatchObject({
+    epoch: 1,
+    conversationId,
+    leaseState: "UNRECONCILED",
+    leaseTurnRef: turn.turnRef,
+    isCurrent: true,
+  });
+  expect(runtime.broker.getAccountSlotHolder()).toBeNull();
+
+  const legacyAbandon = await fetch(`${runtime.origin}/admin/abandon-unreconciled`, {
+    method: "POST",
+    headers: { authorization: "Bearer control-token", "content-type": "application/json" },
+    body: JSON.stringify({ turn_ref: turn.turnRef }),
+  });
+  expect(legacyAbandon.status).toBe(404);
+});
+
+test("exact replay reacquires a quarantined slot and rebinds the same pair without resending", async () => {
+  const conversationId = "aaaaaaaa-bbbb-4ccc-8ddd-000000000902";
+  const sessionId = "goose-slot-rebind";
+  let starts = 0;
+  const driver: RebuildPersistentBrowserDriver = {
+    createTurn(input) {
+      starts += 1;
+      expect(input.prompt).toBe("");
+      expect(input.existingConversationId).toBe(conversationId);
+      expect(input.resumeAccepted).toEqual({
+        canonicalConversationId: conversationId,
+        acceptedUserTurnId: "user-slot-rebind",
+      });
+      return {
+        captureAnswerBoundary: async () => { throw new Error("no tool expected"); },
+        confirmFinal: async evidence => evidence,
+        run: async () => {
+          await input.lifecycle.onRebound?.({
+            canonicalConversationId: conversationId,
+            acceptedUserTurnId: "user-slot-rebind",
+          });
+          return {
+            canonicalConversationId: conversationId,
+            acceptedUserTurnId: "user-slot-rebind",
+            text: "slot-rebind-final",
+            remoteNonRunning: true,
+          };
+        },
+      };
+    },
+  };
+  const { runtime } = setup(driver);
+  const body = requestBody("slot-rebind");
+  const checkpoint = gooseResponsesProjectionCheckpoint(body);
+  runtime.broker.createEpoch({ gooseSessionId: sessionId });
+  const turn = runtime.broker.enqueueTurn({
+    gooseSessionId: sessionId,
+    requestHash: checkpoint.requestHash,
+    checkpointJson: encodeGooseResponsesProjectionCheckpoint(checkpoint),
+  });
+  runtime.broker.admitNext(turn.turnRef);
+  runtime.broker.markSendActivated(turn.turnRef);
+  runtime.broker.markUnreconciled(turn.turnRef, "qualified_terminal_slot_quarantine");
+  runtime.broker.releaseSlotAfterPositiveTerminal(turn.turnRef, {
+    canonicalConversationId: conversationId,
+    acceptedUserTurnId: "user-slot-rebind",
+    remoteUiNonRunningAcrossQualifiedSettle: true,
+    noUnresolvedGooseWork: true,
+    noContradictoryActivity: true,
+  });
+  expect(runtime.broker.getAccountSlotHolder()).toBeNull();
+
+  const response = await post(runtime, body, sessionId);
+  expect(response.status).toBe(200);
+  expect(await response.text()).toContain("slot-rebind-final");
+  expect(starts).toBe(1);
+  expect(runtime.broker.getTurn(turn.turnRef)?.state).toBe("COMPLETE");
+  expect(runtime.broker.getCurrentEpoch(sessionId)).toMatchObject({
+    epoch: 1, conversationId, leaseState: "IDLE", isCurrent: true,
+  });
+  expect(runtime.broker.getAccountSlotHolder()).toBeNull();
+});
+
+test("failed pre-rebound attachment restores quarantined capacity for a later exact replay", async () => {
+  const conversationId = "aaaaaaaa-bbbb-4ccc-8ddd-000000000903";
+  const sessionId = "goose-slot-rebind-failure";
+  const driver: RebuildPersistentBrowserDriver = {
+    createTurn(input) {
+      expect(input.prompt).toBe("");
+      return {
+        captureAnswerBoundary: async () => { throw new Error("no tool expected"); },
+        confirmFinal: async evidence => evidence,
+        run: async () => { throw new Error("synthetic rebind attachment failure before identity verification"); },
+      };
+    },
+  };
+  const { runtime } = setup(driver);
+  const body = requestBody("slot-rebind-failure");
+  const checkpoint = gooseResponsesProjectionCheckpoint(body);
+  runtime.broker.createEpoch({ gooseSessionId: sessionId });
+  const turn = runtime.broker.enqueueTurn({
+    gooseSessionId: sessionId,
+    requestHash: checkpoint.requestHash,
+    checkpointJson: encodeGooseResponsesProjectionCheckpoint(checkpoint),
+  });
+  runtime.broker.admitNext(turn.turnRef);
+  runtime.broker.markSendActivated(turn.turnRef);
+  runtime.broker.markUnreconciled(turn.turnRef, "qualified_terminal_slot_quarantine");
+  runtime.broker.releaseSlotAfterPositiveTerminal(turn.turnRef, {
+    canonicalConversationId: conversationId,
+    acceptedUserTurnId: "user-slot-rebind-failure",
+    remoteUiNonRunningAcrossQualifiedSettle: true,
+    noUnresolvedGooseWork: true,
+    noContradictoryActivity: true,
+  });
+
+  const response = await post(runtime, body, sessionId);
+  expect(response.status).toBe(502);
+  expect(runtime.broker.getTurn(turn.turnRef)).toMatchObject({
+    state: "UNRECONCILED", acceptedUserTurnId: "user-slot-rebind-failure",
+  });
+  expect(runtime.broker.getAccountSlotHolder()).toBeNull();
+  expect(runtime.broker.hasRecordedPositiveTerminalSlotRelease(turn.turnRef)).toBeTrue();
+  expect(runtime.broker.getCurrentEpoch(sessionId)).toMatchObject({
+    epoch: 1, conversationId, leaseState: "UNRECONCILED", leaseTurnRef: turn.turnRef,
+  });
+});
+
+test("successful slot-quarantine rebind consumes terminal evidence before later attachment loss", async () => {
+  const conversationId = "aaaaaaaa-bbbb-4ccc-8ddd-000000000904";
+  const sessionId = "goose-slot-evidence-consumed";
+  let starts = 0;
+  const driver: RebuildPersistentBrowserDriver = {
+    createTurn(input) {
+      starts += 1;
+      const ordinal = starts;
+      if (ordinal === 2) throw new Error("synthetic later rebind construction failure");
+      return {
+        captureAnswerBoundary: async () => { throw new Error("no tool expected"); },
+        confirmFinal: async evidence => evidence,
+        run: async () => {
+          await input.lifecycle.onRebound?.({
+            canonicalConversationId: conversationId,
+            acceptedUserTurnId: "user-slot-evidence-consumed",
+          });
+          throw new Error("synthetic post-rebound attachment failure");
+        },
+      };
+    },
+  };
+  const { runtime } = setup(driver);
+  const body = requestBody("slot-evidence-consumed");
+  const checkpoint = gooseResponsesProjectionCheckpoint(body);
+  runtime.broker.createEpoch({ gooseSessionId: sessionId });
+  const turn = runtime.broker.enqueueTurn({
+    gooseSessionId: sessionId,
+    requestHash: checkpoint.requestHash,
+    checkpointJson: encodeGooseResponsesProjectionCheckpoint(checkpoint),
+  });
+  runtime.broker.admitNext(turn.turnRef);
+  runtime.broker.markSendActivated(turn.turnRef);
+  runtime.broker.markUnreconciled(turn.turnRef, "qualified_terminal_slot_quarantine");
+  runtime.broker.releaseSlotAfterPositiveTerminal(turn.turnRef, {
+    canonicalConversationId: conversationId,
+    acceptedUserTurnId: "user-slot-evidence-consumed",
+    remoteUiNonRunningAcrossQualifiedSettle: true,
+    noUnresolvedGooseWork: true,
+    noContradictoryActivity: true,
+  });
+
+  const first = await post(runtime, body, sessionId);
+  expect(first.status).toBe(502);
+  expect(runtime.broker.getTurn(turn.turnRef)?.state).toBe("UNRECONCILED");
+  expect(runtime.broker.getAccountSlotHolder()).toBe(turn.turnRef);
+  expect(runtime.broker.hasRecordedPositiveTerminalSlotRelease(turn.turnRef)).toBeFalse();
+
+  const second = await post(runtime, body, sessionId);
+  expect(second.status).toBe(502);
+  expect(starts).toBe(2);
+  expect(runtime.broker.getTurn(turn.turnRef)?.state).toBe("UNRECONCILED");
+  expect(runtime.broker.getAccountSlotHolder()).toBe(turn.turnRef);
+  expect(runtime.broker.hasRecordedPositiveTerminalSlotRelease(turn.turnRef)).toBeFalse();
+});

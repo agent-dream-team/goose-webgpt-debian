@@ -1891,3 +1891,127 @@ test("serial tool work is never pre-rejected by a local conversation-growth budg
     broker.close();
   }
 });
+
+test("positive-terminal slot quarantine can reacquire capacity and rebind the same persistent pair", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    broker.admitNext();
+    accept(broker);
+    bindConversation(broker);
+    broker.markUnreconciled("turn-a", "qualified_terminal_slot_quarantine");
+
+    broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
+    expect(broker.getAccountSlotHolder()).toBeNull();
+    expect(broker.getCurrentEpoch("goose-a")).toMatchObject({
+      epoch: 1,
+      conversationId: "conversation-a",
+      leaseState: "UNRECONCILED",
+      leaseTurnRef: "turn-a",
+    });
+
+    const reacquired = broker.reacquireReleasedSlotForRebind("turn-a");
+    expect(reacquired).toMatchObject({
+      turnRef: "turn-a",
+      state: "UNRECONCILED",
+      acceptedUserTurnId: "user-turn-a",
+    });
+    expect(broker.getAccountSlotHolder()).toBe("turn-a");
+    expect(broker.rebindVerifiedRemoteTurn({
+      turnRef: "turn-a",
+      canonicalConversationId: "conversation-a",
+      acceptedUserTurnId: "user-turn-a",
+      remoteIdentityVerified: true,
+    }).state).toBe("TURN_OUTSTANDING");
+    expect(broker.hasRecordedPositiveTerminalSlotRelease("turn-a")).toBeFalse();
+    expect(broker.getCurrentEpoch("goose-a")).toMatchObject({
+      epoch: 1,
+      conversationId: "conversation-a",
+      leaseState: "TURN_OUTSTANDING",
+      leaseTurnRef: "turn-a",
+    });
+  } finally {
+    broker.close();
+  }
+});
+
+test("failed pre-rebind attachment can restore the prior positive-terminal slot release", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    broker.admitNext();
+    accept(broker);
+    bindConversation(broker);
+    broker.markUnreconciled("turn-a", "qualified_terminal_slot_quarantine");
+    broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
+
+    expect(broker.reacquireReleasedSlotForRebind("turn-a")?.state).toBe("UNRECONCILED");
+    expect(broker.getAccountSlotHolder()).toBe("turn-a");
+    const restored = broker.restorePositiveTerminalSlotRelease("turn-a");
+    expect(restored).toMatchObject({ state: "UNRECONCILED", acceptedUserTurnId: "user-turn-a" });
+    expect(broker.getAccountSlotHolder()).toBeNull();
+    expect(broker.hasRecordedPositiveTerminalSlotRelease("turn-a")).toBeTrue();
+  } finally {
+    broker.close();
+  }
+});
+
+test("slot-quarantined pair waits when both bounded account slots are occupied", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker, "goose-a");
+    createSession(broker, "goose-b");
+    createSession(broker, "goose-c");
+    enqueue(broker, "goose-a", "turn-a", "req-a");
+    broker.admitNext("turn-a");
+    accept(broker, "turn-a");
+    bindConversation(broker, "goose-a", "conversation-a");
+    broker.markUnreconciled("turn-a", "qualified_terminal_slot_quarantine");
+    broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
+
+    enqueue(broker, "goose-b", "turn-b", "req-b");
+    enqueue(broker, "goose-c", "turn-c", "req-c");
+    expect(broker.admitNext("turn-b")?.turn.turnRef).toBe("turn-b");
+    expect(broker.admitNext("turn-c")?.turn.turnRef).toBe("turn-c");
+    expect(broker.reacquireReleasedSlotForRebind("turn-a")).toBeNull();
+    expect(broker.getCurrentEpoch("goose-a")).toMatchObject({
+      conversationId: "conversation-a", leaseState: "UNRECONCILED", leaseTurnRef: "turn-a",
+    });
+  } finally {
+    broker.close();
+  }
+});
+
+test("positive-terminal slot quarantine survives broker restart and remains rebindable", () => {
+  const { broker, path } = fixture();
+  createSession(broker);
+  enqueue(broker);
+  broker.admitNext();
+  accept(broker);
+  bindConversation(broker);
+  broker.markUnreconciled("turn-a", "qualified_terminal_slot_quarantine");
+  broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
+  broker.close();
+
+  const restarted = open(path, "broker-b");
+  try {
+    expect(restarted.getTurn("turn-a")).toMatchObject({
+      state: "UNRECONCILED", acceptedUserTurnId: "user-turn-a",
+    });
+    expect(restarted.getCurrentEpoch("goose-a")).toMatchObject({
+      epoch: 1,
+      conversationId: "conversation-a",
+      leaseState: "UNRECONCILED",
+      leaseTurnRef: "turn-a",
+      isCurrent: true,
+    });
+    expect(restarted.getAccountSlotHolder()).toBeNull();
+    expect(restarted.hasRecordedPositiveTerminalSlotRelease("turn-a")).toBeTrue();
+    expect(restarted.reacquireReleasedSlotForRebind("turn-a")?.state).toBe("UNRECONCILED");
+    expect(restarted.getAccountSlotHolder()).toBe("turn-a");
+  } finally {
+    restarted.close();
+  }
+});

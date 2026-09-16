@@ -547,42 +547,53 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     const initialOperation = broker.getInitialOperationForTurn(turn.turnRef);
     const latestTerminal = broker.getLatestTerminalOperationForTurn(turn.turnRef);
     const preSendAbort = new AbortController();
+    const restoreSlotOnPreReboundFailure = broker.hasRecordedPositiveTerminalSlotRelease(turn.turnRef);
+    let reboundVerified = false;
     let active!: ActiveExecution;
-    const browser = options.browserDriver.createTurn({
-      turnRef: turn.turnRef,
-      gooseSessionId: turn.gooseSessionId,
-      epoch: turn.epoch,
-      initialOpRef: initialOperation.opRef,
-      submitNonce: turn.submitNonce,
-      prompt: "",
-      existingConversationId: epoch.conversationId,
-      resumeAccepted: {
-        canonicalConversationId: epoch.conversationId,
-        acceptedUserTurnId: turn.acceptedUserTurnId,
-      },
-      preSendAbortSignal: preSendAbort.signal,
-      gooseWork: { snapshot: () => toolProgressSnapshot(turn.turnRef) },
-      lifecycle: {
-        onSendActivated: () => {
-          throw new Error("Persistent pair rebind must never resend the original Goose prompt");
+    let browser: RebuildPersistentBrowserTurnExecution;
+    try {
+      browser = options.browserDriver.createTurn({
+        turnRef: turn.turnRef,
+        gooseSessionId: turn.gooseSessionId,
+        epoch: turn.epoch,
+        initialOpRef: initialOperation.opRef,
+        submitNonce: turn.submitNonce,
+        prompt: "",
+        existingConversationId: epoch.conversationId,
+        resumeAccepted: {
+          canonicalConversationId: epoch.conversationId,
+          acceptedUserTurnId: turn.acceptedUserTurnId,
         },
-        onAccepted: () => {
-          throw new Error("Persistent pair rebind must never create a replacement ChatGPT user turn");
+        preSendAbortSignal: preSendAbort.signal,
+        gooseWork: { snapshot: () => toolProgressSnapshot(turn.turnRef) },
+        lifecycle: {
+          onSendActivated: () => {
+            throw new Error("Persistent pair rebind must never resend the original Goose prompt");
+          },
+          onAccepted: () => {
+            throw new Error("Persistent pair rebind must never create a replacement ChatGPT user turn");
+          },
+          onRebound: evidence => {
+            const conversationId = normalizeCanonicalChatGptConversationId(evidence.canonicalConversationId);
+            const acceptedUserTurnId = validatePersistentChatTurnIdentity(
+              evidence.acceptedUserTurnId, "reattached accepted user turn",
+            );
+            broker.rebindVerifiedRemoteTurn({
+              turnRef: turn.turnRef,
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId,
+              remoteIdentityVerified: true,
+            });
+            reboundVerified = true;
+          },
         },
-        onRebound: evidence => {
-          const conversationId = normalizeCanonicalChatGptConversationId(evidence.canonicalConversationId);
-          const acceptedUserTurnId = validatePersistentChatTurnIdentity(
-            evidence.acceptedUserTurnId, "reattached accepted user turn",
-          );
-          broker.rebindVerifiedRemoteTurn({
-            turnRef: turn.turnRef,
-            canonicalConversationId: conversationId,
-            acceptedUserTurnId,
-            remoteIdentityVerified: true,
-          });
-        },
-      },
-    });
+      });
+    } catch (error) {
+      if (restoreSlotOnPreReboundFailure) {
+        try { broker.restorePositiveTerminalSlotRelease(turn.turnRef); } catch {}
+      }
+      throw error;
+    }
     active = {
       turnRef: turn.turnRef,
       browser,
@@ -600,6 +611,9 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         const current = broker.getTurn(turn.turnRef);
         if (current?.state === "TURN_OUTSTANDING") {
           try { broker.markUnreconciled(turn.turnRef, "persistent_pair_rebind_failed"); } catch {}
+        }
+        if (restoreSlotOnPreReboundFailure && !reboundVerified) {
+          try { broker.restorePositiveTerminalSlotRelease(turn.turnRef); } catch {}
         }
         try { await detachBrowserExecution(active, "runtime_attachment_failed"); } catch {}
         if (executions.get(turn.turnRef) === active) executions.delete(turn.turnRef);
@@ -626,6 +640,21 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       // slot; this waiter never executes that other turn and simply waits for its own turn.
       const admitted = broker.admitNext(turnRef);
       if (admitted?.turn.turnRef === turnRef) return admitted;
+      await sleep(POLL_MS, signal);
+    }
+  };
+
+  const waitForRebindAdmission = async (turnRef: string, signal: AbortSignal): Promise<BrokerTurn> => {
+    for (;;) {
+      if (signal.aborted) throw abortError();
+      const turn = broker.getTurn(turnRef);
+      if (!turn) throw new Error("Unreconciled broker turn disappeared before pair rebind");
+      if (turn.state !== "UNRECONCILED") {
+        throw new Error(`Broker turn left unreconciled recovery unexpectedly (${turn.state})`);
+      }
+      if (broker.getAccountSlotHolders().some(holder => holder.turnRef === turnRef)) return turn;
+      const reacquired = broker.reacquireReleasedSlotForRebind(turnRef);
+      if (reacquired) return reacquired;
       await sleep(POLL_MS, signal);
     }
   };
@@ -697,8 +726,10 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         return jsonError(409, "rebind_blocked", "Persistent pair rebind requires unresolved Goose tool/result state to be reconciled first");
       }
       let active: ActiveExecution;
-      try { active = startRebindExecution(turn); }
-      catch (error) {
+      try {
+        turn = await waitForRebindAdmission(turn.turnRef, request.signal);
+        active = startRebindExecution(turn);
+      } catch (error) {
         if (error instanceof SessionBrokerError) {
           return Response.json({ error: { type: "invalid_request_error", code: error.code, message: error.message } }, { status: 409 });
         }
@@ -927,6 +958,64 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
             op_ref: opRef,
             operation_state: terminal.operation.state,
             next_op_ref: terminal.nextOpRef,
+          });
+        } catch (error) {
+          if (error instanceof SessionBrokerError) {
+            return Response.json({ status: "rejected", code: error.code }, { status: 409 });
+          }
+          throw error;
+        }
+      }
+      if (request.method === "POST" && url.pathname === "/admin/release-unreconciled-slot") {
+        if (!safeEqualBearer(request.headers.get("authorization") ?? "", options.controlToken)) {
+          return new Response("Unauthorized", { status: 401 });
+        }
+        let body: unknown;
+        try { body = await readJsonRequestBody(request); } catch {
+          return jsonError(400, "invalid_recovery_request", "Recovery request body must be valid JSON");
+        }
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          return jsonError(400, "invalid_recovery_request", "Recovery request must be an object");
+        }
+        const recovery = body as Record<string, unknown>;
+        const turnRef = recovery.turn_ref;
+        const evidenceValue = recovery.positive_terminal_evidence;
+        if (typeof turnRef !== "string" || !turnRef || !evidenceValue
+          || typeof evidenceValue !== "object" || Array.isArray(evidenceValue)) {
+          return jsonError(400, "invalid_recovery_request",
+            "Slot release requires turn_ref and positive_terminal_evidence");
+        }
+        const rawEvidence = evidenceValue as Record<string, unknown>;
+        let evidence: PositiveTerminalEvidence;
+        try {
+          evidence = {
+            canonicalConversationId: normalizeCanonicalChatGptConversationId(
+              typeof rawEvidence.canonical_conversation_id === "string" ? rawEvidence.canonical_conversation_id : "",
+            ),
+            acceptedUserTurnId: validatePersistentChatTurnIdentity(
+              typeof rawEvidence.accepted_user_turn_id === "string" ? rawEvidence.accepted_user_turn_id : "",
+              "accepted user turn",
+            ),
+            remoteUiNonRunningAcrossQualifiedSettle:
+              rawEvidence.remote_ui_non_running_across_qualified_settle === true,
+            noUnresolvedGooseWork: rawEvidence.no_unresolved_goose_work === true,
+            noContradictoryActivity: rawEvidence.no_contradictory_activity === true,
+          };
+        } catch {
+          return jsonError(400, "invalid_recovery_request", "Positive-terminal recovery identity is invalid");
+        }
+        if (executions.has(turnRef) || toolActivityByTurn.has(turnRef)) {
+          return jsonError(409, "recovery_owner_active",
+            "Process-local turn/tool ownership must be gone before account-slot release");
+        }
+        try {
+          const released = broker.releaseSlotAfterPositiveTerminal(turnRef, evidence);
+          return Response.json({
+            status: "ok",
+            turn_ref: turnRef,
+            turn_state: released.state,
+            pair_retained: true,
+            account_slot_holders: broker.getAccountSlotHolders(),
           });
         } catch (error) {
           if (error instanceof SessionBrokerError) {

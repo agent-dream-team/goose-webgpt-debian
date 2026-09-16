@@ -638,7 +638,8 @@ export class SessionBroker {
       }
       if (turn.state === "TURN_OUTSTANDING") return turnFromRow(turn);
       this.db.query(`UPDATE turns SET state = 'TURN_OUTSTANDING', unreconciled_reason = NULL,
-        completion_claim_revision = NULL, revision = revision + 1, updated_at = ? WHERE turn_ref = ?`)
+        positive_terminal_evidence_json = NULL, completion_claim_revision = NULL,
+        revision = revision + 1, updated_at = ? WHERE turn_ref = ?`)
         .run(this.now(), input.turnRef);
       return this.getTurnRequired(input.turnRef);
     });
@@ -698,6 +699,69 @@ export class SessionBroker {
     });
   }
 
+
+  reacquireReleasedSlotForRebind(turnRef: string): BrokerTurn | null {
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(turnRef);
+      if (turn.abandoned_at !== null || turn.state !== "UNRECONCILED") {
+        this.fail("TURN_STATE", "Only an unreconciled persistent pair can reacquire a released account slot");
+      }
+      if (this.accountSlotForTurn(turnRef) !== null) return turnFromRow(turn);
+      if (this.recordedSlotDemotionEvidence(turnRef) === null) {
+        this.fail("RECOVERY_EVIDENCE", "Slot reacquisition requires a prior positive-terminal slot release");
+      }
+      const epoch = this.epochRowRequired(turn.goose_session_id, turn.epoch);
+      if (epoch.is_current !== 1 || !epoch.conversation_id || !turn.accepted_user_turn_id) {
+        this.fail("RECOVERY_IDENTITY", "Slot reacquisition requires the same durable Goose and ChatGPT pair identity");
+      }
+      if (turn.final_digest) this.fail("RECOVERY_FINAL", "A turn with accepted final content cannot resume as running");
+      if (turn.completion_claim_revision !== null) {
+        this.fail("COMPLETION_IN_FLIGHT", "Cannot reacquire an account slot while a completion claim exists");
+      }
+      if (this.hasUnresolvedOperation(turnRef)) {
+        this.fail("UNRESOLVED_OPERATION", "Cannot reacquire an account slot with claimed or uncertain operations");
+      }
+      const freeSlot = this.db.query("SELECT slot_id FROM account_slots WHERE turn_ref IS NULL ORDER BY slot_id ASC LIMIT 1")
+        .get() as { slot_id: 1 | 2 } | null;
+      if (!freeSlot) return null;
+      const at = this.now();
+      const slot = this.db.query("UPDATE account_slots SET turn_ref = ?, updated_at = ? WHERE slot_id = ? AND turn_ref IS NULL")
+        .run(turnRef, at, freeSlot.slot_id);
+      if (slot.changes !== 1) this.fail("ACCOUNT_SLOT", "Failed to reacquire the bounded account execution slot");
+      const held = this.db.query(`UPDATE turns SET slot_held = 1, completion_claim_revision = NULL,
+        revision = revision + 1, updated_at = ? WHERE turn_ref = ? AND state = 'UNRECONCILED' AND slot_held = 0`)
+        .run(at, turnRef);
+      if (held.changes !== 1) this.fail("ACCOUNT_SLOT", "Failed to restore slot ownership to the unreconciled pair");
+      return this.getTurnRequired(turnRef);
+    });
+  }
+
+  restorePositiveTerminalSlotRelease(turnRef: string): BrokerTurn {
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(turnRef);
+      if (turn.abandoned_at !== null || turn.state !== "UNRECONCILED") {
+        this.fail("TURN_STATE", "Only an unreconciled persistent pair can restore its positive-terminal slot release");
+      }
+      if (this.recordedSlotDemotionEvidence(turnRef) === null) {
+        this.fail("RECOVERY_EVIDENCE", "Slot release restoration requires prior positive-terminal evidence");
+      }
+      if (this.accountSlotForTurn(turnRef) === null) return turnFromRow(turn);
+      if (turn.final_digest) this.fail("RECOVERY_FINAL", "A turn with accepted final content cannot restore a released slot");
+      if (turn.completion_claim_revision !== null) {
+        this.fail("COMPLETION_IN_FLIGHT", "Cannot restore a released slot while a completion claim exists");
+      }
+      if (this.hasUnresolvedOperation(turnRef)) {
+        this.fail("UNRESOLVED_OPERATION", "Cannot restore a released slot with claimed or uncertain operations");
+      }
+      const at = this.now();
+      const result = this.db.query(`UPDATE turns SET slot_held = 0, completion_claim_revision = NULL,
+        revision = revision + 1, updated_at = ? WHERE turn_ref = ? AND state = 'UNRECONCILED' AND slot_held = 1`)
+        .run(at, turnRef);
+      if (result.changes !== 1) this.fail("ACCOUNT_SLOT", "Failed to restore the positive-terminal slot release");
+      this.releaseAccountSlotInside(turnRef, at);
+      return this.getTurnRequired(turnRef);
+    });
+  }
 
   recordProgress(turnRef: string, checkpointJson?: string): BrokerTurn {
     return this.transaction(() => {
@@ -1064,6 +1128,11 @@ export class SessionBroker {
 
   getAccountSlotHolders(): AccountSlotOwnership[] {
     return this.accountSlotHolders();
+  }
+
+  hasRecordedPositiveTerminalSlotRelease(turnRef: string): boolean {
+    this.turnRowRequired(turnRef);
+    return this.recordedSlotDemotionEvidence(turnRef) !== null;
   }
 
   getActiveAccountSlotCount(): number {
