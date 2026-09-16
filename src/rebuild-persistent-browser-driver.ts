@@ -714,16 +714,16 @@ export function createRebuildPersistentBrowserDriver(
               // performed for this same stale-observation episode.
               staleObservation = { kind: staleObservationKind, signature, progressRevision: semanticProgress.revision, since: now };
             } else {
-              // A visible running state is positive work evidence; only the long watchdog may
-              // refresh that disposable view while generation is still active.
-              const recoveryThresholdMs = staleObservationKind === "running"
-                ? staleObservationSubsequentRefreshMs
-                : staleObservationRecoveryStage === "initial"
-                  ? staleObservationFirstRefreshMs
-                  : staleObservationSubsequentRefreshMs;
+              const continuationEligible = staleObservationKind === "missing-completion-action"
+                || staleObservationKind === "stopped-no-final";
+              // Running or tool-blocked state is positive work evidence; only the long watchdog
+              // may refresh that disposable view. A freshly observed stopped view needs only the
+              // short settle cadence before same-chat continuation.
+              const recoveryThresholdMs = continuationEligible
+                ? staleObservationFirstRefreshMs
+                : staleObservationSubsequentRefreshMs;
               if (now - staleObservation.since >= recoveryThresholdMs) {
-                if ((staleObservationKind === "missing-completion-action" || staleObservationKind === "stopped-no-final")
-                  && staleObservationRecoveryStage === "refreshed") {
+                if (continuationEligible && staleObservationRecoveryStage === "refreshed") {
                   if (!await sendRecoveryContinuation()) {
                     staleObservation = undefined;
                     continue;

@@ -1232,41 +1232,46 @@ test("reattached stopped turn refreshes the view then continues privately in the
   expect(refreshed.composerText()).toContain("continue from there");
 });
 
-test("stale semantic tool progress refreshes only the browser view and preserves tool authority", async () => {
+test("stale-tool observation uses the long watchdog before refreshing and preserves tool authority", async () => {
   let sent = false;
   let originalSends = 0;
   let progress = { revision: 1, lastToolBatchRevision: 1, activeToolCalls: 1, lastProgressAt: 0 };
+  let staleToolObservations = 0;
   let refreshedObservations = 0;
   const first = fakeSurface(() => {
     sent = true;
     originalSends += 1;
     first.setUrl(`https://chatgpt.com/c/${CONVERSATION}`);
   });
-  first.setRunning(true);
   const refreshed = fakeSurface(
     () => { throw new Error("view recovery must not resend or continue while Goose tool work is active"); },
     `https://chatgpt.com/c/${CONVERSATION}`,
   );
-  refreshed.setRunning(true);
   const connections = [browserConnection(first), browserConnection(refreshed)];
   let connects = 0;
   const harness = createHarness({
     surface: first,
     semanticObservationRefreshMs: 1,
-    // A stale view may be refreshed, but repeated refreshes must remain spaced enough that the
-    // observer does not fight the browser while the durable server-side turn/tool keeps working.
-    staleObservationSubsequentRefreshMs: 10,
+    staleObservationFirstRefreshMs: 0,
+    staleObservationSubsequentRefreshMs: 20,
     connectSurface: async () => connections[connects++]!,
     captureSnapshot: async () => snapshotsAfterSend(() => sent),
     captureAnswer: async page => {
-      if (page === first.page) return { ...projection("tool still pending"), completionActionVisible: false };
+      if (page === first.page) {
+        staleToolObservations += 1;
+        await Bun.sleep(5);
+        return projection("tool still pending");
+      }
       refreshedObservations += 1;
-      if (refreshedObservations < 3) return { ...projection("tool still pending"), completionActionVisible: false };
+      if (refreshedObservations < 3) return projection("tool still pending");
       progress = { ...progress, revision: 2, activeToolCalls: 0, lastProgressAt: Date.now() };
-      refreshed.setRunning(false);
       return projection("recovered final");
     },
-    reopenBinding: async binding => ({ binding, assistantTurnId: "assistant-1", snapshot: snapshotsAfterSend(() => true) }),
+    reopenBinding: async binding => {
+      // The zero short threshold must not make stale-tool recovery aggressive.
+      expect(staleToolObservations).toBeGreaterThanOrEqual(3);
+      return { binding, assistantTurnId: "assistant-1", snapshot: snapshotsAfterSend(() => true) };
+    },
   });
   const execution = harness.driver.createTurn(makeInput({
     existingConversationId: CONVERSATION,
@@ -1277,6 +1282,7 @@ test("stale semantic tool progress refreshes only the browser view and preserves
   expect(candidate.text).toBe("recovered final");
   expect(progress.activeToolCalls).toBe(0);
   expect(connects).toBe(2);
+  expect(staleToolObservations).toBeGreaterThanOrEqual(3);
   expect(originalSends).toBe(1);
   await execution.confirmFinal(candidate);
 });
@@ -1324,11 +1330,12 @@ test("fresh semantic tool progress continues to suppress recovery without treati
   await execution.confirmFinal(candidate);
 });
 
-test("empty stopped assistant projection refreshes before a private same-chat continuation", async () => {
+test("empty stopped assistant projection refreshes once then continues on the short settle cadence", async () => {
   let sent = false;
   let originalSends = 0;
   let continuationSends = 0;
   let continuationAccepted = false;
+  let reopenCalls = 0;
   const first = fakeSurface(() => {
     sent = true;
     originalSends += 1;
@@ -1347,8 +1354,8 @@ test("empty stopped assistant projection refreshes before a private same-chat co
   };
   const harness = createHarness({
     surface: first,
-    staleObservationFirstRefreshMs: 0,
-    staleObservationSubsequentRefreshMs: 0,
+    staleObservationFirstRefreshMs: 5,
+    staleObservationSubsequentRefreshMs: 60_000,
     connectSurface: async () => connections[connects++]!,
     captureSnapshot: async () => continuationAccepted
       ? continuedSnapshot
@@ -1356,7 +1363,10 @@ test("empty stopped assistant projection refreshes before a private same-chat co
     captureAnswer: async () => continuationAccepted
       ? { ...projection("continued after empty stop"), assistantTurnId: "assistant-2" }
       : projection(""),
-    reopenBinding: async binding => ({ binding, assistantTurnId: "assistant-1", snapshot: snapshotsAfterSend(() => true) }),
+    reopenBinding: async binding => {
+      reopenCalls += 1;
+      return { binding, assistantTurnId: "assistant-1", snapshot: snapshotsAfterSend(() => true) };
+    },
   });
   const execution = harness.driver.createTurn(makeInput({ existingConversationId: CONVERSATION }));
 
@@ -1364,6 +1374,7 @@ test("empty stopped assistant projection refreshes before a private same-chat co
   expect(candidate.text).toBe("continued after empty stop");
   expect(originalSends).toBe(1);
   expect(continuationSends).toBe(1);
+  expect(reopenCalls).toBe(1);
   expect(connects).toBe(2);
   expect(refreshed.composerText()).toContain("continue from there");
 });
