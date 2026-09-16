@@ -22,6 +22,10 @@ import {
   renderGoosePersistentPrompt,
 } from "./goose-canonical-history";
 import { buildRebuildResponsesSse, rebuildResponsesSseResponse } from "./rebuild-responses-sse";
+import {
+  ChatGptExternalTurnProgress,
+  type ChatGptExternalTurnProgressSnapshot,
+} from "./adapters/chatgpt-web/turn-progress";
 import { VERSION } from "./version";
 import {
   normalizeCanonicalChatGptConversationId,
@@ -72,7 +76,11 @@ export interface RebuildPersistentBrowserTurnInput {
   prompt: string;
   existingConversationId: string | null;
   preSendAbortSignal: AbortSignal;
-  gooseWork: { isToolWorkInFlight(): boolean };
+  gooseWork: {
+    snapshot(): ChatGptExternalTurnProgressSnapshot;
+    /** Quarantine only if the caller still observes this exact stale semantic-progress revision. */
+    quarantineStalledToolWork(expectedRevision: number): Promise<boolean>;
+  };
   lifecycle: RebuildBrowserTurnLifecycle;
 }
 
@@ -83,6 +91,8 @@ export interface RebuildPersistentBrowserTurnExecution {
   confirmFinal(candidate: RebuildBrowserFinalEvidence): Promise<RebuildBrowserFinalEvidence>;
   /** Must freshly observe the exact persistent surface after qualified renderer catch-up/quiescence. */
   captureAnswerBoundary(opRef: string): Promise<string>;
+  /** Detach the disposable observer after an authenticated authoritative owner-terminal signal. */
+  terminateOwner?(reason: string): Promise<void>;
 }
 
 export interface RebuildPersistentBrowserDriver {
@@ -121,12 +131,18 @@ interface ActiveExecution {
   sendActivated: boolean;
   latestBoundaryOpRef: string | null;
   final: Promise<string>;
+  ownerTermination: Promise<void> | null;
 }
 
 interface CompletedResponse {
   turnRef: string;
   requestHash: string;
   sse: string;
+}
+
+interface TurnToolActivity {
+  readonly progress: ChatGptExternalTurnProgress;
+  activeOpRef: string | null;
 }
 
 function validSessionId(value: string | null): value is string {
@@ -183,14 +199,42 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
   });
   const baton = new GooseToolRendezvous({ loadCheckpoint: turnRef => broker.getTurn(turnRef)?.checkpointJson ?? null });
   const executions = new Map<string, ActiveExecution>();
-  const toolActivityByTurn = new Map<string, number>();
-  const beginToolActivity = (turnRef: string) => {
-    toolActivityByTurn.set(turnRef, (toolActivityByTurn.get(turnRef) ?? 0) + 1);
+  const toolActivityByTurn = new Map<string, TurnToolActivity>();
+  const toolActivity = (turnRef: string): TurnToolActivity => {
+    let activity = toolActivityByTurn.get(turnRef);
+    if (!activity) {
+      activity = { progress: new ChatGptExternalTurnProgress(), activeOpRef: null };
+      toolActivityByTurn.set(turnRef, activity);
+    }
+    return activity;
   };
-  const endToolActivity = (turnRef: string) => {
-    const next = (toolActivityByTurn.get(turnRef) ?? 1) - 1;
-    if (next <= 0) toolActivityByTurn.delete(turnRef);
-    else toolActivityByTurn.set(turnRef, next);
+  const beginToolActivity = (turnRef: string, opRef: string) => {
+    const activity = toolActivity(turnRef);
+    if (activity.activeOpRef) throw new Error("Persistent rebuild supports only one serial Goose tool operation per turn");
+    activity.activeOpRef = opRef;
+    activity.progress.recordToolBatch(1);
+  };
+  const endToolActivity = (turnRef: string, opRef: string) => {
+    const activity = toolActivityByTurn.get(turnRef);
+    if (!activity || activity.activeOpRef !== opRef) return;
+    activity.activeOpRef = null;
+    if (activity.progress.snapshot().activeToolCalls > 0) activity.progress.recordToolResult();
+  };
+  const quarantineToolActivity = (
+    turnRef: string,
+    reason: string,
+    expectedRevision?: number,
+  ): boolean => {
+    const activity = toolActivityByTurn.get(turnRef);
+    if (!activity?.activeOpRef) return false;
+    const snapshot = activity.progress.snapshot();
+    if (expectedRevision !== undefined && snapshot.revision !== expectedRevision) return false;
+    const decision = broker.quarantineOwnedOperation({ turnRef, opRef: activity.activeOpRef, reason });
+    if (decision.kind === "TERMINAL") return false;
+    baton.quarantineTurn(turnRef, "Goose tool outcome is uncertain; explicit reconciliation is required");
+    activity.progress.retire(new GooseToolRendezvousError("TURN_UNCERTAIN", reason));
+    activity.activeOpRef = null;
+    return true;
   };
   // Keep only the latest completed transport payload per Goose session. Active executions, raw
   // request bodies, browser closures, and tool literals are released as soon as the turn ends.
@@ -243,15 +287,16 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       active.latestBoundaryOpRef = request.opRef;
     },
     rendezvous: async request => {
-      beginToolActivity(request.turnRef);
+      beginToolActivity(request.turnRef, request.opRef);
       let released = false;
       const releaseActivity = () => {
         if (released) return;
         released = true;
-        endToolActivity(request.turnRef);
+        endToolActivity(request.turnRef, request.opRef);
       };
       try {
         const continuation = await baton.dispatchTool(request);
+        toolActivityByTurn.get(request.turnRef)?.progress.recordActivity();
         return {
           outcome: "SUCCESS",
           dataClass: "task",
@@ -275,6 +320,12 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
 
   const ensureEpoch = (sessionId: string): RemoteEpoch =>
     broker.getCurrentEpoch(sessionId) ?? broker.createEpoch({ gooseSessionId: sessionId });
+
+  const terminateBrowserOwner = (active: ActiveExecution, reason: string): Promise<void> => {
+    if (active.ownerTermination) return active.ownerTermination;
+    active.ownerTermination = active.browser.terminateOwner?.(reason) ?? Promise.resolve();
+    return active.ownerTermination;
+  };
 
   const durableToolResult = (opRef: string): string => {
     const operation = broker.getOperation(opRef);
@@ -324,7 +375,14 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       prompt,
       existingConversationId: epoch.conversationId,
       preSendAbortSignal: preSendAbort.signal,
-      gooseWork: { isToolWorkInFlight: () => (toolActivityByTurn.get(turn.turnRef) ?? 0) > 0 },
+      gooseWork: {
+        snapshot: () => toolActivity(turn.turnRef).progress.snapshot(),
+        quarantineStalledToolWork: async expectedRevision => quarantineToolActivity(
+          turn.turnRef,
+          "goose_tool_semantic_progress_stalled",
+          expectedRevision,
+        ),
+      },
       lifecycle: {
         onSendActivated: () => {
           if (preSendAbort.signal.aborted) throw abortError();
@@ -352,6 +410,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       sendActivated,
       latestBoundaryOpRef: null,
       final: Promise.resolve("") as Promise<string>,
+      ownerTermination: null,
     };
     executions.set(turn.turnRef, active);
 
@@ -430,7 +489,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         }
         return finalSse;
       })
-      .catch(error => {
+      .catch(async error => {
         const current = broker.getTurn(turn.turnRef);
         if (current?.state === "QUEUED") {
           // No irreversible send fence was armed. Local preparation failure or transport-owner
@@ -439,13 +498,18 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         } else if (current?.state === "TURN_OUTSTANDING") {
           try { broker.markUnreconciled(turn.turnRef, "persistent_browser_turn_failed"); } catch {}
         }
+        if (current?.state !== "QUEUED") {
+          try { await terminateBrowserOwner(active, "runtime_terminal_failure"); } catch {}
+        }
         if (executions.get(turn.turnRef) === active) executions.delete(turn.turnRef);
         throw error;
       })
       .finally(() => {
         requestSignal.removeEventListener("abort", onInitialDisconnect);
         if (executions.get(turn.turnRef) === active) executions.delete(turn.turnRef);
+        if (toolActivityByTurn.get(turn.turnRef)?.activeOpRef === null) toolActivityByTurn.delete(turn.turnRef);
       });
+    void active.final.catch(() => {});
     return active;
   };
 
@@ -599,6 +663,35 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     return await serveStage(stage, active, request.signal);
   };
 
+  const terminateAuthoritativeOwner = async (input: {
+    turnRef: string;
+    gooseSessionId: string;
+    reason: "terminal_response" | "cancelled";
+  }): Promise<BrokerTurn> => {
+    const turn = broker.getTurn(input.turnRef);
+    if (!turn || turn.gooseSessionId !== input.gooseSessionId) {
+      throw new SessionBrokerError("TURN_IDENTITY", "Owner termination identity does not match the broker turn");
+    }
+    if (turn.state !== "TURN_OUTSTANDING" && turn.state !== "UNRECONCILED") {
+      throw new SessionBrokerError("TURN_STATE", "Owner termination requires a remotely outstanding turn");
+    }
+    const active = executions.get(input.turnRef);
+    if (!active) {
+      if (turn.state === "UNRECONCILED") return turn;
+      throw new SessionBrokerError("TURN_EXECUTION", "Outstanding browser execution is unavailable");
+    }
+    if (!active.browser.terminateOwner) {
+      throw new SessionBrokerError("TURN_EXECUTION", "Browser driver cannot detach authoritative terminal owners");
+    }
+    const durableReason = `goose_owner_${input.reason}`;
+    quarantineToolActivity(input.turnRef, durableReason);
+    const current = broker.getTurn(input.turnRef);
+    if (current?.state === "TURN_OUTSTANDING") broker.markUnreconciled(input.turnRef, durableReason);
+    await terminateBrowserOwner(active, input.reason);
+    await active.final.catch(() => {});
+    return broker.getTurn(input.turnRef)!;
+  };
+
   let server!: ReturnType<typeof Bun.serve>;
   const stop = async () => {
     if (stopped) return;
@@ -628,6 +721,46 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
           active_http_turns: activeHttpTurns,
           active_browser_turns: broker.getActiveAccountSlotCount(),
         });
+      }
+      if (request.method === "POST" && url.pathname === "/admin/terminate-turn-owner") {
+        if (!safeEqualBearer(request.headers.get("authorization") ?? "", options.controlToken)) {
+          return new Response("Unauthorized", { status: 401 });
+        }
+        let body: unknown;
+        try { body = await readJsonRequestBody(request); } catch {
+          return jsonError(400, "invalid_owner_termination", "Owner termination body must be valid JSON");
+        }
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          return jsonError(400, "invalid_owner_termination", "Owner termination must be an object");
+        }
+        const terminal = body as Record<string, unknown>;
+        const turnRef = terminal.turn_ref;
+        const gooseSessionId = terminal.goose_session_id;
+        const reason = terminal.reason;
+        if (typeof turnRef !== "string" || !turnRef
+          || typeof gooseSessionId !== "string" || !validSessionId(gooseSessionId)
+          || (reason !== "terminal_response" && reason !== "cancelled")) {
+          return jsonError(
+            400,
+            "invalid_owner_termination",
+            "Owner termination requires turn_ref, goose_session_id, and a supported reason",
+          );
+        }
+        try {
+          const turn = await terminateAuthoritativeOwner({ turnRef, gooseSessionId, reason });
+          return Response.json({
+            status: "ok",
+            turn_ref: turn.turnRef,
+            turn_state: turn.state,
+            unreconciled_reason: turn.unreconciledReason,
+            slot_retained: broker.getAccountSlotHolders().some(holder => holder.turnRef === turn.turnRef),
+          });
+        } catch (error) {
+          if (error instanceof SessionBrokerError) {
+            return Response.json({ status: "rejected", code: error.code }, { status: 409 });
+          }
+          throw error;
+        }
       }
       if (request.method === "POST" && url.pathname === "/admin/reconcile-operation") {
         if (!safeEqualBearer(request.headers.get("authorization") ?? "", options.controlToken)) {

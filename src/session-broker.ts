@@ -102,6 +102,10 @@ export type OperationClaimDecision =
   | { kind: "WRONG_TURN"; opRef: string; seq: number }
   | { kind: "UNKNOWN"; opRef: string; seq: null };
 
+export type OperationQuarantineDecision =
+  | { kind: "QUARANTINED" | "ALREADY_UNCERTAIN"; operation: BrokerOperation }
+  | { kind: "TERMINAL"; operation: BrokerOperation };
+
 export type MissingOperationDecision =
   | { kind: "UNCERTAIN"; matchingOpRefs: string[] }
   | { kind: "PROTOCOL_VIOLATION" }
@@ -846,6 +850,39 @@ export class SessionBroker {
         .run(input.inputHash, this.instanceId, this.now(), input.opRef);
       this.bumpTurnRevision(input.turnRef);
       return { kind: "EXECUTE", opRef: op.op_ref, seq: op.seq };
+    });
+  }
+
+  quarantineOwnedOperation(input: {
+    turnRef: string;
+    opRef: string;
+    reason: string;
+  }): OperationQuarantineDecision {
+    if (!input.reason) this.fail("INVALID_REASON", "Operation quarantine requires a reason");
+    return this.transaction(() => {
+      const op = this.operationRowRequired(input.opRef);
+      if (op.turn_ref !== input.turnRef) this.fail("WRONG_TURN", "Operation belongs to another turn");
+      if (op.state === "SUCCESS" || op.state === "FAILURE") {
+        return { kind: "TERMINAL", operation: operationFromRow(op) };
+      }
+      if (op.state === "UNCERTAIN") {
+        return { kind: "ALREADY_UNCERTAIN", operation: operationFromRow(op) };
+      }
+      if (op.state !== "CLAIMED" || op.owner_id !== this.instanceId) {
+        this.fail("OP_STATE", "Only this broker instance's claimed operation can be quarantined");
+      }
+      const turn = this.turnRowRequired(input.turnRef);
+      if (turn.state === "TURN_OUTSTANDING") this.markUnreconciledInside(input.turnRef, input.reason);
+      else if (turn.state !== "UNRECONCILED") {
+        this.fail("TURN_STATE", "Operation quarantine requires an outstanding or unreconciled turn");
+      }
+      const at = this.now();
+      const changed = this.db.query(`UPDATE operations SET state = 'UNCERTAIN', owner_id = NULL,
+        updated_at = ? WHERE op_ref = ? AND state = 'CLAIMED' AND owner_id = ?`)
+        .run(at, input.opRef, this.instanceId);
+      if (changed.changes !== 1) this.fail("OP_STATE", "Operation quarantine lost its owned claim");
+      if (turn.state === "UNRECONCILED") this.bumpTurnRevision(input.turnRef);
+      return { kind: "QUARANTINED", operation: this.getOperationRequired(input.opRef) };
     });
   }
 

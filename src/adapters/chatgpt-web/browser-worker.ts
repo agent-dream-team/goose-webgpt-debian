@@ -114,6 +114,9 @@ import {
   type CapturedChatGptLunaCheckpoint,
 } from "./rolling-checkpoint";
 import {
+  CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS,
+  CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS,
+  chatGptExternalProgressIsRecent,
   chatGptExternalProgressIsLive,
   chatGptExternalToolCallsAreInFlight,
 } from "./turn-progress";
@@ -123,6 +126,10 @@ import type {
 } from "./turn-progress";
 
 export { MAX_CHATGPT_BROWSER_TABS } from "./concurrency";
+export {
+  CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS,
+  CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS,
+} from "./turn-progress";
 
 const workers = new Map<string, ChatGptBrowserWorker>();
 
@@ -1348,32 +1355,13 @@ export class ChatGptTurnDomHealthTracker {
  */
 export const MAX_CHATGPT_INTERNAL_OBSERVATION_FAULTS = 8;
 
-/**
- * How stale recorded MCP progress may be and still suppress DOM health checks.
- *
- * An outstanding tool call reports liveness regardless of age, so a call that never returns would
- * otherwise hold a turn open forever — turns carry no deadline unless a caller supplies one. This
- * bounds the silence since the last recorded activity rather than the turn's total duration, so a
- * long turn that keeps calling tools is never penalised for taking a long time.
- */
-export const CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS = 10 * 60_000;
-
-/** Tolerated clock difference between the recording daemon and the observing helper process. */
-export const CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS = 5_000;
-
 /** Proven MCP activity, additionally required to be recent enough to still be evidence. */
 export function chatGptExternalProgressSuppressesDomHealth(
   snapshot: ChatGptExternalTurnProgressSnapshot | undefined,
   now: number,
 ): boolean {
   if (!chatGptExternalProgressIsLive(snapshot, now, CHATGPT_RESPONSE_DOM_GRACE_MS)) return false;
-  const lastProgressAt = snapshot?.lastProgressAt;
-  if (lastProgressAt === undefined) return false;
-  const age = now - lastProgressAt;
-  // A timestamp from the future would keep `age` below the ceiling forever. Recorded activity can
-  // only precede the observation, so anything meaningfully ahead of now is not evidence at all.
-  return age >= -CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS
-    && age < CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS;
+  return chatGptExternalProgressIsRecent(snapshot, now);
 }
 
 export interface ChatGptVisibleTraceBlock {

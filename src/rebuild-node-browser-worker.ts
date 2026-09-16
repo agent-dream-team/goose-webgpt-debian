@@ -2,6 +2,10 @@ import { createInterface } from "node:readline";
 import { stdin, stdout } from "node:process";
 import { createChatGptProjectNavigationEntry } from "./rebuild-project-entry";
 import { createRebuildPersistentBrowserDriver } from "./rebuild-persistent-browser-driver";
+import {
+  assertChatGptTurnProgressSnapshot,
+  type ChatGptExternalTurnProgressSnapshot,
+} from "./adapters/chatgpt-web/turn-progress";
 import type {
   RebuildBrowserAcceptedEvidence,
   RebuildBrowserFinalEvidence,
@@ -31,24 +35,33 @@ type StartMessage = {
 
 type InputMessage = StartMessage
   | { type: "lifecycle_ack"; event: "send_activated" | "accepted"; ok: boolean; message?: string }
-  | { type: "tool_state"; inFlight: boolean }
+  | { type: "tool_progress"; snapshot: ChatGptExternalTurnProgressSnapshot }
+  | { type: "quarantine_tool_ack"; requestId: number; quarantined: boolean; snapshot: ChatGptExternalTurnProgressSnapshot }
+  | { type: "terminate_owner"; reason: string }
   | { type: "abort" }
   | { type: "boundary"; requestId: number; opRef: string }
   | { type: "confirm"; candidate: RebuildBrowserFinalEvidence }
   | { type: "shutdown" };
 
-interface Deferred {
-  resolve(): void;
+interface Deferred<T = void> {
+  resolve(value: T): void;
   reject(error: Error): void;
 }
 
 let execution: RebuildPersistentBrowserTurnExecution | undefined;
 let abortController: AbortController | undefined;
-let toolInFlight = false;
+let toolProgress: ChatGptExternalTurnProgressSnapshot = {
+  revision: 0,
+  lastToolBatchRevision: 0,
+  activeToolCalls: 0,
+};
+let quarantineRequestId = 0;
 let started = false;
 let candidate: RebuildBrowserFinalEvidence | undefined;
 let confirmed = false;
+let ownerTerminating = false;
 const lifecycleWaiters = new Map<"send_activated" | "accepted", Deferred>();
+const quarantineWaiters = new Map<number, Deferred<boolean>>();
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -97,7 +110,14 @@ function start(message: StartMessage): void {
   execution = driver.createTurn({
     ...input,
     preSendAbortSignal: abortController.signal,
-    gooseWork: { isToolWorkInFlight: () => toolInFlight },
+    gooseWork: {
+      snapshot: () => ({ ...toolProgress }),
+      quarantineStalledToolWork: expectedRevision => new Promise<boolean>((resolve, reject) => {
+        quarantineRequestId += 1;
+        quarantineWaiters.set(quarantineRequestId, { resolve, reject });
+        write({ type: "quarantine_tool", requestId: quarantineRequestId, expectedRevision });
+      }),
+    },
     lifecycle: {
       onSendActivated: () => waitForLifecycleAck("send_activated"),
       onAccepted: evidence => waitForLifecycleAck("accepted", evidence),
@@ -107,7 +127,10 @@ function start(message: StartMessage): void {
     candidate = evidence;
     write({ type: "candidate", evidence });
   }).catch(error => {
-    write({ type: "error", message: errorMessage(error) });
+    // Authoritative owner termination deliberately tears down the disposable browser observer.
+    // Its explicit owner_terminated frame is the parent protocol fence; do not race that
+    // acknowledgement with the expected run() rejection caused by closing the surface.
+    if (!ownerTerminating) write({ type: "error", message: errorMessage(error) });
   });
 }
 
@@ -124,8 +147,25 @@ async function handle(message: InputMessage): Promise<void> {
     else waiter.reject(new Error(message.message || `Parent rejected ${message.event}`));
     return;
   }
-  if (message.type === "tool_state") {
-    toolInFlight = message.inFlight === true;
+  if (message.type === "tool_progress") {
+    assertChatGptTurnProgressSnapshot(message.snapshot);
+    if (message.snapshot.revision >= toolProgress.revision) toolProgress = { ...message.snapshot };
+    return;
+  }
+  if (message.type === "quarantine_tool_ack") {
+    const waiter = quarantineWaiters.get(message.requestId);
+    if (!waiter) throw new Error("Node browser worker received an unknown quarantine acknowledgement");
+    quarantineWaiters.delete(message.requestId);
+    assertChatGptTurnProgressSnapshot(message.snapshot);
+    if (message.snapshot.revision >= toolProgress.revision) toolProgress = { ...message.snapshot };
+    waiter.resolve(message.quarantined);
+    return;
+  }
+  if (message.type === "terminate_owner") {
+    if (!execution?.terminateOwner) throw new Error("Node browser worker cannot detach its owner");
+    ownerTerminating = true;
+    await execution.terminateOwner(message.reason);
+    write({ type: "owner_terminated" });
     return;
   }
   if (message.type === "abort") {

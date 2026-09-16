@@ -144,11 +144,34 @@ function makeInput(options: {
   existingConversationId?: string | null;
   prompt?: string;
   toolInFlight?: () => boolean;
+  gooseWork?: RebuildPersistentBrowserTurnInput["gooseWork"];
   onSendActivated?: () => void;
   onAccepted?: (conversationId: string, userTurnId: string) => void;
   abortController?: AbortController;
 } = {}): RebuildPersistentBrowserTurnInput {
   const controller = options.abortController ?? new AbortController();
+  let priorToolState = false;
+  let progressRevision = 0;
+  let lastToolBatchRevision = 0;
+  let lastProgressAt: number | undefined;
+  const gooseWork = options.gooseWork ?? {
+    snapshot: () => {
+      const active = options.toolInFlight?.() ?? false;
+      if (active !== priorToolState) {
+        progressRevision += 1;
+        if (active) lastToolBatchRevision = progressRevision;
+        lastProgressAt = Date.now();
+        priorToolState = active;
+      }
+      return {
+        revision: progressRevision,
+        lastToolBatchRevision,
+        activeToolCalls: active ? 1 : 0,
+        ...(lastProgressAt === undefined ? {} : { lastProgressAt }),
+      };
+    },
+    quarantineStalledToolWork: async () => false,
+  };
   return {
     turnRef: "turn_browser_driver_test",
     gooseSessionId: "goose-browser-driver",
@@ -158,7 +181,7 @@ function makeInput(options: {
     prompt: options.prompt ?? "submit_browser_driver_1:op_browser_driver_1",
     existingConversationId: options.existingConversationId ?? null,
     preSendAbortSignal: controller.signal,
-    gooseWork: { isToolWorkInFlight: options.toolInFlight ?? (() => false) },
+    gooseWork,
     lifecycle: {
       onSendActivated: options.onSendActivated ?? (() => {}),
       onAccepted: evidence => options.onAccepted?.(evidence.canonicalConversationId, evidence.acceptedUserTurnId),
@@ -180,6 +203,7 @@ function createHarness(options: {
   timeoutMs?: number;
   staleObservationFirstRefreshMs?: number;
   staleObservationSubsequentRefreshMs?: number;
+  semanticProgressStallMs?: number;
   startLease?: {
     surfaceId: string;
     reused: boolean;
@@ -211,6 +235,7 @@ function createHarness(options: {
     postToolAnswerGraceMs: 50,
     staleObservationFirstRefreshMs: options.staleObservationFirstRefreshMs,
     staleObservationSubsequentRefreshMs: options.staleObservationSubsequentRefreshMs,
+    semanticProgressStallMs: options.semanticProgressStallMs,
     prepareFreshProjectChat: options.prepareFresh ?? (async () => {}),
     dependencies: {
       notifyTurn: (async (_path: string, activity: any) => {
@@ -688,7 +713,7 @@ test("repeated hard refresh preserves the post-tool answer boundary until fresh 
   let connects = 0;
   const harness = createHarness({
     surface: first,
-    staleObservationFirstRefreshMs: 0,
+    staleObservationFirstRefreshMs: 5,
     staleObservationSubsequentRefreshMs: 0,
     connectSurface: async () => connections[connects++]!,
     captureSnapshot: async () => snapshotsAfterSend(() => sent),
@@ -1114,6 +1139,174 @@ test("tool activity clears a stale episode so later staleness starts with refres
   expect(connects).toBe(3);
   expect(reopenCalls).toBe(2);
   await execution.confirmFinal(candidate);
+});
+
+test("stale semantic tool progress quarantines by revision and enters same-chat view recovery", async () => {
+  let sent = false;
+  let sends = 0;
+  let quarantines = 0;
+  let progress = { revision: 1, lastToolBatchRevision: 1, activeToolCalls: 1, lastProgressAt: 0 };
+  const first = fakeSurface(() => {
+    sent = true;
+    sends += 1;
+    first.setUrl(`https://chatgpt.com/c/${CONVERSATION}`);
+  });
+  first.setRunning(true);
+  const refreshed = fakeSurface(
+    () => { throw new Error("recovered surface must never resend the Goose prompt"); },
+    `https://chatgpt.com/c/${CONVERSATION}`,
+  );
+  const connections = [browserConnection(first), browserConnection(refreshed)];
+  let connects = 0;
+  const harness = createHarness({
+    surface: first,
+    semanticProgressStallMs: 1,
+    staleObservationSubsequentRefreshMs: 0,
+    connectSurface: async () => connections[connects++]!,
+    captureSnapshot: async () => snapshotsAfterSend(() => sent),
+    captureAnswer: async page => page === first.page
+      ? { ...projection("tool still pending"), completionActionVisible: false }
+      : projection("recovered final"),
+    reopenBinding: async binding => ({ binding, assistantTurnId: "assistant-1", snapshot: snapshotsAfterSend(() => true) }),
+  });
+  const execution = harness.driver.createTurn(makeInput({
+    existingConversationId: CONVERSATION,
+    gooseWork: {
+      snapshot: () => ({ ...progress }),
+      quarantineStalledToolWork: async expectedRevision => {
+        expect(expectedRevision).toBe(1);
+        quarantines += 1;
+        progress = { ...progress, revision: 2, activeToolCalls: 0 };
+        return true;
+      },
+    },
+  }));
+
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("recovered final");
+  expect(quarantines).toBe(1);
+  expect(connects).toBe(2);
+  expect(sends).toBe(1);
+  await execution.confirmFinal(candidate);
+});
+
+test("fresh semantic tool progress continues to suppress recovery without treating lease heartbeats as progress", async () => {
+  let sent = false;
+  let observations = 0;
+  let active = true;
+  const semanticProgressAt = Date.now();
+  let surface!: FakeSurface;
+  surface = fakeSurface(() => {
+    sent = true;
+    surface.setUrl(`https://chatgpt.com/c/${CONVERSATION}`);
+  });
+  surface.setRunning(true);
+  const harness = createHarness({
+    surface,
+    semanticProgressStallMs: 10_000,
+    staleObservationFirstRefreshMs: 0,
+    staleObservationSubsequentRefreshMs: 0,
+    captureSnapshot: async () => snapshotsAfterSend(() => sent),
+    captureAnswer: async () => {
+      observations += 1;
+      if (observations >= 4) {
+        active = false;
+        surface.setRunning(false);
+        return projection("long tool completed");
+      }
+      return { ...projection("waiting for tool"), completionActionVisible: false };
+    },
+  });
+  const execution = harness.driver.createTurn(makeInput({
+    existingConversationId: CONVERSATION,
+    gooseWork: {
+      snapshot: () => active
+        ? { revision: 1, lastToolBatchRevision: 1, activeToolCalls: 1, lastProgressAt: semanticProgressAt }
+        : { revision: 2, lastToolBatchRevision: 1, activeToolCalls: 0, lastProgressAt: semanticProgressAt },
+      quarantineStalledToolWork: async () => { throw new Error("fresh progress must not be quarantined"); },
+    },
+  }));
+
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("long tool completed");
+  expect(observations).toBeGreaterThanOrEqual(4);
+  expect(harness.activities.filter(activity => activity.phase === "start")).toHaveLength(1);
+  await execution.confirmFinal(candidate);
+});
+
+test("empty stopped assistant projection refreshes before a private same-chat continuation", async () => {
+  let sent = false;
+  let originalSends = 0;
+  let continuationSends = 0;
+  let continuationAccepted = false;
+  const first = fakeSurface(() => {
+    sent = true;
+    originalSends += 1;
+    first.setUrl(`https://chatgpt.com/c/${CONVERSATION}`);
+  });
+  const refreshed = fakeSurface(() => {
+    continuationSends += 1;
+    continuationAccepted = true;
+  }, `https://chatgpt.com/c/${CONVERSATION}`);
+  const connections = [browserConnection(first), browserConnection(refreshed)];
+  let connects = 0;
+  const continuedSnapshot: PersistentChatTurnSnapshot = {
+    turnIdentities: ["user-1", "assistant-1", "user-2", "assistant-2"],
+    userIdentities: ["user-1", "user-2"],
+    assistantIdentities: ["assistant-1", "assistant-2"],
+  };
+  const harness = createHarness({
+    surface: first,
+    staleObservationFirstRefreshMs: 0,
+    staleObservationSubsequentRefreshMs: 0,
+    connectSurface: async () => connections[connects++]!,
+    captureSnapshot: async () => continuationAccepted
+      ? continuedSnapshot
+      : snapshotsAfterSend(() => sent),
+    captureAnswer: async () => continuationAccepted
+      ? { ...projection("continued after empty stop"), assistantTurnId: "assistant-2" }
+      : projection(""),
+    reopenBinding: async binding => ({ binding, assistantTurnId: "assistant-1", snapshot: snapshotsAfterSend(() => true) }),
+  });
+  const execution = harness.driver.createTurn(makeInput({ existingConversationId: CONVERSATION }));
+
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("continued after empty stop");
+  expect(originalSends).toBe(1);
+  expect(continuationSends).toBe(1);
+  expect(connects).toBe(2);
+  expect(refreshed.composerText()).toContain("continue from there");
+});
+
+test("authoritative owner termination ends launcher heartbeat ownership without mutating the conversation", async () => {
+  let sent = false;
+  const accepted = deferred<void>();
+  let surface!: FakeSurface;
+  surface = fakeSurface(() => {
+    sent = true;
+    surface.setUrl(`https://chatgpt.com/c/${CONVERSATION}`);
+  });
+  surface.setRunning(true);
+  const harness = createHarness({
+    surface,
+    captureSnapshot: async () => snapshotsAfterSend(() => sent),
+    captureAnswer: async () => ({ ...projection("still running"), completionActionVisible: false }),
+  });
+  const execution = harness.driver.createTurn(makeInput({
+    existingConversationId: CONVERSATION,
+    onAccepted: () => accepted.resolve(),
+  }));
+  const running = execution.run();
+  await accepted.promise;
+  const rejection = running.then(
+    () => new Error("browser execution unexpectedly completed"),
+    error => error as Error,
+  );
+
+  await execution.terminateOwner?.("terminal_response");
+  expect((await rejection).message).toContain("owner terminated");
+  expect(harness.activities.at(-1)).toMatchObject({ phase: "end", status: "failed" });
+  expect(harness.activities.filter(activity => activity.phase === "start")).toHaveLength(1);
 });
 
 test("visible approval fence blocks stale-observation recovery before refresh", async () => {

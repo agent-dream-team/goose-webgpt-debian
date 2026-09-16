@@ -359,6 +359,114 @@ test("operator-known terminal reconciliation requires post-owner uncertainty and
   }
 });
 
+test("owned claimed operation quarantine is idempotent and retains the slot until reconciliation", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    const { initialOpRef } = broker.admitNext()!;
+    accept(broker);
+    bindConversation(broker);
+    broker.recordAnswerBoundary("turn-a", initialOpRef, '{"chars":10}');
+    broker.claimOperation({ turnRef: "turn-a", opRef: initialOpRef, inputHash: "known-input" });
+
+    const first = broker.quarantineOwnedOperation({
+      turnRef: "turn-a", opRef: initialOpRef, reason: "semantic_progress_stalled",
+    });
+    expect(first.kind).toBe("QUARANTINED");
+    expect(first.operation.state).toBe("UNCERTAIN");
+    expect(broker.getTurn("turn-a")).toMatchObject({
+      state: "UNRECONCILED", unreconciledReason: "semantic_progress_stalled",
+    });
+    expect(broker.getAccountSlotHolder()).toBe("turn-a");
+
+    expect(broker.quarantineOwnedOperation({
+      turnRef: "turn-a", opRef: initialOpRef, reason: "semantic_progress_stalled",
+    }).kind).toBe("ALREADY_UNCERTAIN");
+    const terminal = broker.reconcileKnownOperationTerminal({
+      turnRef: "turn-a",
+      opRef: initialOpRef,
+      inputHash: "known-input",
+      outcome: "SUCCESS",
+      resultJson: '{"ok":true}',
+    });
+    expect(terminal.operation.state).toBe("SUCCESS");
+    expect(broker.getAccountSlotHolder()).toBe("turn-a");
+  } finally {
+    broker.close();
+  }
+});
+
+test("terminal operation commit wins cleanly over a later quarantine attempt", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    const { initialOpRef } = broker.admitNext()!;
+    accept(broker);
+    bindConversation(broker);
+    broker.recordAnswerBoundary("turn-a", initialOpRef, '{"chars":10}');
+    broker.claimOperation({ turnRef: "turn-a", opRef: initialOpRef, inputHash: "known-input" });
+    broker.completeOperation({
+      opRef: initialOpRef, inputHash: "known-input", outcome: "SUCCESS", resultJson: '{"ok":true}',
+    });
+
+    const decision = broker.quarantineOwnedOperation({
+      turnRef: "turn-a", opRef: initialOpRef, reason: "late_timeout",
+    });
+    expect(decision.kind).toBe("TERMINAL");
+    expect(decision.operation.state).toBe("SUCCESS");
+    expect(broker.getTurn("turn-a")?.state).toBe("TURN_OUTSTANDING");
+  } finally {
+    broker.close();
+  }
+});
+
+test("uncertain tool owner keeps its slot while a safe second-slot completion admits the queued turn", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker, "goose-a");
+    createSession(broker, "goose-b");
+    createSession(broker, "goose-c");
+    enqueue(broker, "goose-a", "turn-a", "req-a");
+    enqueue(broker, "goose-b", "turn-b", "req-b");
+    enqueue(broker, "goose-c", "turn-c", "req-c");
+
+    const a = broker.admitNext("turn-a")!;
+    accept(broker, "turn-a");
+    bindConversation(broker, "goose-a", "conversation-a");
+    broker.recordAnswerBoundary("turn-a", a.initialOpRef, '{"chars":10}');
+    broker.claimOperation({ turnRef: "turn-a", opRef: a.initialOpRef, inputHash: "input-a" });
+    broker.quarantineOwnedOperation({ turnRef: "turn-a", opRef: a.initialOpRef, reason: "semantic_progress_stalled" });
+
+    broker.admitNext("turn-b");
+    accept(broker, "turn-b");
+    bindConversation(broker, "goose-b", "conversation-b");
+    expect(broker.admitNext("turn-c")).toBeNull();
+    broker.recordFinalDigest("turn-b", "digest-b");
+    const claim = broker.beginCompletion("turn-b");
+    broker.commitCompletion(claim, {
+      connectorFinal: "ACKNOWLEDGED",
+      canonicalConversationId: "conversation-b",
+      acceptedUserTurnId: "user-turn-b",
+      noUnresolvedGooseWork: true,
+      remoteNonRunning: true,
+      observedFinalDigest: "digest-b",
+      canonicalHistoryWatermark: "wm-b",
+      answerBoundary: null,
+    });
+
+    expect(broker.admitNext("turn-c")?.turn.turnRef).toBe("turn-c");
+    expect(broker.getAccountSlotHolders()).toEqual([
+      { slotId: 1, turnRef: "turn-a" },
+      { slotId: 2, turnRef: "turn-c" },
+    ]);
+    expect(broker.getOperation(a.initialOpRef)?.state).toBe("UNCERTAIN");
+  } finally {
+    broker.close();
+  }
+});
+
 test("timeout or silence alone never releases its slot while the second slot remains independent", () => {
   let now = 1_000;
   const { broker } = fixture("broker-a", () => now);

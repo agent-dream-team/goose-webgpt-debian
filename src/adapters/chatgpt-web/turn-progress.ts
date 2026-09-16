@@ -5,6 +5,26 @@ export interface ChatGptExternalTurnProgressSnapshot {
   lastProgressAt?: number;
 }
 
+/** Maximum silence since proven tool activity before it stops suppressing browser recovery. */
+export const CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS = 10 * 60_000;
+
+/** Tolerated clock difference between the progress recorder and its observer. */
+export const CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS = 5_000;
+
+/** Whether the snapshot still proves recent semantic activity, independent of transport liveness. */
+export function chatGptExternalProgressIsRecent(
+  snapshot: ChatGptExternalTurnProgressSnapshot | undefined,
+  now: number,
+  stallCeilingMs = CHATGPT_EXTERNAL_PROGRESS_STALL_CEILING_MS,
+): boolean {
+  if (!snapshot || snapshot.lastProgressAt === undefined) return false;
+  if (!Number.isFinite(now) || !Number.isFinite(stallCeilingMs) || stallCeilingMs < 0) {
+    throw new Error("ChatGPT external progress freshness inputs are invalid");
+  }
+  const age = now - snapshot.lastProgressAt;
+  return age >= -CHATGPT_EXTERNAL_PROGRESS_CLOCK_SKEW_MS && age < stallCeilingMs;
+}
+
 interface ProgressWaiter {
   afterRevision: number;
   resolve: (snapshot: ChatGptExternalTurnProgressSnapshot) => void;
@@ -152,6 +172,15 @@ export class ChatGptExternalTurnProgress extends ChatGptTurnProgressBroadcaster 
     this.advance(now, "tool_result");
   }
 
+  /** Record a proven continuation/progress milestone without changing the active-call count. */
+  recordActivity(now = Date.now()): void {
+    this.assertNotRetired();
+    if (this.activeToolCalls <= 0) {
+      throw new Error("ChatGPT external progress received activity without an active call");
+    }
+    this.advance(now, "activity");
+  }
+
   /** Retire every unresolved batch when the broker capability can no longer accept its result. */
   retire(error: Error): boolean {
     if (!(error instanceof Error)) throw new Error("ChatGPT external progress retirement requires an error");
@@ -176,7 +205,7 @@ export class ChatGptExternalTurnProgress extends ChatGptTurnProgressBroadcaster 
     this.assertNotRetired();
   }
 
-  private advance(now: number, event: "tool_batch" | "tool_result"): void {
+  private advance(now: number, event: "tool_batch" | "tool_result" | "activity"): void {
     if (!Number.isFinite(now)) throw new Error("ChatGPT external progress timestamp must be finite");
     this.revision += 1;
     if (event === "tool_batch") this.lastToolBatchRevision = this.revision;

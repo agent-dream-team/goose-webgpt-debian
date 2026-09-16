@@ -517,11 +517,11 @@ test("dead pre-dispatch HTTP owner releases one stage and exact retry can receiv
 
 test("runtime resolves connector-qualified Goose tool aliases before the exact serial tool round", async () => {
   let invokeTool!: (input: RebuildPersistentBrowserTurnInput) => Promise<Record<string, unknown>>;
-  let toolWorkInFlight!: () => boolean;
+  let toolWorkSnapshot!: RebuildPersistentBrowserTurnInput["gooseWork"]["snapshot"];
   let boundaryCaptures = 0;
   const driver: RebuildPersistentBrowserDriver = {
     createTurn(input) {
-      toolWorkInFlight = input.gooseWork.isToolWorkInFlight;
+      toolWorkSnapshot = input.gooseWork.snapshot;
       return {
         captureAnswerBoundary: async opRef => {
           boundaryCaptures += 1;
@@ -569,15 +569,196 @@ test("runtime resolves connector-qualified Goose tool aliases before the exact s
     expect(call).toMatchObject({ name: "tree", argumentsJson: canonicalJson({ path: "." }) });
     expect(boundaryCaptures).toBe(1);
     expect(runtime.broker.getOperation(call.callId)?.state).toBe("CLAIMED");
-    expect(toolWorkInFlight()).toBeTrue();
+    expect(toolWorkSnapshot().activeToolCalls).toBe(1);
 
     const second = await post(runtime, continuationBody(initial, call.callId, "tool-output"), "goose-tool");
     expect(second.status).toBe(200);
     expect(await second.text()).toContain("runtime-tool-loop-ok");
     expect(runtime.broker.getOperation(call.callId)?.state).toBe("SUCCESS");
-    expect(toolWorkInFlight()).toBeFalse();
+    expect(toolWorkSnapshot().activeToolCalls).toBe(0);
     expect(runtime.broker.getAccountSlotHolder()).toBeNull();
     expect(runtime.broker.getCurrentEpoch("goose-tool")).toMatchObject({ leaseState: "IDLE", historyWatermark: watermark(continuationBody(initial, call.callId, "tool-output"), "runtime-tool-loop-ok") });
+  } finally {
+    await connector.client.close().catch(() => {});
+  }
+});
+
+test("authenticated owner termination quarantines a claimed tool once and retains its slot through late-result rejection", async () => {
+  let invokeTool!: (input: RebuildPersistentBrowserTurnInput) => Promise<any>;
+  const toolSettled = deferred<any>();
+  const ownerTerminated = deferred<void>();
+  let terminations = 0;
+  const conversationId = "bbbbbbbb-cccc-4ddd-8eee-000000000123";
+  const driver: RebuildPersistentBrowserDriver = {
+    createTurn(input) {
+      return {
+        captureAnswerBoundary: async opRef => JSON.stringify({ kind: "owner-terminal-boundary", opRef }),
+        confirmFinal: async evidence => evidence,
+        terminateOwner: async () => {
+          terminations += 1;
+          ownerTerminated.resolve();
+        },
+        run: async () => {
+          input.lifecycle.onSendActivated();
+          input.lifecycle.onAccepted({ canonicalConversationId: conversationId, acceptedUserTurnId: "user-owner-terminal" });
+          toolSettled.resolve(await invokeTool(input));
+          await ownerTerminated.promise;
+          throw new Error("authoritative owner terminated");
+        },
+      };
+    },
+  };
+  const { runtime, authorization } = setup(driver);
+  const connector = connectorClient(runtime, authorization);
+  await connector.client.connect(connector.transport);
+  invokeTool = input => connector.client.callTool({ name: "goose_tool", arguments: {
+    turn_ref: input.turnRef,
+    op_ref: input.initialOpRef,
+    tool_name: "tree",
+    arguments: { path: "." },
+  } });
+
+  try {
+    const initial = requestBody("owner-terminal");
+    const first = await post(runtime, initial, "goose-owner-terminal");
+    const call = responseFunctionCall(await first.text());
+    const turn = runtime.broker.getOpenTurnForSession("goose-owner-terminal")!;
+    expect(runtime.broker.getOperation(call.callId)?.state).toBe("CLAIMED");
+
+    const wrongIdentity = await fetch(`${runtime.origin}/admin/terminate-turn-owner`, {
+      method: "POST",
+      headers: { authorization: "Bearer control-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        turn_ref: turn.turnRef, goose_session_id: "wrong-session", reason: "terminal_response",
+      }),
+    });
+    expect(wrongIdentity.status).toBe(409);
+    expect(runtime.broker.getOperation(call.callId)?.state).toBe("CLAIMED");
+
+    const terminated = await fetch(`${runtime.origin}/admin/terminate-turn-owner`, {
+      method: "POST",
+      headers: { authorization: "Bearer control-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        turn_ref: turn.turnRef, goose_session_id: "goose-owner-terminal", reason: "terminal_response",
+      }),
+    });
+    expect(terminated.status).toBe(200);
+    expect(await terminated.json()).toMatchObject({
+      status: "ok", turn_state: "UNRECONCILED", slot_retained: true,
+      unreconciled_reason: "goose_owner_terminal_response",
+    });
+    expect((await toolSettled.promise).structuredContent).toMatchObject({ ok: false, output: "UNCERTAIN" });
+    expect(runtime.broker.getOperation(call.callId)).toMatchObject({ state: "UNCERTAIN", ownerId: null });
+    expect(runtime.broker.getAccountSlotHolders().some(holder => holder.turnRef === turn.turnRef)).toBeTrue();
+    expect(terminations).toBe(1);
+
+    const repeated = await fetch(`${runtime.origin}/admin/terminate-turn-owner`, {
+      method: "POST",
+      headers: { authorization: "Bearer control-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        turn_ref: turn.turnRef, goose_session_id: "goose-owner-terminal", reason: "terminal_response",
+      }),
+    });
+    expect(repeated.status).toBe(200);
+    expect(terminations).toBe(1);
+
+    const late = await post(runtime, continuationBody(initial, call.callId, "late-tool-output"), "goose-owner-terminal");
+    expect(late.status).toBe(409);
+    expect(await late.text()).toContain("turn_unreconciled");
+
+    const reconciled = await fetch(`${runtime.origin}/admin/reconcile-operation`, {
+      method: "POST",
+      headers: { authorization: "Bearer control-token", "content-type": "application/json" },
+      body: JSON.stringify({
+        turn_ref: turn.turnRef,
+        op_ref: call.callId,
+        tool_name: "tree",
+        arguments: { path: "." },
+        outcome: "SUCCESS",
+        data_class: "task",
+        content: "known-late-result",
+      }),
+    });
+    expect(reconciled.status).toBe(200);
+    expect(runtime.broker.getOperation(call.callId)?.state).toBe("SUCCESS");
+    expect(runtime.broker.getAccountSlotHolders().some(holder => holder.turnRef === turn.turnRef)).toBeTrue();
+
+    const released = runtime.broker.releaseSlotAfterPositiveTerminal(turn.turnRef, {
+      canonicalConversationId: conversationId,
+      acceptedUserTurnId: "user-owner-terminal",
+      remoteUiNonRunningAcrossQualifiedSettle: true,
+      noUnresolvedGooseWork: true,
+      noContradictoryActivity: true,
+    });
+    expect(released.state).toBe("UNRECONCILED");
+    expect(runtime.broker.getAccountSlotHolders().some(holder => holder.turnRef === turn.turnRef)).toBeFalse();
+  } finally {
+    await connector.client.close().catch(() => {});
+  }
+});
+
+test("semantic-progress expiry quarantines the claim and detaches after unresolved browser final", async () => {
+  let invokeTool!: (input: RebuildPersistentBrowserTurnInput) => Promise<any>;
+  let expireStalled!: RebuildPersistentBrowserTurnInput["gooseWork"]["quarantineStalledToolWork"];
+  let progressSnapshot!: RebuildPersistentBrowserTurnInput["gooseWork"]["snapshot"];
+  const toolSettled = deferred<any>();
+  const detached = deferred<void>();
+  let detachments = 0;
+  const driver: RebuildPersistentBrowserDriver = {
+    createTurn(input) {
+      expireStalled = input.gooseWork.quarantineStalledToolWork;
+      progressSnapshot = input.gooseWork.snapshot;
+      return {
+        captureAnswerBoundary: async opRef => JSON.stringify({ kind: "semantic-timeout-boundary", opRef }),
+        confirmFinal: async evidence => evidence,
+        terminateOwner: async () => {
+          detachments += 1;
+          detached.resolve();
+        },
+        run: async () => {
+          input.lifecycle.onSendActivated();
+          input.lifecycle.onAccepted({
+            canonicalConversationId: "bbbbbbbb-cccc-4ddd-8eee-000000000124",
+            acceptedUserTurnId: "user-semantic-timeout",
+          });
+          toolSettled.resolve(await invokeTool(input));
+          return {
+            canonicalConversationId: "bbbbbbbb-cccc-4ddd-8eee-000000000124",
+            acceptedUserTurnId: "user-semantic-timeout",
+            text: "remote final after uncertain tool",
+            remoteNonRunning: true,
+          };
+        },
+      };
+    },
+  };
+  const { runtime, authorization } = setup(driver);
+  const connector = connectorClient(runtime, authorization);
+  await connector.client.connect(connector.transport);
+  invokeTool = input => connector.client.callTool({ name: "goose_tool", arguments: {
+    turn_ref: input.turnRef,
+    op_ref: input.initialOpRef,
+    tool_name: "tree",
+    arguments: { path: "." },
+  } });
+
+  try {
+    const first = await post(runtime, requestBody("semantic-timeout"), "goose-semantic-timeout");
+    const call = responseFunctionCall(await first.text());
+    const staleRevision = progressSnapshot().revision;
+    expect(progressSnapshot().activeToolCalls).toBe(1);
+    expect(await expireStalled(staleRevision)).toBeTrue();
+    expect(await expireStalled(staleRevision)).toBeFalse();
+    expect((await toolSettled.promise).structuredContent).toMatchObject({ ok: false, output: "UNCERTAIN" });
+    await detached.promise;
+
+    expect(detachments).toBe(1);
+    expect(runtime.broker.getOperation(call.callId)?.state).toBe("UNCERTAIN");
+    expect(runtime.broker.getOpenTurnForSession("goose-semantic-timeout")).toMatchObject({
+      state: "UNRECONCILED", unreconciledReason: "goose_tool_semantic_progress_stalled",
+    });
+    expect(runtime.broker.getAccountSlotHolders().some(holder => holder.turnRef
+      === runtime.broker.getOpenTurnForSession("goose-semantic-timeout")?.turnRef)).toBeTrue();
   } finally {
     await connector.client.close().catch(() => {});
   }

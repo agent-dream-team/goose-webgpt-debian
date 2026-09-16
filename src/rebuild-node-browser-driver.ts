@@ -30,6 +30,8 @@ type WorkerMessage =
   | { type: "candidate"; evidence: RebuildBrowserFinalEvidence }
   | { type: "confirmed"; evidence: RebuildBrowserFinalEvidence }
   | { type: "boundary"; requestId: number; boundaryJson?: string; error?: string }
+  | { type: "quarantine_tool"; requestId: number; expectedRevision: number }
+  | { type: "owner_terminated" }
   | { type: "error"; message: string };
 
 interface Deferred<T> {
@@ -75,12 +77,13 @@ export function createRebuildNodeBrowserDriver(
       let runStarted = false;
       let candidate: RebuildBrowserFinalEvidence | undefined;
       let terminal = false;
-      let latestToolState: boolean | undefined;
+      let latestToolProgressRevision = -1;
       let toolTimer: ReturnType<typeof setInterval> | undefined;
       let boundaryRequestId = 0;
       const ready = deferred<void>();
       const runResult = deferred<RebuildBrowserFinalEvidence>();
       const confirmResult = deferred<RebuildBrowserFinalEvidence>();
+      const ownerTerminationResult = deferred<void>();
       const boundaries = new Map<number, Deferred<string>>();
       let messageChain = Promise.resolve();
       let stderrTail = "";
@@ -91,6 +94,7 @@ export function createRebuildNodeBrowserDriver(
         ready.reject(error);
         runResult.reject(error);
         confirmResult.reject(error);
+        ownerTerminationResult.reject(error);
         for (const pending of boundaries.values()) pending.reject(error);
         boundaries.clear();
         if (toolTimer) clearInterval(toolTimer);
@@ -174,6 +178,34 @@ export function createRebuildNodeBrowserDriver(
           pending.resolve(message.boundaryJson);
           return;
         }
+        if (message.type === "quarantine_tool") {
+          const quarantined = await input.gooseWork.quarantineStalledToolWork(message.expectedRevision);
+          const snapshot = input.gooseWork.snapshot();
+          latestToolProgressRevision = snapshot.revision;
+          await send({
+            type: "quarantine_tool_ack",
+            requestId: message.requestId,
+            quarantined,
+            snapshot,
+          });
+          return;
+        }
+        if (message.type === "owner_terminated") {
+          ownerTerminationResult.resolve();
+          if (!terminal) {
+            // The acknowledgement is the terminal fence. Settle parent promises here because
+            // stopping the disposable child may race with its later diagnostic error frame.
+            terminal = true;
+            const error = new Error("authoritative owner terminated Node browser worker");
+            runResult.reject(error);
+            confirmResult.reject(error);
+            for (const pending of boundaries.values()) pending.reject(error);
+            boundaries.clear();
+            if (toolTimer) clearInterval(toolTimer);
+            toolTimer = undefined;
+          }
+          return;
+        }
         if (message.type === "error") throw new Error(message.message);
       };
 
@@ -227,10 +259,10 @@ export function createRebuildNodeBrowserDriver(
         input.preSendAbortSignal.addEventListener("abort", abort, { once: true });
         if (input.preSendAbortSignal.aborted) abort();
         const publishToolState = () => {
-          const next = input.gooseWork.isToolWorkInFlight();
-          if (next === latestToolState) return;
-          latestToolState = next;
-          void send({ type: "tool_state", inFlight: next }).catch(fail);
+          const next = input.gooseWork.snapshot();
+          if (next.revision === latestToolProgressRevision) return;
+          latestToolProgressRevision = next.revision;
+          void send({ type: "tool_progress", snapshot: next }).catch(fail);
         };
         publishToolState();
         toolTimer = setInterval(publishToolState, toolStatePollMs);
@@ -238,6 +270,12 @@ export function createRebuildNodeBrowserDriver(
       };
 
       return {
+        terminateOwner: async reason => {
+          if (!runStarted) throw new Error("Node browser owner termination requires an active run");
+          await send({ type: "terminate_owner", reason });
+          try { await ownerTerminationResult.promise; }
+          finally { stopWorker(); }
+        },
         run: async () => {
           if (runStarted) throw new Error("Node browser turn run() may be called only once");
           runStarted = true;

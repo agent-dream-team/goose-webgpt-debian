@@ -89,6 +89,70 @@ out({ type: "ready", version: 1 });
   return path;
 }
 
+function recoveryControlWorkerFixture(): string {
+  const root = mkdtempSync(join(tmpdir(), "cgw-node-browser-driver-recovery-test-"));
+  ROOTS.push(root);
+  const path = join(root, "worker.mjs");
+  writeFileSync(path, `
+import { createInterface } from "node:readline";
+const out = value => process.stdout.write(JSON.stringify(value) + "\\n");
+const accepted = { canonicalConversationId: ${JSON.stringify(CONVERSATION)}, acceptedUserTurnId: "user-fixture" };
+const final = { ...accepted, text: "recovered fixture final", remoteNonRunning: true };
+let latestProgress;
+createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", line => {
+  const message = JSON.parse(line);
+  if (message.type === "start") return out({ type: "lifecycle", event: "send_activated" });
+  if (message.type === "tool_progress") { latestProgress = message.snapshot; return; }
+  if (message.type === "lifecycle_ack" && message.event === "send_activated") {
+    return out({ type: "lifecycle", event: "accepted", evidence: accepted });
+  }
+  if (message.type === "lifecycle_ack" && message.event === "accepted") {
+    return out({ type: "quarantine_tool", requestId: 7, expectedRevision: latestProgress.revision });
+  }
+  if (message.type === "quarantine_tool_ack") {
+    if (!message.quarantined || message.snapshot.activeToolCalls !== 0) {
+      return out({ type: "error", message: "quarantine acknowledgement invalid" });
+    }
+    return out({ type: "candidate", evidence: final });
+  }
+  if (message.type === "terminate_owner") {
+    out({ type: "owner_terminated" });
+    return out({ type: "error", message: "authoritative owner terminated" });
+  }
+  if (message.type === "confirm") {
+    out({ type: "confirmed", evidence: final });
+    return setImmediate(() => process.exit(0));
+  }
+});
+out({ type: "ready", version: 1 });
+`, { mode: 0o600 });
+  return path;
+}
+
+function ownerTerminationWorkerFixture(): string {
+  const root = mkdtempSync(join(tmpdir(), "cgw-node-browser-driver-owner-test-"));
+  ROOTS.push(root);
+  const path = join(root, "worker.mjs");
+  writeFileSync(path, `
+import { createInterface } from "node:readline";
+const out = value => process.stdout.write(JSON.stringify(value) + "\\n");
+const accepted = { canonicalConversationId: ${JSON.stringify(CONVERSATION)}, acceptedUserTurnId: "user-fixture" };
+createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", line => {
+  const message = JSON.parse(line);
+  if (message.type === "start") return out({ type: "lifecycle", event: "send_activated" });
+  if (message.type === "lifecycle_ack" && message.event === "send_activated") {
+    return out({ type: "lifecycle", event: "accepted", evidence: accepted });
+  }
+  if (message.type === "terminate_owner") {
+    out({ type: "owner_terminated" });
+    return out({ type: "error", message: "authoritative owner terminated" });
+  }
+});
+out({ type: "ready", version: 1 });
+`, { mode: 0o600 });
+  return path;
+}
+
 function turnInput(overrides: Partial<RebuildPersistentBrowserTurnInput> = {}): RebuildPersistentBrowserTurnInput {
   return {
     turnRef: "turn-fixture",
@@ -99,7 +163,10 @@ function turnInput(overrides: Partial<RebuildPersistentBrowserTurnInput> = {}): 
     prompt: "private prompt sentinel",
     existingConversationId: null,
     preSendAbortSignal: new AbortController().signal,
-    gooseWork: { isToolWorkInFlight: () => false },
+    gooseWork: {
+      snapshot: () => ({ revision: 0, lastToolBatchRevision: 0, activeToolCalls: 0 }),
+      quarantineStalledToolWork: async () => false,
+    },
     lifecycle: {
       onSendActivated: () => {},
       onAccepted: () => {},
@@ -177,4 +244,42 @@ test("boundary refusal rejects only that request while the browser turn remains 
   const candidate = await running;
   expect(candidate.text).toBe("fixture final");
   expect(await execution.confirmFinal(candidate)).toEqual(candidate);
+});
+
+test("worker stale-progress quarantine round-trips through the authoritative parent snapshot", async () => {
+  let progress = { revision: 1, lastToolBatchRevision: 1, activeToolCalls: 1, lastProgressAt: 1 };
+  let quarantines = 0;
+  const execution = driver(recoveryControlWorkerFixture()).createTurn(turnInput({
+    gooseWork: {
+      snapshot: () => ({ ...progress }),
+      quarantineStalledToolWork: async expectedRevision => {
+        expect(expectedRevision).toBe(1);
+        quarantines += 1;
+        progress = { ...progress, revision: 2, activeToolCalls: 0 };
+        return true;
+      },
+    },
+  }));
+
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("recovered fixture final");
+  expect(quarantines).toBe(1);
+  expect(await execution.confirmFinal(candidate)).toEqual(candidate);
+});
+
+test("authoritative owner termination is acknowledged by the worker before process cleanup", async () => {
+  let resolveAccepted!: () => void;
+  const accepted = new Promise<void>(resolve => { resolveAccepted = resolve; });
+  const execution = driver(ownerTerminationWorkerFixture()).createTurn(turnInput({
+    lifecycle: { onSendActivated: () => {}, onAccepted: () => resolveAccepted() },
+  }));
+  const running = execution.run();
+  await accepted;
+  const rejection = running.then(
+    () => new Error("browser execution unexpectedly completed"),
+    error => error as Error,
+  );
+
+  await execution.terminateOwner?.("terminal_response");
+  expect((await rejection).message).toContain("authoritative owner terminated");
 });
