@@ -188,7 +188,7 @@ function rebuildConnectorUrl(config) {
   return `http://127.0.0.1:${port}/mcp`;
 }
 
-function managedTunnelConnectArgs(config, invocation, runtimeBinaryPath) {
+function managedTunnelConnectArgs(config, invocation) {
   const tunnel = config.tunnel;
   if (!tunnel) throw new Error("launcher-owned tunnel has no runtime configuration");
   const target = runtimeKind(config) === "persistent-rebuild"
@@ -199,7 +199,7 @@ function managedTunnelConnectArgs(config, invocation, runtimeBinaryPath) {
     "--alias", tunnel.alias,
     "--profile", tunnel.profileName,
     "--profile-dir", tunnel.profileDir,
-    "--tunnel-client-bin", runtimeBinaryPath || tunnel.runtimeBinaryPath || tunnel.binaryPath,
+    "--tunnel-client-bin", tunnel.binaryPath,
     "--tunnel-id", tunnel.tunnelId,
     "--runtime-api-key", `file:${tunnel.runtimeKeyFile}`,
     ...target,
@@ -1108,9 +1108,10 @@ class RuntimeSupervisor {
     }
     return await this.runTunnelCommand(
       config,
-      managedTunnelConnectArgs(config, invocation, this.managedTunnelRuntimeBinary(config)),
+      managedTunnelConnectArgs(config, invocation),
       TUNNEL_START_TIMEOUT_MS,
       "Tunnel managed startup",
+      this.managedTunnelRuntimeBinary(config),
     );
   }
 
@@ -1658,11 +1659,11 @@ class RuntimeSupervisor {
     );
   }
 
-  async runTunnelCommand(config, args, timeoutMs, label) {
+  async runTunnelCommand(config, args, timeoutMs, label, executable) {
     const tunnel = config.tunnel;
     if (!tunnel) throw new Error("launcher-owned tunnel has no runtime configuration");
     return await new Promise((resolve, reject) => {
-      const child = spawn(tunnel.binaryPath, args, {
+      const child = spawn(executable || tunnel.binaryPath, args, {
         cwd: tunnel.profileDir,
         detached: DETACH_OWNED_CHILD,
         stdio: ["ignore", "pipe", "pipe"],

@@ -3176,6 +3176,7 @@ describe("ChatGPT outer-native harness v4", () => {
     const client = new Client({ name: "codex-chatgpt-web-mcp-abort-test", version: "1.0.0" });
 
     try {
+      expect(CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS).toBe(110_000);
       expect(chatGptMcpInvocationTimeout(environment)).toBe(CHATGPT_WEB_MCP_INVOCATION_TIMEOUT_MS);
       expect(chatGptMcpInvocationTimeout({ ...environment, expiresAt: 1_500 }, 1_000)).toBe(500);
       await client.connect(transport);

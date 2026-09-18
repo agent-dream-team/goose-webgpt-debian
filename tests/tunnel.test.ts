@@ -2,8 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { TUNNEL_VERSION, parseTunnelStatus, tunnelClientInstallAction, tunnelCommandOutput, tunnelConnectLaunchError } from "../src/tunnel";
 
 test("pins the fixed tunnel-client and migrates only the previously shipped version", () => {
-  expect(TUNNEL_VERSION).toBe("0.0.12");
-  expect(tunnelClientInstallAction("0.0.12")).toBe("reuse");
+  expect(TUNNEL_VERSION).toBe("0.0.14");
+  expect(tunnelClientInstallAction("0.0.14")).toBe("reuse");
+  expect(tunnelClientInstallAction("0.0.12")).toBe("upgrade");
   expect(tunnelClientInstallAction("0.0.10")).toBe("upgrade");
   expect(() => tunnelClientInstallAction("0.0.11")).toThrow("not a trusted upgrade source");
   expect(() => tunnelClientInstallAction("9.9.9")).toThrow("not a trusted upgrade source");

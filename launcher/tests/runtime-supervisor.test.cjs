@@ -2000,12 +2000,9 @@ test("packaged Linux persistent rebuild uses the installed checked runtime tunne
       browserDescriptorPath: descriptorPath,
     });
     assert.equal(supervisor.managedTunnelRuntimeBinary(config), ownedWrapper);
-    assert.equal(
-      managedTunnelConnectArgs(config, undefined, supervisor.managedTunnelRuntimeBinary(config))[
-        managedTunnelConnectArgs(config, undefined, supervisor.managedTunnelRuntimeBinary(config)).indexOf("--tunnel-client-bin") + 1
-      ],
-      ownedWrapper,
-    );
+    const connectArgs = managedTunnelConnectArgs(config);
+    assert.equal(connectArgs[connectArgs.indexOf("--tunnel-client-bin") + 1], config.tunnel.binaryPath);
+    assert.notEqual(supervisor.managedTunnelRuntimeBinary(config), config.tunnel.binaryPath);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -2041,7 +2038,7 @@ test("persistent rebuild tunnel uses the daemon HTTP connector and managed auth 
   const args = managedTunnelConnectArgs(validated);
   assert.equal(args.includes("--mcp-command"), false);
   assert.equal(args[args.indexOf("--mcp-server-url") + 1], "http://127.0.0.1:38883/mcp");
-  assert.equal(args[args.indexOf("--tunnel-client-bin") + 1], config.tunnel.runtimeBinaryPath);
+  assert.equal(args[args.indexOf("--tunnel-client-bin") + 1], config.tunnel.binaryPath);
 });
 
 test("persistent rebuild starts its HTTP daemon before connecting the tunnel", async () => {

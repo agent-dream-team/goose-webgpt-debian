@@ -24,7 +24,7 @@ function fixture(base: string): { real: string; auth: string; capture: string } 
   const capture = join(base, "capture.json");
   writeFileSync(auth, `${SECRET}\n`, { mode: 0o600 });
   chmodSync(auth, 0o600);
-  writeFileSync(real, `#!/usr/bin/env bash\nset -euo pipefail\npython3 - "$CGW_TEST_CAPTURE" "$@" <<'PY'\nimport hashlib,json,os,sys\nout=sys.argv[1]\nargs=sys.argv[2:]\nvalue=os.environ.get("CGW_REBUILD_CONNECTOR_AUTHORIZATION", "")\nwith open(out,"w") as f:\n    json.dump({"args":args,"authorizationSha256":hashlib.sha256(value.encode()).hexdigest()},f)\nPY\n`, { mode: 0o755 });
+  writeFileSync(real, `#!/usr/bin/env bash\nset -euo pipefail\npython3 - "$CGW_TEST_CAPTURE" "$@" <<'PY'\nimport hashlib,json,os,sys\nout=sys.argv[1]\nargs=sys.argv[2:]\nvalue=os.environ.get("CGW_REBUILD_CONNECTOR_AUTHORIZATION", "")\nwith open(out,"w") as f:\n    json.dump({"args":args,"authorizationSha256":hashlib.sha256(value.encode()).hexdigest(),"mcpExtraHeaders":os.environ.get("MCP_EXTRA_HEADERS", ""),"mcpDiscoveryExtraHeaders":os.environ.get("MCP_DISCOVERY_EXTRA_HEADERS", "")},f)\nPY\n`, { mode: 0o755 });
   chmodSync(real, 0o755);
   return { real, auth, capture };
 }
@@ -69,6 +69,21 @@ test("forwards caller args and injects request plus discovery auth through envir
   expect(JSON.stringify(captured.args)).not.toContain(SECRET);
   expect(result.stdout).not.toContain(SECRET);
   expect(result.stderr).not.toContain(SECRET);
+});
+
+
+test("runtimes connect injects auth through inherited MCP header environment without unsupported flags", async () => {
+  const base = root();
+  const { real, auth, capture } = fixture(base);
+  const callerArgs = ["runtimes", "connect", "--alias", "gcw", "--tunnel-client-bin", real];
+  const result = await run({ real, auth, capture, testing: true, args: callerArgs });
+  expect(result).toEqual({ code: 0, stdout: "", stderr: "" });
+  const captured = JSON.parse(await Bun.file(capture).text()) as { args: string[]; authorizationSha256: string; mcpExtraHeaders: string; mcpDiscoveryExtraHeaders: string };
+  expect(captured.args).toEqual(callerArgs);
+  expect(captured.mcpExtraHeaders).toBe("Authorization: env:CGW_REBUILD_CONNECTOR_AUTHORIZATION");
+  expect(captured.mcpDiscoveryExtraHeaders).toBe("Authorization: env:CGW_REBUILD_CONNECTOR_AUTHORIZATION");
+  expect(captured.authorizationSha256).toBe(createHash("sha256").update(SECRET).digest("hex"));
+  expect(JSON.stringify(captured)).not.toContain(SECRET);
 });
 
 test("production invocation follows CODEX_CHATGPT_WEB_HOME without test-only path overrides", async () => {
