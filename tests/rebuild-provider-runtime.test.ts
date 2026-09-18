@@ -1236,7 +1236,6 @@ test("provider restart recovers an exact durable terminal-tool continuation with
                 acceptedUserTurnId,
                 text: "recovered-terminal-final",
                 remoteNonRunning: true,
-                contentAdvancedAfterLastTool: true,
               };
             },
           };
@@ -1261,6 +1260,146 @@ test("provider restart recovers an exact durable terminal-tool continuation with
       expect(decodeGooseResponsesProjectionCheckpoint(recoveredTurn!.checkpointJson).requestHash)
         .toBe(previousCheckpoint.requestHash);
     }
+  }
+});
+
+test("qualified-terminal recovery does not bless a later new tool boundary", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-rebuild-provider-qualified-terminal-boundary-"));
+  roots.push(root);
+  const brokerPath = join(root, "broker.sqlite");
+  const authorizationFile = join(root, "connector-auth.txt");
+  const authorization = "Bearer " + "q".repeat(64);
+  writeFileSync(authorizationFile, authorization + "\n", { mode: 0o600 });
+  chmodSync(authorizationFile, 0o600);
+
+  const sessionId = "goose-qualified-terminal-boundary";
+  const conversationId = "aaaaaaaa-bbbb-4ccc-8ddd-000000000807";
+  const acceptedUserTurnId = "user-qualified-terminal-boundary";
+  const previous = requestBody("qualified-terminal-boundary");
+  const previousCheckpoint = gooseResponsesProjectionCheckpoint(previous);
+  let opSequence = 0;
+  const seed = new SessionBroker(brokerPath, {
+    projectId: "project-qualified-terminal-boundary",
+    instanceId: "seed",
+    terminalReplayWindowMs: 60_000,
+    makeTurnRef: () => "turn-qualified-terminal-boundary",
+    makeSubmitNonce: () => "nonce-qualified-terminal-boundary",
+    makeOpRef: () => "op-qualified-terminal-boundary-" + String(++opSequence),
+  });
+  seed.createEpoch({ gooseSessionId: sessionId });
+  const turn = seed.enqueueTurn({
+    gooseSessionId: sessionId,
+    requestHash: previousCheckpoint.requestHash,
+    checkpointJson: encodeGooseResponsesProjectionCheckpoint(previousCheckpoint),
+  });
+  const admitted = seed.admitNext()!;
+  seed.markSendActivated(turn.turnRef);
+  seed.bindConversation({ gooseSessionId: sessionId, epoch: 1, conversationId });
+  seed.markAccepted(turn.turnRef, acceptedUserTurnId);
+  seed.recordAnswerBoundary(turn.turnRef, admitted.initialOpRef, '{"chars":1}');
+  const originalArgs = { path: "." };
+  const originalInputHash = connectorOperationInputHash("tree", originalArgs);
+  expect(seed.claimOperation({
+    turnRef: turn.turnRef,
+    opRef: admitted.initialOpRef,
+    inputHash: originalInputHash,
+  }).kind).toBe("EXECUTE");
+  const originalTerminal = prepareConnectorTerminalResult({
+    outcome: "SUCCESS",
+    dataClass: "task",
+    content: "known-tool-result",
+  });
+  const completed = seed.completeOperation({
+    opRef: admitted.initialOpRef,
+    inputHash: originalInputHash,
+    outcome: originalTerminal.outcome,
+    resultJson: originalTerminal.resultJson,
+  });
+  const nextOpRef = completed.nextOpRef;
+  seed.markUnreconciled(turn.turnRef, "restart_after_terminal_tool_before_progress_checkpoint");
+  seed.releaseSlotAfterPositiveTerminal(turn.turnRef, {
+    canonicalConversationId: conversationId,
+    acceptedUserTurnId,
+    remoteUiNonRunningAcrossQualifiedSettle: true,
+    noUnresolvedGooseWork: true,
+    noContradictoryActivity: true,
+  });
+  seed.close();
+
+  const continuation = continuationBody(previous, admitted.initialOpRef, "known-tool-result");
+  let invokeNewTool!: () => Promise<Record<string, unknown>>;
+  let browserStarts = 0;
+  const runtime = startRebuildProviderRuntime({
+    port: 0,
+    model: "gpt-4.1",
+    contextWindow: 200_000,
+    controlToken: "control-token",
+    projectId: "project-qualified-terminal-boundary",
+    connectorIdentity: "Goose Native 2nd Shift",
+    brokerPath,
+    terminalReplayWindowMs: 60_000,
+    connectorPort: 0,
+    connectorAuthorizationFile: authorizationFile,
+    browserDriver: {
+      createTurn(input) {
+        browserStarts += 1;
+        return {
+          captureAnswerBoundary: async opRef => JSON.stringify({ kind: "new-boundary", opRef }),
+          confirmFinal: async evidence => evidence,
+          run: async () => {
+            await input.lifecycle.onRebound?.({ canonicalConversationId: conversationId, acceptedUserTurnId });
+            const terminal = await invokeNewTool();
+            expect(terminal).toMatchObject({ ok: true, op_ref: nextOpRef });
+            return {
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId,
+              text: "final-without-post-new-tool-advance",
+              remoteNonRunning: true,
+            };
+          },
+        };
+      },
+    },
+  });
+  runtimes.push(runtime);
+  const connector = connectorClient(runtime, authorization);
+  await connector.client.connect(connector.transport);
+  invokeNewTool = async () => (await connector.client.callTool({
+    name: "goose_tool",
+    arguments: {
+      turn_ref: turn.turnRef,
+      op_ref: nextOpRef,
+      tool_name: "tree",
+      arguments: { path: "src" },
+    },
+  })).structuredContent as Record<string, unknown>;
+
+  try {
+    const first = await post(runtime, continuation, sessionId);
+    expect(first.status).toBe(200);
+    const call = responseFunctionCall(await first.text());
+    expect(call).toEqual({
+      callId: nextOpRef,
+      name: "tree",
+      argumentsJson: canonicalJson({ path: "src" }),
+    });
+
+    const progressed = {
+      ...continuation,
+      input: [
+        ...continuation.input,
+        { type: "function_call", call_id: nextOpRef, name: "tree", arguments: canonicalJson({ path: "src" }) },
+        { type: "function_call_output", call_id: nextOpRef, output: "new-tool-output" },
+      ],
+    };
+    const second = await post(runtime, progressed, sessionId);
+    expect(second.status).toBe(409);
+    expect(await second.text()).toContain("Completion must prove post-tool content or qualified terminal semantics");
+    expect(browserStarts).toBe(1);
+    expect(runtime.broker.getTurn(turn.turnRef)?.state).toBe("UNRECONCILED");
+    expect(runtime.broker.getOperation(nextOpRef)?.state).toBe("SUCCESS");
+  } finally {
+    await connector.client.close().catch(() => {});
   }
 });
 

@@ -142,6 +142,8 @@ interface ActiveExecution {
   preSendAbort: AbortController;
   sendActivated: boolean;
   latestBoundaryOpRef: string | null;
+  /** Positive-terminal recovery qualifies only this exact already-terminal boundary. */
+  qualifiedTerminalBoundaryOpRef: string | null;
   final: Promise<string>;
   executionDetach: Promise<void> | null;
 }
@@ -496,7 +498,12 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         ? {
             opRef: active.latestBoundaryOpRef,
             contentAdvanced: confirmed.contentAdvancedAfterLastTool === true,
-            ...(confirmed.qualifiedTerminalAfterLastTool === true ? { qualifiedTerminal: true } : {}),
+            ...(
+              confirmed.qualifiedTerminalAfterLastTool === true
+              || active.qualifiedTerminalBoundaryOpRef === active.latestBoundaryOpRef
+                ? { qualifiedTerminal: true }
+                : {}
+            ),
           }
         : null,
     });
@@ -578,6 +585,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       preSendAbort,
       sendActivated,
       latestBoundaryOpRef: null,
+      qualifiedTerminalBoundaryOpRef: null,
       final: Promise.resolve("") as Promise<string>,
       executionDetach: null,
     };
@@ -632,6 +640,11 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     const latestTerminal = broker.getLatestTerminalOperationForTurn(turn.turnRef);
     const preSendAbort = new AbortController();
     const restoreSlotOnPreReboundFailure = broker.hasRecordedPositiveTerminalSlotRelease(turn.turnRef);
+    // Provisional only: finalizeExecutionEvidence can consume this after browser.run() has passed
+    // onRebound, which freshly verifies the durable remote conversation/user identity.
+    const qualifiedTerminalBoundaryOpRef = restoreSlotOnPreReboundFailure && latestTerminal?.answerBoundaryJson
+      ? latestTerminal.opRef
+      : null;
     let reboundVerified = false;
     let active!: ActiveExecution;
     let browser: RebuildPersistentBrowserTurnExecution;
@@ -684,6 +697,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       preSendAbort,
       sendActivated: true,
       latestBoundaryOpRef: latestTerminal?.answerBoundaryJson ? latestTerminal.opRef : null,
+      qualifiedTerminalBoundaryOpRef,
       final: Promise.resolve("") as Promise<string>,
       executionDetach: null,
     };
