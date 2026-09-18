@@ -6,8 +6,8 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { canonicalJson } from "../src/canonical-json";
 import { encodeGooseCanonicalHistoryWatermark } from "../src/goose-canonical-history";
-import { encodeGooseResponsesProjectionCheckpoint, gooseResponsesProjectionCheckpoint } from "../src/goose-responses-projection";
-import { connectorOperationInputHash } from "../src/rebuild-connector-http";
+import { decodeGooseResponsesProjectionCheckpoint, encodeGooseResponsesProjectionCheckpoint, gooseResponsesProjectionCheckpoint } from "../src/goose-responses-projection";
+import { connectorOperationInputHash, prepareConnectorTerminalResult } from "../src/rebuild-connector-http";
 import { ChatGptUpstreamTerminalError } from "../src/chatgpt-terminal-state";
 import { SessionBroker } from "../src/session-broker";
 import {
@@ -1055,6 +1055,213 @@ test("provider restart rebinds from the latest durable tool-continuation checkpo
   expect(await response.text()).toContain("rebound-from-continuation");
   expect(browserStarts).toBe(1);
   expect(runtime.broker.getTurn(seeded.turnRef)?.state).toBe("COMPLETE");
+});
+
+
+test("provider restart recovers an exact durable terminal-tool continuation without replaying the tool", async () => {
+  const cases = [
+    { label: "exact", mutate: (_body: ReturnType<typeof continuationBody>) => {}, status: 200, starts: 1, release: true, code: "" },
+    {
+      label: "tampered-call",
+      mutate: (body: ReturnType<typeof continuationBody>) => {
+        (body.input.at(-2) as any).arguments = '{"action":"disable","extension_name":"orchestrator"}';
+      },
+      status: 409,
+      starts: 0,
+      release: true,
+      code: "rebind_request_conflict",
+    },
+    {
+      label: "tampered-output",
+      mutate: (body: ReturnType<typeof continuationBody>) => {
+        (body.input.at(-1) as any).output = "tampered-result";
+      },
+      status: 409,
+      starts: 0,
+      release: true,
+      code: "rebind_request_conflict",
+    },
+    {
+      label: "tampered-prefix",
+      mutate: (body: ReturnType<typeof continuationBody>) => {
+        (body.input[1] as any).content[0].text = "tampered prior user";
+      },
+      status: 409,
+      starts: 0,
+      release: true,
+      code: "rebind_request_conflict",
+    },
+    {
+      label: "tampered-stable-field",
+      mutate: (body: ReturnType<typeof continuationBody>) => {
+        (body as any).max_output_tokens = 2048;
+      },
+      status: 409,
+      starts: 0,
+      release: true,
+      code: "rebind_request_conflict",
+    },
+    {
+      label: "missing-positive-terminal",
+      mutate: (_body: ReturnType<typeof continuationBody>) => {},
+      status: 409,
+      starts: 0,
+      release: false,
+      code: "rebind_recovery_precondition",
+    },
+  ] as const;
+
+  for (const entry of cases) {
+    const root = mkdtempSync(join(tmpdir(), "cgw-rebuild-provider-recovered-terminal-" + entry.label + "-"));
+    roots.push(root);
+    const brokerPath = join(root, "broker.sqlite");
+    const authorizationFile = join(root, "connector-auth.txt");
+    const authorization = "Bearer " + "t".repeat(64);
+    writeFileSync(authorizationFile, authorization + "\n", { mode: 0o600 });
+    chmodSync(authorizationFile, 0o600);
+
+    const sessionId = "goose-recovered-terminal-" + entry.label;
+    const conversationId = entry.label === "exact"
+      ? "aaaaaaaa-bbbb-4ccc-8ddd-000000000801"
+      : entry.label === "tampered-call"
+        ? "aaaaaaaa-bbbb-4ccc-8ddd-000000000802"
+        : entry.label === "tampered-output"
+          ? "aaaaaaaa-bbbb-4ccc-8ddd-000000000803"
+          : entry.label === "tampered-prefix"
+            ? "aaaaaaaa-bbbb-4ccc-8ddd-000000000804"
+            : entry.label === "tampered-stable-field"
+              ? "aaaaaaaa-bbbb-4ccc-8ddd-000000000805"
+              : "aaaaaaaa-bbbb-4ccc-8ddd-000000000806";
+    const acceptedUserTurnId = "user-recovered-terminal-" + entry.label;
+    const previous = requestBody("recovered-terminal-" + entry.label);
+    (previous as any).store = false;
+    (previous as any).max_output_tokens = 1024;
+    const previousCheckpoint = gooseResponsesProjectionCheckpoint(previous);
+    let opSequence = 0;
+    const seed = new SessionBroker(brokerPath, {
+      projectId: "project-recovered-terminal",
+      instanceId: "seed",
+      terminalReplayWindowMs: 60_000,
+      makeTurnRef: () => "turn-recovered-terminal-" + entry.label,
+      makeSubmitNonce: () => "nonce-recovered-terminal-" + entry.label,
+      makeOpRef: () => "op-recovered-terminal-" + entry.label + "-" + String(++opSequence),
+    });
+    seed.createEpoch({ gooseSessionId: sessionId });
+    const turn = seed.enqueueTurn({
+      gooseSessionId: sessionId,
+      requestHash: previousCheckpoint.requestHash,
+      checkpointJson: encodeGooseResponsesProjectionCheckpoint(previousCheckpoint),
+    });
+    const admitted = seed.admitNext()!;
+    seed.markSendActivated(turn.turnRef);
+    seed.bindConversation({ gooseSessionId: sessionId, epoch: 1, conversationId });
+    seed.markAccepted(turn.turnRef, acceptedUserTurnId);
+    seed.recordAnswerBoundary(turn.turnRef, admitted.initialOpRef, '{"chars":1}');
+    const extensionArgs = { action: "enable", extension_name: "orchestrator" };
+    const inputHash = connectorOperationInputHash("extensionmanager__manage_extensions", extensionArgs);
+    expect(seed.claimOperation({
+      turnRef: turn.turnRef,
+      opRef: admitted.initialOpRef,
+      inputHash,
+    }).kind).toBe("EXECUTE");
+    const terminal = prepareConnectorTerminalResult({
+      outcome: "SUCCESS",
+      dataClass: "task",
+      content: "known-tool-result",
+    });
+    seed.completeOperation({
+      opRef: admitted.initialOpRef,
+      inputHash,
+      outcome: terminal.outcome,
+      resultJson: terminal.resultJson,
+    });
+    // Model the crash window Pair A hit: the connector result is durable, but the next
+    // Responses continuation never atomically advanced checkpoint_json before restart.
+    seed.markUnreconciled(turn.turnRef, "restart_after_terminal_tool_before_progress_checkpoint");
+    if (entry.release) {
+      seed.releaseSlotAfterPositiveTerminal(turn.turnRef, {
+        canonicalConversationId: conversationId,
+        acceptedUserTurnId,
+        remoteUiNonRunningAcrossQualifiedSettle: true,
+        noUnresolvedGooseWork: true,
+        noContradictoryActivity: true,
+      });
+    }
+    seed.close();
+
+    const continuation = continuationBody(previous, admitted.initialOpRef, "known-tool-result");
+    const recoveredCall = continuation.input.at(-2) as any;
+    recoveredCall.name = "extensionmanager__manage_extensions";
+    recoveredCall.arguments = '{"action":"enable","extension_name":"orchestrator"}';
+    // Enabling an extension can legitimately change both the system projection and advertised
+    // tool registry before Goose sends the already-durable tool continuation.
+    (continuation.input[0] as any).content[0].text = "system after extension change";
+    continuation.tools = [
+      ...continuation.tools,
+      { type: "function", name: "orchestrator", parameters: { type: "object" } },
+    ];
+    entry.mutate(continuation);
+
+    let browserStarts = 0;
+    const runtime = startRebuildProviderRuntime({
+      port: 0,
+      model: "gpt-4.1",
+      contextWindow: 200_000,
+      controlToken: "control-token",
+      projectId: "project-recovered-terminal",
+      connectorIdentity: "Goose Native 2nd Shift",
+      brokerPath,
+      terminalReplayWindowMs: 60_000,
+      connectorPort: 0,
+      connectorAuthorizationFile: authorizationFile,
+      browserDriver: {
+        createTurn(input) {
+          browserStarts += 1;
+          expect(input.prompt).toBe("");
+          expect(input.existingConversationId).toBe(conversationId);
+          expect(input.resumeAccepted).toEqual({
+            canonicalConversationId: conversationId,
+            acceptedUserTurnId,
+          });
+          return {
+            captureAnswerBoundary: async () => { throw new Error("no new tool expected"); },
+            confirmFinal: async evidence => evidence,
+            run: async () => {
+              await input.lifecycle.onRebound?.({
+                canonicalConversationId: conversationId,
+                acceptedUserTurnId,
+              });
+              return {
+                canonicalConversationId: conversationId,
+                acceptedUserTurnId,
+                text: "recovered-terminal-final",
+                remoteNonRunning: true,
+                contentAdvancedAfterLastTool: true,
+              };
+            },
+          };
+        },
+      },
+    });
+    runtimes.push(runtime);
+
+    const response = await post(runtime, continuation, sessionId);
+    expect(response.status).toBe(entry.status);
+    expect(browserStarts).toBe(entry.starts);
+    const responseText = await response.text();
+    const recoveredTurn = runtime.broker.getTurn(turn.turnRef);
+    if (entry.status === 200) {
+      expect(responseText).toContain("recovered-terminal-final");
+      expect(recoveredTurn?.state).toBe("COMPLETE");
+      expect(decodeGooseResponsesProjectionCheckpoint(recoveredTurn!.checkpointJson).requestHash)
+        .toBe(gooseResponsesProjectionCheckpoint(continuation).requestHash);
+    } else {
+      expect(responseText).toContain(entry.code);
+      expect(recoveredTurn?.state).toBe("UNRECONCILED");
+      expect(decodeGooseResponsesProjectionCheckpoint(recoveredTurn!.checkpointJson).requestHash)
+        .toBe(previousCheckpoint.requestHash);
+    }
+  }
 });
 
 test("provider restart fails closed when the durable rebind checkpoint is missing or malformed", async () => {

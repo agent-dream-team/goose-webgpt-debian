@@ -1126,6 +1126,13 @@ export class SessionBroker {
     return row ? operationFromRow(row) : null;
   }
 
+  getNextOperationForTurn(turnRef: string, seq: number): BrokerOperation | null {
+    this.turnRowRequired(turnRef);
+    const row = this.db.query("SELECT * FROM operations WHERE turn_ref = ? AND seq = ?")
+      .get(turnRef, seq + 1) as OperationRow | null;
+    return row ? operationFromRow(row) : null;
+  }
+
   getAccountSlotHolders(): AccountSlotOwnership[] {
     return this.accountSlotHolders();
   }

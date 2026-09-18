@@ -15,7 +15,13 @@ import {
   type RebuildConnectorHttpServer,
 } from "./rebuild-connector-http";
 import { ChatGptUpstreamTerminalError } from "./chatgpt-terminal-state";
-import { decodeGooseResponsesProjectionCheckpoint, encodeGooseResponsesProjectionCheckpoint, gooseResponsesProjectionCheckpoint } from "./goose-responses-projection";
+import {
+  classifyGooseResponsesContinuation,
+  decodeGooseResponsesProjectionCheckpoint,
+  encodeGooseResponsesProjectionCheckpoint,
+  gooseResponsesProjectionCheckpoint,
+  type ExpectedGooseToolCall,
+} from "./goose-responses-projection";
 import {
   classifyGooseCanonicalHistory,
   encodeGooseCanonicalHistoryWatermark,
@@ -151,6 +157,17 @@ interface TurnToolActivity {
   activeOpRef: string | null;
 }
 
+interface RecoveredTerminalReplay {
+  turnRef: string;
+  opRef: string;
+  seq: number;
+  inputHash: string;
+  outcome: "SUCCESS" | "FAILURE";
+  resultJson: string;
+  nextOpRef: string;
+  expectedTool: ExpectedGooseToolCall;
+}
+
 function validSessionId(value: string | null): value is string {
   return value !== null
     && value.length > 0
@@ -245,13 +262,80 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
   // Keep only the latest completed transport payload per Goose session. Active executions, raw
   // request bodies, browser closures, and tool literals are released as soon as the turn ends.
   const completedResponses = new Map<string, CompletedResponse>();
+  const recoveredTerminalReplays = new Map<string, RecoveredTerminalReplay>();
+
+  const recoveredTerminalReplayForBody = (turnRef: string, body: unknown): RecoveredTerminalReplay | null => {
+    const terminal = broker.getLatestTerminalOperationForTurn(turnRef);
+    if (!terminal || (terminal.state !== "SUCCESS" && terminal.state !== "FAILURE")
+      || !terminal.inputHash || !terminal.resultJson || !terminal.answerBoundaryJson) return null;
+    const next = broker.getNextOperationForTurn(turnRef, terminal.seq);
+    if (!next || next.state !== "MINTED") return null;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+    const items = (body as Record<string, unknown>).input;
+    if (!Array.isArray(items) || items.length < 2) return null;
+    const callValue = items[items.length - 2];
+    const outputValue = items[items.length - 1];
+    if (!callValue || typeof callValue !== "object" || Array.isArray(callValue)
+      || !outputValue || typeof outputValue !== "object" || Array.isArray(outputValue)) return null;
+    const call = callValue as Record<string, unknown>;
+    const output = outputValue as Record<string, unknown>;
+    const callKeys = Object.keys(call).sort();
+    const outputKeys = Object.keys(output).sort();
+    if (callKeys.join("\0") !== ["arguments", "call_id", "name", "type"].join("\0")
+      || outputKeys.join("\0") !== ["call_id", "output", "type"].join("\0")
+      || call.type !== "function_call" || output.type !== "function_call_output"
+      || call.call_id !== terminal.opRef || output.call_id !== terminal.opRef
+      || typeof call.name !== "string" || !call.name || typeof call.arguments !== "string"
+      || typeof output.output !== "string") return null;
+    let args: unknown;
+    try { args = JSON.parse(call.arguments); } catch { return null; }
+    if (!args || typeof args !== "object" || Array.isArray(args)
+      || connectorOperationInputHash(call.name, args as Record<string, unknown>) !== terminal.inputHash) return null;
+    let expectedOutput: string;
+    try { expectedOutput = connectorStoredResultOutput(terminal.resultJson); } catch { return null; }
+    if (output.output !== expectedOutput) return null;
+    return {
+      turnRef,
+      opRef: terminal.opRef,
+      seq: terminal.seq,
+      inputHash: terminal.inputHash,
+      outcome: terminal.state,
+      resultJson: terminal.resultJson,
+      nextOpRef: next.opRef,
+      expectedTool: {
+        opRef: terminal.opRef,
+        toolName: call.name,
+        argumentsJson: call.arguments,
+      },
+    };
+  };
+
   let draining = false;
   let activeHttpTurns = 0;
   let stopped = false;
 
   const authority = createConnectorOperationAuthority({
-    claimOperation: input => broker.claimOperation(input),
-    classifyMissingOperationRef: (turnRef, inputHash) => broker.classifyMissingOperationRef(turnRef, inputHash),
+    claimOperation: input => {
+      const recovered = recoveredTerminalReplays.get(input.turnRef);
+      if (recovered?.opRef === input.opRef && recovered.inputHash === input.inputHash) {
+        return {
+          kind: "REPLAY",
+          opRef: recovered.opRef,
+          seq: recovered.seq,
+          outcome: recovered.outcome,
+          resultJson: recovered.resultJson,
+          nextOpRef: recovered.nextOpRef,
+        };
+      }
+      return broker.claimOperation(input);
+    },
+    classifyMissingOperationRef: (turnRef, inputHash) => {
+      const recovered = recoveredTerminalReplays.get(turnRef);
+      if (recovered?.inputHash === inputHash) {
+        return { kind: "UNCERTAIN", matchingOpRefs: [recovered.opRef] };
+      }
+      return broker.classifyMissingOperationRef(turnRef, inputHash);
+    },
     boundOperationInputHash: (turnRef, opRef) => {
       const op = broker.getOperation(opRef);
       return op?.turnRef === turnRef ? op.inputHash : null;
@@ -621,6 +705,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       })
       .finally(() => {
         if (executions.get(turn.turnRef) === active) executions.delete(turn.turnRef);
+        recoveredTerminalReplays.delete(turn.turnRef);
         if (toolActivityByTurn.get(turn.turnRef)?.activeOpRef === null) toolActivityByTurn.delete(turn.turnRef);
       });
     void active.final.catch(() => {});
@@ -725,17 +810,49 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       } catch {
         return jsonError(409, "rebind_request_conflict", "Persistent pair rebind requires a valid latest durable Goose Responses checkpoint");
       }
+      const recoveredReplay = recoveredTerminalReplayForBody(turn.turnRef, body);
+      let recoveredDecision = null;
       if (durableCheckpoint.requestHash !== checkpoint.requestHash) {
-        return jsonError(409, "rebind_request_conflict", "Persistent pair rebind requires the exact latest durable Goose Responses request");
+        if (recoveredReplay) {
+          recoveredDecision = classifyGooseResponsesContinuation({
+            body,
+            previous: durableCheckpoint,
+            expectedTool: recoveredReplay.expectedTool,
+          });
+        }
+        if (!recoveredReplay || recoveredDecision?.kind !== "TOOL_RESULT") {
+          return jsonError(
+            409,
+            "rebind_request_conflict",
+            "Persistent pair rebind requires the latest durable request or its exact recovered terminal-tool continuation",
+          );
+        }
+        // Recovered +2 continuations are admitted only after the separate recovery cadence has
+        // proven the remote UI non-running, no unresolved Goose work, and no contradictory activity.
+        if (!broker.hasRecordedPositiveTerminalSlotRelease(turn.turnRef)) {
+          return jsonError(
+            409,
+            "rebind_recovery_precondition",
+            "Recovered terminal-tool continuation requires qualified positive-terminal slot release before pair rebind",
+          );
+        }
       }
       if (broker.hasBlockingOperation(turn.turnRef)) {
         return jsonError(409, "rebind_blocked", "Persistent pair rebind requires unresolved Goose tool/result state to be reconciled first");
       }
+      if (durableCheckpoint.requestHash !== checkpoint.requestHash) {
+        turn = broker.recordProgress(turn.turnRef, encodeGooseResponsesProjectionCheckpoint(recoveredDecision!.checkpoint));
+      } else if (durableCheckpoint.stableNonInputHash === undefined) {
+        // Exact legacy-v2 replay is safe to upgrade because requestHash already proves body identity.
+        turn = broker.recordProgress(turn.turnRef, encodeGooseResponsesProjectionCheckpoint(checkpoint));
+      }
       let active: ActiveExecution;
       try {
         turn = await waitForRebindAdmission(turn.turnRef, request.signal);
+        if (recoveredReplay) recoveredTerminalReplays.set(turn.turnRef, recoveredReplay);
         active = startRebindExecution(turn);
       } catch (error) {
+        recoveredTerminalReplays.delete(turn.turnRef);
         if (error instanceof SessionBrokerError) {
           return Response.json({ error: { type: "invalid_request_error", code: error.code, message: error.message } }, { status: 409 });
         }
