@@ -967,6 +967,165 @@ test("provider restart rebinds the same Goose turn to the same ChatGPT conversat
   expect(runtime.broker.getAccountSlotHolder()).toBeNull();
 });
 
+test("provider restart rebinds from the latest durable tool-continuation checkpoint", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-rebuild-provider-restart-continuation-"));
+  roots.push(root);
+  const brokerPath = join(root, "broker.sqlite");
+  const authorizationFile = join(root, "connector-auth.txt");
+  const authorization = `Bearer ${"r".repeat(64)}`;
+  writeFileSync(authorizationFile, `${authorization}\n`, { mode: 0o600 });
+  chmodSync(authorizationFile, 0o600);
+  const initial = requestBody("restart-continuation");
+  const initialCheckpoint = gooseResponsesProjectionCheckpoint(initial);
+  const continuation = continuationBody(initial, "op-restart-continuation", "known-tool-result");
+  const continuationCheckpoint = gooseResponsesProjectionCheckpoint(continuation);
+  expect(continuationCheckpoint.requestHash).not.toBe(initialCheckpoint.requestHash);
+  const conversationId = "aaaaaaaa-bbbb-4ccc-8ddd-000000000778";
+  const seed = new SessionBroker(brokerPath, {
+    projectId: "project-restart-continuation",
+    instanceId: "seed",
+    terminalReplayWindowMs: 60_000,
+    makeTurnRef: () => "turn-restart-continuation",
+    makeSubmitNonce: () => "nonce-restart-continuation",
+    makeOpRef: () => "op-seed-restart-continuation",
+  });
+  seed.createEpoch({ gooseSessionId: "goose-restart-continuation" });
+  const seeded = seed.enqueueTurn({
+    gooseSessionId: "goose-restart-continuation",
+    requestHash: initialCheckpoint.requestHash,
+    checkpointJson: encodeGooseResponsesProjectionCheckpoint(initialCheckpoint),
+  });
+  seed.admitNext();
+  seed.markSendActivated(seeded.turnRef);
+  seed.bindConversation({ gooseSessionId: "goose-restart-continuation", epoch: 1, conversationId });
+  seed.markAccepted(seeded.turnRef, "user-restart-continuation");
+  seed.recordProgress(seeded.turnRef, encodeGooseResponsesProjectionCheckpoint(continuationCheckpoint));
+  seed.close();
+
+  let browserStarts = 0;
+  const runtime = startRebuildProviderRuntime({
+    port: 0,
+    model: "gpt-4.1",
+    contextWindow: 200_000,
+    controlToken: "control-token",
+    projectId: "project-restart-continuation",
+    connectorIdentity: "Goose Native 2nd Shift",
+    brokerPath,
+    terminalReplayWindowMs: 60_000,
+    connectorPort: 0,
+    connectorAuthorizationFile: authorizationFile,
+    browserDriver: {
+      createTurn(input) {
+        browserStarts += 1;
+        expect(input.prompt).toBe("");
+        expect(input.existingConversationId).toBe(conversationId);
+        expect(input.resumeAccepted).toEqual({
+          canonicalConversationId: conversationId,
+          acceptedUserTurnId: "user-restart-continuation",
+        });
+        return {
+          captureAnswerBoundary: async () => { throw new Error("no tool expected"); },
+          confirmFinal: async evidence => evidence,
+          run: async () => {
+            await input.lifecycle.onRebound?.({
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId: "user-restart-continuation",
+            });
+            return {
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId: "user-restart-continuation",
+              text: "rebound-from-continuation",
+              remoteNonRunning: true,
+            };
+          },
+        };
+      },
+    },
+  });
+  runtimes.push(runtime);
+  expect(runtime.broker.getTurn(seeded.turnRef)?.state).toBe("UNRECONCILED");
+
+  const staleInitial = await post(runtime, initial, "goose-restart-continuation");
+  expect(staleInitial.status).toBe(409);
+  expect(await staleInitial.text()).toContain("rebind_request_conflict");
+  expect(browserStarts).toBe(0);
+
+  const response = await post(runtime, continuation, "goose-restart-continuation");
+  expect(response.status).toBe(200);
+  expect(await response.text()).toContain("rebound-from-continuation");
+  expect(browserStarts).toBe(1);
+  expect(runtime.broker.getTurn(seeded.turnRef)?.state).toBe("COMPLETE");
+});
+
+test("provider restart fails closed when the durable rebind checkpoint is missing or malformed", async () => {
+  for (const [label, checkpointJson] of [["missing", null], ["malformed", "{not-json"]] as const) {
+    const root = mkdtempSync(join(tmpdir(), "cgw-rebuild-provider-restart-" + label + "-checkpoint-"));
+    roots.push(root);
+    const brokerPath = join(root, "broker.sqlite");
+    const authorizationFile = join(root, "connector-auth.txt");
+    const authorization = "Bearer " + "c".repeat(64);
+    writeFileSync(authorizationFile, authorization + "\n", { mode: 0o600 });
+    chmodSync(authorizationFile, 0o600);
+    const body = requestBody("restart-" + label + "-checkpoint");
+    const checkpoint = gooseResponsesProjectionCheckpoint(body);
+    const conversationId = label === "missing"
+      ? "aaaaaaaa-bbbb-4ccc-8ddd-000000000779"
+      : "aaaaaaaa-bbbb-4ccc-8ddd-000000000780";
+    const seed = new SessionBroker(brokerPath, {
+      projectId: "project-restart-" + label + "-checkpoint",
+      instanceId: "seed",
+      terminalReplayWindowMs: 60_000,
+      makeTurnRef: () => "turn-restart-" + label + "-checkpoint",
+      makeSubmitNonce: () => "nonce-restart-" + label + "-checkpoint",
+      makeOpRef: () => "op-seed-restart-" + label + "-checkpoint",
+    });
+    seed.createEpoch({ gooseSessionId: "goose-restart-" + label + "-checkpoint" });
+    const seeded = seed.enqueueTurn({
+      gooseSessionId: "goose-restart-" + label + "-checkpoint",
+      requestHash: checkpoint.requestHash,
+      ...(checkpointJson === null ? {} : { checkpointJson }),
+    });
+    seed.admitNext();
+    seed.markSendActivated(seeded.turnRef);
+    seed.bindConversation({
+      gooseSessionId: "goose-restart-" + label + "-checkpoint",
+      epoch: 1,
+      conversationId,
+    });
+    seed.markAccepted(seeded.turnRef, "user-restart-" + label + "-checkpoint");
+    if (checkpointJson !== null) seed.recordProgress(seeded.turnRef, checkpointJson);
+    seed.close();
+
+    let browserStarts = 0;
+    const runtime = startRebuildProviderRuntime({
+      port: 0,
+      model: "gpt-4.1",
+      contextWindow: 200_000,
+      controlToken: "control-token",
+      projectId: "project-restart-" + label + "-checkpoint",
+      connectorIdentity: "Goose Native 2nd Shift",
+      brokerPath,
+      terminalReplayWindowMs: 60_000,
+      connectorPort: 0,
+      connectorAuthorizationFile: authorizationFile,
+      browserDriver: {
+        createTurn() {
+          browserStarts += 1;
+          throw new Error("invalid durable checkpoint must block before browser start");
+        },
+      },
+    });
+    runtimes.push(runtime);
+    expect(runtime.broker.getTurn(seeded.turnRef)?.state).toBe("UNRECONCILED");
+
+    const response = await post(runtime, body, "goose-restart-" + label + "-checkpoint");
+    expect(response.status).toBe(409);
+    expect(await response.text()).toContain("rebind_request_conflict");
+    expect(browserStarts).toBe(0);
+    expect(runtime.broker.getTurn(seeded.turnRef)?.state).toBe("UNRECONCILED");
+  }
+});
+
 test("provider restart refuses pair rebind while a prior tool result remains genuinely ambiguous", async () => {
   const root = mkdtempSync(join(tmpdir(), "cgw-rebuild-provider-restart-blocked-"));
   roots.push(root);

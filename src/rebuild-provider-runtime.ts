@@ -719,8 +719,14 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     let turn = broker.getOpenTurnForSession(sessionId);
 
     if (turn?.state === "UNRECONCILED") {
-      if (turn.requestHash !== checkpoint.requestHash) {
-        return jsonError(409, "rebind_request_conflict", "Persistent pair rebind requires the exact original Goose Responses request");
+      let durableCheckpoint;
+      try {
+        durableCheckpoint = decodeGooseResponsesProjectionCheckpoint(turn.checkpointJson);
+      } catch {
+        return jsonError(409, "rebind_request_conflict", "Persistent pair rebind requires a valid latest durable Goose Responses checkpoint");
+      }
+      if (durableCheckpoint.requestHash !== checkpoint.requestHash) {
+        return jsonError(409, "rebind_request_conflict", "Persistent pair rebind requires the exact latest durable Goose Responses request");
       }
       if (broker.hasBlockingOperation(turn.turnRef)) {
         return jsonError(409, "rebind_blocked", "Persistent pair rebind requires unresolved Goose tool/result state to be reconciled first");
