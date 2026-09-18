@@ -10,31 +10,30 @@ Status: CLEAN CHECKPOINT — deployed, idle, recoverable, autostart-qualified wi
 - Branch: `fix/semantic-progress-recovery`
 - HEAD: `297b4484034ff3e76b5fbb9f074d4299521dbc81`
 - Worktree: clean
-- Temporary `goose-chatgpt-web-recovery-fix` worktree: retired
-- Temporary `goose-chatgpt-web-recovery-control` worktree: retired after its uncommitted diagnostic diff was archived locally as superseded/not deployed
+- Temporary recovery worktrees retired.
+- Reproducible source-tree build outputs pruned after qualification; installed packages and off-machine source bundles remain authoritative.
 
 ## Off-machine source recovery
 
 Deployment repository: `agent-dream-team/goose-webgpt-debian`
 
-Checkpoint branch:
-`checkpoint/semantic-progress-recovery-20260918`
+Checkpoint branches:
+- `checkpoint/gcw-debian-clean-20260918` — exact Git bundles for final GCW and the local Goose patch
+- `checkpoint/semantic-progress-recovery-20260918` — this whole-system checkpoint record and patch-series recovery artifacts
 
-The branch is based on the last published deployment source checkpoint:
-`883113222e7ed003266563a1458a7c52dafba4e1` (`fix/two-persistent-gcw-slots`).
+Exact final GCW source:
+- local ref: `fix/semantic-progress-recovery`
+- final commit: `297b4484034ff3e76b5fbb9f074d4299521dbc81`
+- prerequisite/base: `883113222e7ed003266563a1458a7c52dafba4e1`
+- exact Git bundle is stored off-machine on `checkpoint/gcw-debian-clean-20260918`
 
-Published recovery artifacts:
-- `checkpoints/2026-09-18-gcw-semantic-progress-recovery.mbox.gz.b64`
-  - Git blob SHA: `15e7358cf371e7b7e8df4d34c473e3264d9b45a7`
-  - raw mbox SHA-256 after decode/decompress: `6cad4bcdb9e69c7b2830d60f81c0c677ee76cb45d4346658e73f702530eed2a4`
-  - reconstructs the exact nine local GCW commits ending at `297b4484034ff3e76b5fbb9f074d4299521dbc81`
-- `checkpoints/2026-09-18-goose-post-tool-resume.mbox.gz.b64`
-  - Git blob SHA: `f2938c447ddd3604aa2ddfca80c6b44270272eab`
-  - raw mbox SHA-256 after decode/decompress: `92a9d4a145e1f3bda5a13623275753acaa870b7ae63f4880980b84a93726261f`
-  - base: `d213a3b13545b4e85524a572ac695b2181728e3b`
-  - reconstructs the four local Goose commits ending at `ebe9fe226b46681c04a33cdec4dc98e3fdfde790`
+Exact Goose #12133 local patch:
+- local ref: `fix/persisted-post-tool-resume`
+- final commit: `ebe9fe226b46681c04a33cdec4dc98e3fdfde790`
+- prerequisite/upstream base: `d213a3b13545b4e85524a572ac695b2181728e3b`
+- exact Git bundle is stored off-machine on `checkpoint/gcw-debian-clean-20260918`
 
-The Goose source artifact is deliberately stored on the deployment checkpoint branch rather than pushed to `aaif-goose/goose`; upstream implementation remains deferred until issue #12133 is Ready.
+The Goose implementation is deliberately checkpointed in the deployment repository rather than pushed to `aaif-goose/goose`; upstream implementation remains deferred until issue #12133 is Ready.
 
 ## Installed GCW
 
@@ -52,43 +51,80 @@ Retained rollback bundle:
 
 Only the live final bundle plus this immediately previous known-good rollback bundle remain installed.
 
+The shared durable runtime manifest also reports the live final bundle ID, so mutable launcher config and the stable wrapper resolve to the same installed release.
+
 ## Runtime configuration durability
 
-Mutable config now points to immutable installed runtime paths rather than source-tree commands:
+Mutable config points to immutable installed runtime paths rather than source-tree commands:
 
 - runtime Bun: `~/.local/share/goose-chatgpt-web-rebuild/versions/5.0.6-linux-x64/runtime/bun`
 - runtime entrypoint: `~/.local/share/goose-chatgpt-web-rebuild/versions/5.0.6-linux-x64/app/cli.js`
 - tunnel wrapper: `~/.local/share/goose-chatgpt-web-rebuild/versions/5.0.6-linux-x64/bin/dreambook-rebuild-tunnel-client-auth-wrapper.sh`
 
-Private state SHA-256 values at checkpoint:
+No DreamBook source-checkout path or `~/.bun/bin/bun` remains in mutable GCW config.
+
+Private state SHA-256 values:
 - `config.json`: `689f9965ba6776ba9e07ead34909ae73115a9aeb5857d2752f4716be5715f576`
 - `launcher/launcher-state.json`: `2adc1b0534f1ba5ec3d96b61cbed2c273cc5ebc3963b934d61b7726deb35cb9f`
 - XDG autostart desktop file: `5f8dc87193c2b47d241c17b6aaa19aef9f1eb16f867060f5a6bc82fdbd7a6544`
 
-All three files are mode `0600`.
+All three files are mode `0600`. Tunnel runtime key and custom-provider config are also mode `0600`.
+
+The broker SQLite files are `0644` but live under a `0700` runtime directory inside a `0700` application root, so they are not accessible to other users through the filesystem hierarchy. No permission mutation was made to the live SQLite set.
+
+## Browser/authentication ownership
+
+Persistent rebuild uses launcher-owned browser mode.
+
+- launcher profile directory is private (`0700`)
+- launcher Cookies/Preferences are private (`0600`)
+- browser worker attaches to the launcher-owned persistent browser context before any standalone `storageStatePath` is consulted
+- therefore the absence of `browser/storage-state.json` is expected in this deployment mode and is not a cold-start dependency
+
+Authenticated embedded ChatGPT browser checks passed during final deployment and XDG reconstruction qualification.
 
 ## Boot/autostart ownership
 
-Linux ownership model is the packaged launcher + XDG autostart, not systemd.
+Linux ownership model is the packaged launcher + XDG autostart, not a dedicated GCW systemd service.
 
 Autostart state:
 - launcher state `autoStart=true`
 - `~/.config/autostart/dev.codexwebgpt.launcher.desktop` exists
 - Exec: `~/.local/bin/goose-chatgpt-web --hidden`
-- X-GNOME-Autostart-enabled=true
+- `X-GNOME-Autostart-enabled=true`
 
 Non-reboot reconstruction qualification:
 1. GCW was idle with both slots free and no outstanding turns.
 2. The running launcher root was terminated cleanly.
 3. Provider port, account owner marker, and prior AppImage mount cleared.
 4. The exact XDG Exec command was launched: `~/.local/bin/goose-chatgpt-web --hidden`.
-5. The final bundle reconstructed successfully and provider health returned in 12 seconds.
+5. The final bundle reconstructed successfully.
 6. The root process re-parented to PID 1 after launch-shell exit.
-7. Authenticated embedded ChatGPT browser check passed.
-8. Tunnel runtime re-established and reports healthy/ready.
+7. The embedded ChatGPT browser authenticated successfully.
+8. Tunnel runtime re-established.
 9. Broker ownership re-established under the new provider process.
+10. Provider returned healthy with zero active HTTP/browser turns.
 
-An actual machine reboot/login cycle was not performed because DreamBook reboot remains explicitly disallowed without separate approval. This is a deferred deployment proof, not an observed checkpoint defect.
+An actual machine reboot/login cycle was not performed because DreamBook reboot remains explicitly disallowed without separate approval. This is the only unobserved boot-level proof; the exact autostart command itself is qualified.
+
+## Surrounding Second Shift services
+
+At final audit the following services were both enabled and active:
+- `second-shift-goose.service`
+- `second-shift-goose-control.service`
+- `second-shift-goose-control-tunnel.service`
+- `second-shift-goose-pilot.service`
+- `second-shift-goose-pilot-tunnel.service`
+- `second-shift-agent-notify.service`
+- `second-shift-agent-notify-tunnel.service`
+
+Enabled maintenance timers:
+- DreamBook Borg backup
+- Borg repository check
+- Borg retention maintenance
+- Second Shift recovery sentinel
+
+Most recent backup/check/retention service results were successful. Recovery sentinel result was successful.
 
 ## Provider/browser/tunnel state
 
@@ -100,24 +136,18 @@ Final provider:
 - active HTTP turns: 0
 - active browser turns: 0
 
-Authenticated browser:
-- Playwright reaches the embedded authenticated ChatGPT surface.
+The live process tree is entirely from the final `29bada9e…` installed bundle and durable `versions/5.0.6-linux-x64` runtime. The account lease owner marker matches that live launcher.
 
-Tunnel:
-- pinned tunnel client installed
-- runtime key private
-- launcher owns tunnel runtime
-- tunnel reports healthy and ready
+Launcher JSONL logging is internally bounded:
+- active log rotates at 4 MiB
+- one `.1` previous file is retained
+- in-memory record set is capped at 300
 
-The standalone legacy `doctor` still exits non-zero for two known non-appliance assumptions:
-- it expects the retired Codex model route;
-- it expects service name `codex-chatgpt-web` rather than the persistent rebuild service `goose-chatgpt-web-rebuild`.
-
-Those two doctor checks are not used as readiness gates for this Goose deployment; browser, provider, launcher ownership, pinned tunnel, key privacy, and tunnel health all pass.
+No host-side logrotate rule is required for the launcher JSONL.
 
 ## Goose runtime
 
-Installed system Goose remains stock `1.50.0` and the authoritative Second Shift Goose service remains separate from GCW.
+Installed system Goose remains stock `1.50.0`; the authoritative Second Shift Goose service remains separate from GCW.
 
 Qualified recovery binary retained separately:
 `~/.local/share/goose-chatgpt-web-rebuild/qualification-binaries/goose-post-tool-resume-ebe9fe22`
@@ -126,6 +156,8 @@ Pinned recovery binary SHA-256:
 `1b1161a58d084623f5be689ce54f756b673ce8ea16ba53fcba0c3f9cd5d32a78`
 
 Qualified patched Goose version: `1.51.0`.
+
+The Goose source checkout is clean at `ebe9fe226b46681c04a33cdec4dc98e3fdfde790`. Its ~31 GiB reproducible Cargo `target/` tree was removed after qualification; the checkout, Hermit environment, pinned binary, and exact off-machine Git bundle remain.
 
 ## Persistent-pair state
 
@@ -146,11 +178,12 @@ Pair B:
 Both account slots are free and there are no `TURN_SENDING` or `TURN_OUTSTANDING` rows.
 
 Historical broker quarantine:
-- 14 older `UNRECONCILED` turns are intentionally retained as recovery history;
-- all 14 hold no account slot;
-- all 14 have zero `CLAIMED`/`UNCERTAIN` blocking operations;
-- all 14 retain positive-terminal evidence;
-- they are historical quarantined records, not active work or slot debt.
+- 14 older `UNRECONCILED` turns are intentionally retained as recovery history
+- all 14 hold no account slot
+- all 14 have zero `CLAIMED`/`UNCERTAIN` blocking operations
+- all 14 retain positive-terminal evidence
+- each has only an unclaimed next `MINTED` operation
+- they are historical quarantine, not active work or slot debt
 
 ## Qualification
 
@@ -164,6 +197,8 @@ Final source/runtime qualification includes:
 - live Pair A recovery PASS
 - live Pair B 25-tool legacy recovery PASS
 - exact XDG-autostart-command reconstruction PASS
+- surrounding Second Shift services/timers audit PASS
+- backup/recovery-sentinel status PASS
 
 ## Retained recovery/rollback evidence
 
@@ -175,18 +210,19 @@ Database snapshots retained:
 
 Small request/JSONL/rehearsal artifacts remain for reproducibility.
 
-The superseded uncommitted recovery-control experiment was archived locally as a clearly marked never-deployed patch before its worktree was removed.
-
 ## Cleanup completed
 
 - 11 superseded installed GCW qualification bundles removed
+- only live + immediate known-good rollback bundle retained
 - obsolete earlier Goose candidate removed
 - redundant intermediate DB snapshots removed
-- temporary recovery-fix and recovery-control worktrees removed
-- obsolete local recovery-control branch removed
-- stale GCW `/tmp` qualification/probe files removed
+- temporary recovery worktrees removed
+- stale GCW-specific `/tmp` qualification/probe files removed
 - canonical source checkout reconciled to deployed final source
-- approximately 27 GB free on root filesystem at checkpoint
+- Goose reproducible Cargo `target/` tree removed (~31 GiB)
+- GCW reproducible `dist`, launcher build/dist, and package-artifact directories removed (~0.5 GiB)
+- canonical GCW checkout remains dependency-ready (`node_modules` retained)
+- root filesystem now has approximately 57 GiB free (76% used), versus ~26–27 GiB before final build-cache cleanup
 
 ## Intentionally deferred only
 
