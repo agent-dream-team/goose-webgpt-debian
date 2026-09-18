@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import { canonicalJsonSha256 } from "./canonical-json";
 import { readJsonRequestBody } from "./http-body";
 import {
   advertisedGooseToolNames,
@@ -21,6 +22,7 @@ import {
   encodeGooseResponsesProjectionCheckpoint,
   gooseResponsesProjectionCheckpoint,
   type ExpectedGooseToolCall,
+  type GooseResponsesProjectionCheckpoint,
 } from "./goose-responses-projection";
 import {
   classifyGooseCanonicalHistory,
@@ -798,6 +800,48 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     }
   };
 
+  const legacyRecoveredRuntimeCheckpoint = (
+    body: unknown,
+    previous: GooseResponsesProjectionCheckpoint,
+    current: GooseResponsesProjectionCheckpoint,
+  ): GooseResponsesProjectionCheckpoint | null => {
+    if (previous.stableNonInputHash !== undefined) return null;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+    const request = body as Record<string, unknown>;
+    const allowed = new Set(["input", "tools", "model", "stream", "store", "max_output_tokens"]);
+    if (Object.keys(request).some(key => !allowed.has(key))) return null;
+    if (!Array.isArray(request.input) || !Array.isArray(request.tools)) return null;
+    if (request.model !== options.model || request.stream !== true || request.store !== false) return null;
+    if (request.max_output_tokens !== undefined
+      && (!Number.isSafeInteger(request.max_output_tokens) || Number(request.max_output_tokens) <= 0)) return null;
+    if (previous.inputCount < 1 || request.input.length !== previous.inputCount + 2) return null;
+
+    const system = request.input[0];
+    if (!system || typeof system !== "object" || Array.isArray(system)) return null;
+    const systemRecord = system as Record<string, unknown>;
+    if (systemRecord.type !== "message" || systemRecord.role !== "system" || !Array.isArray(systemRecord.content)
+      || systemRecord.content.length !== 1) return null;
+    const systemContent = systemRecord.content[0];
+    if (!systemContent || typeof systemContent !== "object" || Array.isArray(systemContent)) return null;
+    const systemText = (systemContent as Record<string, unknown>).text;
+    if ((systemContent as Record<string, unknown>).type !== "input_text"
+      || typeof systemText !== "string"
+      || !systemText.startsWith("You are a general-purpose AI agent called goose")) return null;
+
+    for (let index = 1; index < previous.inputCount; index += 1) {
+      if (current.inputItemHashes[index] !== previous.inputItemHashes[index]) return null;
+    }
+    return {
+      ...previous,
+      // Only the generated system message and advertised tool projection may cross this one-way
+      // legacy migration boundary. The strict classifier still validates the appended tool pair.
+      nonInputHash: current.nonInputHash,
+      stableNonInputHash: current.stableNonInputHash,
+      inputHash: canonicalJsonSha256(request.input.slice(0, previous.inputCount)),
+      inputItemHashes: current.inputItemHashes.slice(0, previous.inputCount),
+    };
+  };
+
   const handleResponses = async (request: Request): Promise<Response> => {
     const sessionId = request.headers.get("agent-session-id");
     if (!validSessionId(sessionId)) return jsonError(400, "invalid_agent_session_id", "One valid agent-session-id header is required");
@@ -833,6 +877,16 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
             previous: durableCheckpoint,
             expectedTool: recoveredReplay.expectedTool,
           });
+          if (recoveredDecision.kind === "DIVERGED") {
+            const legacyCheckpoint = legacyRecoveredRuntimeCheckpoint(body, durableCheckpoint, checkpoint);
+            if (legacyCheckpoint) {
+              recoveredDecision = classifyGooseResponsesContinuation({
+                body,
+                previous: legacyCheckpoint,
+                expectedTool: recoveredReplay.expectedTool,
+              });
+            }
+          }
         }
         if (!recoveredReplay || recoveredDecision?.kind !== "TOOL_RESULT") {
           return jsonError(

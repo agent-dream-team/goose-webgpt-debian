@@ -109,10 +109,10 @@ export function classifyGooseResponsesContinuation(input: {
       return { kind: "DIVERGED", reason: "non-input Responses projection changed during tool continuation" };
     }
     // New checkpoints pin every non-input field except tools. Legacy v2 checkpoints predate this
-    // digest; only the narrowly identified extension-manager mutation may use that compatibility path.
+    // digest; extension mutation remains compatible because it is itself the durable tool result.
     if (input.previous.stableNonInputHash !== undefined
       && current.stableNonInputHash !== input.previous.stableNonInputHash) {
-      return { kind: "DIVERGED", reason: "stable non-tool Responses projection changed during extension mutation" };
+      return { kind: "DIVERGED", reason: "stable non-tool Responses projection changed during tool continuation" };
     }
   }
   const items = request.input as unknown[];
