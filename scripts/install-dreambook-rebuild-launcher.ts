@@ -64,11 +64,15 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
-export function installedBundleDirectoryName(manifest: Pick<RuntimeManifest, "appVersion" | "platform" | "arch" | "bundleId">): string {
+export function installedBundleDirectoryName(
+  manifest: Pick<RuntimeManifest, "appVersion" | "platform" | "arch" | "bundleId">,
+  appImageSha256: string,
+): string {
   if (!/^[A-Za-z0-9._-]+$/.test(manifest.appVersion)) throw new Error("Runtime manifest appVersion is invalid");
   if (manifest.platform !== "linux" || manifest.arch !== "x64") throw new Error("DreamBook launcher requires a Linux x64 runtime manifest");
   if (!/^[a-f0-9]{64}$/.test(manifest.bundleId)) throw new Error("Runtime manifest bundleId is invalid");
-  return `${manifest.appVersion}-${manifest.platform}-${manifest.arch}-${manifest.bundleId}`;
+  if (!/^[a-f0-9]{64}$/.test(appImageSha256)) throw new Error("AppImage SHA-256 is invalid");
+  return `${manifest.appVersion}-${manifest.platform}-${manifest.arch}-${manifest.bundleId}-${appImageSha256}`;
 }
 
 export function dreamBookInstalledWrapper(input: {
@@ -171,7 +175,7 @@ async function install(options: InstallOptions): Promise<void> {
     const manifestPath = join(runtimeRoot, "manifest.json");
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as RuntimeManifest;
     if (manifest.schemaVersion !== 2) throw new Error("Packaged runtime manifest schema is unsupported");
-    const bundleName = installedBundleDirectoryName(manifest);
+    const bundleName = installedBundleDirectoryName(manifest, actualAppImageSha);
     const verifiedSupport = new Map<string, string>();
     for (const relativePath of SUPPORT_FILES) {
       verifiedSupport.set(relativePath, requireManifestFile(runtimeRoot, manifest, relativePath));

@@ -27,15 +27,26 @@ test("installed rebuild wrapper has no source-tree dependency and enters the pac
   expect(wrapper).not.toContain("/usr/bin/xvfb-run");
 });
 
-test("installed bundle directory is immutable across same-version bundle changes", () => {
-  const one = installedBundleDirectoryName({
+test("installed bundle directory is immutable across runtime or AppImage changes", () => {
+  const manifest = {
     appVersion: "5.0.6", platform: "linux", arch: "x64", bundleId: "a".repeat(64),
-  });
-  const two = installedBundleDirectoryName({
-    appVersion: "5.0.6", platform: "linux", arch: "x64", bundleId: "b".repeat(64),
-  });
-  expect(one).not.toBe(two);
+  } as const;
+  const one = installedBundleDirectoryName(manifest, "1".repeat(64));
+  const changedRuntime = installedBundleDirectoryName(
+    { ...manifest, bundleId: "b".repeat(64) },
+    "1".repeat(64),
+  );
+  const changedAppImage = installedBundleDirectoryName(manifest, "2".repeat(64));
+  expect(one).not.toBe(changedRuntime);
+  expect(one).not.toBe(changedAppImage);
   expect(one).toContain("5.0.6-linux-x64-");
+  expect(one).toEndWith(`-${"1".repeat(64)}`);
+});
+
+test("installed bundle directory rejects an invalid AppImage digest", () => {
+  expect(() => installedBundleDirectoryName({
+    appVersion: "5.0.6", platform: "linux", arch: "x64", bundleId: "a".repeat(64),
+  }, "not-a-sha256")).toThrow("AppImage SHA-256 is invalid");
 });
 
 test("installed runtime support is verified against manifest size and SHA-256", () => {
