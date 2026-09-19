@@ -29,17 +29,24 @@ const snapshot = (overrides: Partial<PersistentChatTurnSnapshot> = {}): Persiste
 function fakeConnection(options: {
   url: string;
   snapshot?: PersistentChatTurnSnapshot;
+  snapshots?: PersistentChatTurnSnapshot[];
   afterReload?: PersistentChatTurnSnapshot;
   afterGoto?: PersistentChatTurnSnapshot;
 }) {
   let currentUrl = options.url;
-  let currentSnapshot = options.snapshot ?? snapshot();
+  let currentSnapshot = options.snapshot ?? options.snapshots?.[0] ?? snapshot();
+  let snapshotIndex = 0;
   let reloads = 0;
   const gotos: string[] = [];
   let closes = 0;
   const page = {
     url: () => currentUrl,
-    evaluate: async () => currentSnapshot,
+    evaluate: async () => {
+      if (options.snapshots && snapshotIndex < options.snapshots.length) {
+        currentSnapshot = options.snapshots[snapshotIndex++]!;
+      }
+      return currentSnapshot;
+    },
     reload: async () => {
       reloads += 1;
       if (options.afterReload) currentSnapshot = options.afterReload;
@@ -207,6 +214,27 @@ test("inspect uses the exact durable surface and closes its disposable Playwrigh
   expect(calls).toEqual([{ path: "/descriptor", timeout: 3210, surface: SURFACE }]);
   expect(result.assistantTurnId).toBe("assistant-accepted");
   expect(authChecks).toBe(1);
+  expect(fake.state.closes).toBe(1);
+});
+
+test("inspect waits for the durable user and assistant anchors to hydrate", async () => {
+  const empty = snapshot({ turnIdentities: [], userIdentities: [], assistantIdentities: [] });
+  const userOnly = snapshot({
+    turnIdentities: ["user-old", "assistant-old", "user-accepted"],
+    userIdentities: ["user-old", "user-accepted"],
+    assistantIdentities: ["assistant-old"],
+  });
+  const hydrated = snapshot();
+  const fake = fakeConnection({
+    url: `https://chatgpt.com/c/${CONVERSATION}`,
+    snapshots: [empty, userOnly, hydrated],
+  });
+  const controller = new PersistentChatSurfaceController(
+    "/descriptor", async () => fake.connection, 1_000, async () => {},
+  );
+  const result = await controller.inspect(binding());
+  expect(result.assistantTurnId).toBe("assistant-accepted");
+  expect(result.snapshot).toEqual(hydrated);
   expect(fake.state.closes).toBe(1);
 });
 

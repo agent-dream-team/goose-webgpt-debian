@@ -229,12 +229,23 @@ export class PersistentChatSurfaceController {
       throw new Error("ChatGPT reopened a different canonical conversation");
     }
     await this.verifyAuthenticated(page, this.timeoutMs);
-    const snapshot = await capturePersistentChatTurnSnapshot(page);
-    const assistantTurnId = assistantTurnForAcceptedUser(snapshot, binding.acceptedUserTurnId);
-    return {
-      binding: { ...binding, conversationId: location.conversationId },
-      ...(assistantTurnId ? { assistantTurnId } : {}),
-      snapshot,
-    };
+    const deadline = Date.now() + this.timeoutMs;
+    for (;;) {
+      const snapshot = await capturePersistentChatTurnSnapshot(page);
+      if (snapshot.userIdentities.includes(binding.acceptedUserTurnId)) {
+        const assistantTurnId = assistantTurnForAcceptedUser(snapshot, binding.acceptedUserTurnId);
+        if (assistantTurnId) {
+          return {
+            binding: { ...binding, conversationId: location.conversationId },
+            assistantTurnId,
+            snapshot,
+          };
+        }
+      }
+      if (Date.now() >= deadline) {
+        throw new Error("ChatGPT durable turn binding did not hydrate before the observation timeout");
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
   }
 }
