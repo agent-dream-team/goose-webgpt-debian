@@ -126,7 +126,7 @@ out({ type: "ready", version: 1 });
   return path;
 }
 
-function rebindWorkerFixture(): string {
+function rebindWorkerFixture(finalRecoveryOnly = false): string {
   const root = mkdtempSync(join(tmpdir(), "cgw-node-browser-driver-rebind-test-"));
   ROOTS.push(root);
   const path = join(root, "worker.mjs");
@@ -140,7 +140,8 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", line =
   if (message.type === "start") {
     if (message.input.prompt !== "" || message.input.existingConversationId !== accepted.canonicalConversationId
       || message.input.resumeAccepted?.canonicalConversationId !== accepted.canonicalConversationId
-      || message.input.resumeAccepted?.acceptedUserTurnId !== accepted.acceptedUserTurnId) {
+      || message.input.resumeAccepted?.acceptedUserTurnId !== accepted.acceptedUserTurnId
+      || (message.input.resumeAccepted?.finalRecoveryOnly === true) !== ${JSON.stringify(finalRecoveryOnly)}) {
       return out({ type: "error", message: "rebind start contract missing" });
     }
     return out({ type: "lifecycle", event: "rebound", evidence: accepted });
@@ -298,6 +299,28 @@ test("node worker rebind passes the persisted pair and acknowledges rebound with
     lifecycle: {
       onSendActivated: () => { throw new Error("rebind must not send"); },
       onAccepted: () => { throw new Error("rebind must not create a replacement accepted turn"); },
+      onRebound: evidence => { events.push(`rebound:${evidence.acceptedUserTurnId}`); },
+    },
+  }));
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("rebound fixture final");
+  expect(events).toEqual(["rebound:user-fixture"]);
+  expect(await execution.confirmFinal(candidate)).toEqual(candidate);
+});
+
+test("node worker preserves final-recovery-only rebind authority across the process boundary", async () => {
+  const events: string[] = [];
+  const execution = driver(rebindWorkerFixture(true)).createTurn(turnInput({
+    prompt: "",
+    existingConversationId: CONVERSATION,
+    resumeAccepted: {
+      canonicalConversationId: CONVERSATION,
+      acceptedUserTurnId: "user-fixture",
+      finalRecoveryOnly: true,
+    },
+    lifecycle: {
+      onSendActivated: () => { throw new Error("final recovery must not send"); },
+      onAccepted: () => { throw new Error("final recovery must not replace the accepted turn"); },
       onRebound: evidence => { events.push(`rebound:${evidence.acceptedUserTurnId}`); },
     },
   }));

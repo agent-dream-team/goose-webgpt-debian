@@ -1180,6 +1180,58 @@ test("reattach mode proves the same accepted pair and observes final without sen
   await execution.confirmFinal(candidate);
 });
 
+test("accepted-final reattach refreshes stale stopped views without sending a recovery continuation", async () => {
+  let recoverySends = 0;
+  const first = fakeSurface(
+    () => { recoverySends += 1; },
+    `https://chatgpt.com/c/${CONVERSATION}`,
+  );
+  first.setRunning(false);
+  const refreshedOnce = fakeSurface(
+    () => { recoverySends += 1; },
+    `https://chatgpt.com/c/${CONVERSATION}`,
+  );
+  refreshedOnce.setRunning(false);
+  const refreshedTwice = fakeSurface(
+    () => { recoverySends += 1; },
+    `https://chatgpt.com/c/${CONVERSATION}`,
+  );
+  refreshedTwice.setRunning(false);
+  const connections = [
+    browserConnection(first), browserConnection(refreshedOnce), browserConnection(refreshedTwice),
+  ];
+  let connects = 0;
+  const harness = createHarness({
+    surface: first,
+    staleObservationFirstRefreshMs: 0,
+    staleObservationSubsequentRefreshMs: 0,
+    connectSurface: async () => connections[connects++]!,
+    captureSnapshot: async () => snapshotsAfterSend(() => true),
+    captureAnswer: async page => page === refreshedTwice.page
+      ? projection("existing accepted final")
+      : projection(""),
+    reopenBinding: async binding => ({
+      binding,
+      assistantTurnId: "assistant-1",
+      snapshot: snapshotsAfterSend(() => true),
+    }),
+  });
+  const execution = harness.driver.createTurn(makeInput({
+    existingConversationId: CONVERSATION,
+    resumeAccepted: {
+      canonicalConversationId: CONVERSATION,
+      acceptedUserTurnId: "user-1",
+      finalRecoveryOnly: true,
+    },
+    prompt: "",
+  }));
+
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("existing accepted final");
+  expect(recoverySends).toBe(0);
+  expect(connects).toBe(3);
+});
+
 test("reattached stopped turn refreshes the view then continues privately in the same ChatGPT conversation", async () => {
   let continuationSends = 0;
   let continuationAccepted = false;

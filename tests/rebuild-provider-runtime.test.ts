@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -965,6 +966,203 @@ test("provider restart rebinds the same Goose turn to the same ChatGPT conversat
     leaseState: "IDLE",
   });
   expect(runtime.broker.getAccountSlotHolder()).toBeNull();
+});
+
+test("provider restart completes an already-accepted post-tool final without resending or replaying tools", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-rebuild-provider-final-recovery-"));
+  roots.push(root);
+  const brokerPath = join(root, "broker.sqlite");
+  const authorizationFile = join(root, "connector-auth.txt");
+  const authorization = `Bearer ${"f".repeat(64)}`;
+  writeFileSync(authorizationFile, `${authorization}\n`, { mode: 0o600 });
+  chmodSync(authorizationFile, 0o600);
+  const initial = requestBody("accepted-final-recovery");
+  const initialCheckpoint = gooseResponsesProjectionCheckpoint(initial);
+  const conversationId = "aaaaaaaa-bbbb-4ccc-8ddd-000000000797";
+  const finalText = "accepted-final-before-restart";
+  const finalTextDigest = createHash("sha256").update(finalText, "utf8").digest("hex");
+  const seed = new SessionBroker(brokerPath, {
+    projectId: "project-final-recovery",
+    instanceId: "seed",
+    terminalReplayWindowMs: 60_000,
+    makeTurnRef: () => "turn-final-recovery",
+    makeSubmitNonce: () => "nonce-final-recovery",
+    makeOpRef: (() => {
+      const refs = ["op-final-recovery", "op-final-recovery-next"];
+      return () => refs.shift() ?? "op-final-recovery-extra";
+    })(),
+  });
+  seed.createEpoch({ gooseSessionId: "goose-final-recovery" });
+  const seeded = seed.enqueueTurn({
+    gooseSessionId: "goose-final-recovery",
+    requestHash: initialCheckpoint.requestHash,
+    checkpointJson: encodeGooseResponsesProjectionCheckpoint(initialCheckpoint),
+  });
+  const admitted = seed.admitNext()!;
+  seed.markSendActivated(seeded.turnRef);
+  seed.bindConversation({ gooseSessionId: "goose-final-recovery", epoch: 1, conversationId });
+  seed.markAccepted(seeded.turnRef, "user-final-recovery");
+  seed.recordAnswerBoundary(seeded.turnRef, admitted.initialOpRef, '{"text":"before-tool"}');
+  const toolArguments = { path: "." };
+  const inputHash = connectorOperationInputHash("tree", toolArguments);
+  seed.claimOperation({ turnRef: seeded.turnRef, opRef: admitted.initialOpRef, inputHash });
+  const continuation = continuationBody(initial, admitted.initialOpRef, "known-tool-result");
+  const continuationCheckpoint = gooseResponsesProjectionCheckpoint(continuation);
+  seed.completeOperationWithProgress({
+    turnRef: seeded.turnRef,
+    opRef: admitted.initialOpRef,
+    inputHash,
+    outcome: "SUCCESS",
+    resultJson: prepareConnectorTerminalResult({
+      outcome: "SUCCESS", dataClass: "task", content: "known-tool-result",
+    }).resultJson,
+    checkpointJson: encodeGooseResponsesProjectionCheckpoint(continuationCheckpoint),
+  });
+  seed.recordFinalDigest(seeded.turnRef, finalTextDigest);
+  seed.close();
+
+  let browserStarts = 0;
+  let rebounds = 0;
+  let confirmations = 0;
+  const runtime = startRebuildProviderRuntime({
+    port: 0,
+    model: "gpt-4.1",
+    contextWindow: 200_000,
+    controlToken: "control-token",
+    projectId: "project-final-recovery",
+    connectorIdentity: "Goose Native 2nd Shift",
+    brokerPath,
+    terminalReplayWindowMs: 60_000,
+    connectorPort: 0,
+    connectorAuthorizationFile: authorizationFile,
+    browserDriver: {
+      createTurn(input) {
+        browserStarts += 1;
+        expect(input.prompt).toBe("");
+        expect(input.existingConversationId).toBe(conversationId);
+        expect(input.resumeAccepted).toEqual({
+          canonicalConversationId: conversationId,
+          acceptedUserTurnId: "user-final-recovery",
+          finalRecoveryOnly: true,
+        });
+        return {
+          captureAnswerBoundary: async () => { throw new Error("historical tool must not replay"); },
+          confirmFinal: async evidence => {
+            confirmations += 1;
+            return evidence;
+          },
+          run: async () => {
+            await input.lifecycle.onRebound?.({
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId: "user-final-recovery",
+            });
+            rebounds += 1;
+            return {
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId: "user-final-recovery",
+              text: finalText,
+              remoteNonRunning: true,
+              contentAdvancedAfterLastTool: true,
+            };
+          },
+        };
+      },
+    },
+  });
+  runtimes.push(runtime);
+  expect(runtime.broker.getTurn(seeded.turnRef)).toMatchObject({
+    state: "UNRECONCILED", finalDigest: finalTextDigest,
+  });
+  expect(runtime.broker.getOperation(admitted.initialOpRef)?.state).toBe("SUCCESS");
+  expect(runtime.broker.getNextOperationForTurn(seeded.turnRef, 1)?.state).toBe("MINTED");
+
+  const response = await post(runtime, continuation, "goose-final-recovery");
+  expect(response.status).toBe(200);
+  expect(await response.text()).toContain(finalText);
+  expect(browserStarts).toBe(1);
+  expect(rebounds).toBe(1);
+  expect(confirmations).toBe(1);
+  expect(runtime.broker.getTurn(seeded.turnRef)?.state).toBe("COMPLETE");
+  expect(runtime.broker.getAccountSlotHolder()).toBeNull();
+  expect(runtime.broker.getOperation(admitted.initialOpRef)?.state).toBe("SUCCESS");
+  expect(runtime.broker.getNextOperationForTurn(seeded.turnRef, 1)?.state).toBe("MINTED");
+});
+
+test("accepted-final recovery fails closed when the reopened final no longer matches its durable digest", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-rebuild-provider-final-drift-"));
+  roots.push(root);
+  const brokerPath = join(root, "broker.sqlite");
+  const authorizationFile = join(root, "connector-auth.txt");
+  const authorization = `Bearer ${"d".repeat(64)}`;
+  writeFileSync(authorizationFile, `${authorization}\n`, { mode: 0o600 });
+  chmodSync(authorizationFile, 0o600);
+  const body = requestBody("accepted-final-drift");
+  const checkpoint = gooseResponsesProjectionCheckpoint(body);
+  const conversationId = "aaaaaaaa-bbbb-4ccc-8ddd-000000000798";
+  const seed = new SessionBroker(brokerPath, {
+    projectId: "project-final-drift",
+    instanceId: "seed",
+    terminalReplayWindowMs: 60_000,
+    makeTurnRef: () => "turn-final-drift",
+    makeSubmitNonce: () => "nonce-final-drift",
+    makeOpRef: () => "op-final-drift",
+  });
+  seed.createEpoch({ gooseSessionId: "goose-final-drift" });
+  const seeded = seed.enqueueTurn({
+    gooseSessionId: "goose-final-drift",
+    requestHash: checkpoint.requestHash,
+    checkpointJson: encodeGooseResponsesProjectionCheckpoint(checkpoint),
+  });
+  seed.admitNext();
+  seed.markSendActivated(seeded.turnRef);
+  seed.bindConversation({ gooseSessionId: "goose-final-drift", epoch: 1, conversationId });
+  seed.markAccepted(seeded.turnRef, "user-final-drift");
+  seed.recordFinalDigest(
+    seeded.turnRef,
+    createHash("sha256").update("durable-final", "utf8").digest("hex"),
+  );
+  seed.close();
+
+  let sends = 0;
+  const runtime = startRebuildProviderRuntime({
+    port: 0,
+    model: "gpt-4.1",
+    contextWindow: 200_000,
+    controlToken: "control-token",
+    projectId: "project-final-drift",
+    connectorIdentity: "Goose Native 2nd Shift",
+    brokerPath,
+    terminalReplayWindowMs: 60_000,
+    connectorPort: 0,
+    connectorAuthorizationFile: authorizationFile,
+    browserDriver: {
+      createTurn(input) {
+        return {
+          captureAnswerBoundary: async () => { throw new Error("no tool expected"); },
+          confirmFinal: async evidence => evidence,
+          run: async () => {
+            sends += 0;
+            await input.lifecycle.onRebound?.({
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId: "user-final-drift",
+            });
+            return {
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId: "user-final-drift",
+              text: "different-final",
+              remoteNonRunning: true,
+            };
+          },
+        };
+      },
+    },
+  });
+  runtimes.push(runtime);
+  const response = await post(runtime, body, "goose-final-drift");
+  expect(response.status).toBe(409);
+  expect(sends).toBe(0);
+  expect(runtime.broker.getTurn(seeded.turnRef)?.state).toBe("UNRECONCILED");
+  expect(runtime.broker.getAccountSlotHolder()).toBe(seeded.turnRef);
 });
 
 test("provider restart rebinds from the latest durable tool-continuation checkpoint", async () => {

@@ -645,6 +645,39 @@ export class SessionBroker {
     });
   }
 
+  verifyFinalRecoveryRemoteTurn(input: {
+    turnRef: string;
+    canonicalConversationId: string;
+    acceptedUserTurnId: string;
+    remoteIdentityVerified: true;
+  }): BrokerTurn {
+    if (input.remoteIdentityVerified !== true) {
+      this.fail("RECOVERY_EVIDENCE", "Final recovery requires positive remote identity evidence");
+    }
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(input.turnRef);
+      if (turn.abandoned_at !== null || turn.state !== "UNRECONCILED") {
+        this.fail("TURN_STATE", "Accepted-final recovery requires an unreconciled remote turn");
+      }
+      this.requireSlotHolder(input.turnRef);
+      const epoch = this.epochRowRequired(turn.goose_session_id, turn.epoch);
+      if (epoch.conversation_id !== input.canonicalConversationId
+        || turn.accepted_user_turn_id !== input.acceptedUserTurnId) {
+        this.fail("RECOVERY_IDENTITY", "Final recovery identity does not match the durable conversation/turn binding");
+      }
+      if (!turn.final_digest) {
+        this.fail("FINAL_DIGEST_REQUIRED", "Accepted-final recovery requires a durably acknowledged final digest");
+      }
+      if (this.hasUnresolvedOperation(input.turnRef)) {
+        this.fail("UNRESOLVED_OPERATION", "Accepted-final recovery cannot proceed with unresolved Goose work");
+      }
+      // This proves only that the disposable browser reattached to the already-final durable pair.
+      // Keep the turn UNRECONCILED so the existing completion CAS must still freshly confirm the
+      // remote final and match its digest before releasing the account slot.
+      return turnFromRow(turn);
+    });
+  }
+
   releaseSlotAfterPositiveTerminal(turnRef: string, evidence: PositiveTerminalEvidence): BrokerTurn {
     if (!positiveTerminalSatisfied(evidence)) {
       this.fail("POSITIVE_TERMINAL_REQUIRED", "Account-slot release requires the full positive terminal predicate");

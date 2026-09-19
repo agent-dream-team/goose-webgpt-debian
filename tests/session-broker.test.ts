@@ -948,6 +948,46 @@ test("accepted final digest is durable before completion and blocks positive-ter
   }
 });
 
+test("accepted final recovery verifies the same remote pair without resuming it as running", () => {
+  const { broker, path } = fixture();
+  createSession(broker);
+  enqueue(broker);
+  broker.admitNext();
+  accept(broker);
+  bindConversation(broker);
+  broker.recordFinalDigest("turn-a", "digest-a");
+  broker.close();
+
+  const restarted = open(path, "broker-b");
+  try {
+    expect(restarted.getTurn("turn-a")?.state).toBe("UNRECONCILED");
+    expect(() => restarted.verifyFinalRecoveryRemoteTurn({
+      turnRef: "turn-a",
+      canonicalConversationId: "wrong-conversation",
+      acceptedUserTurnId: "user-turn-a",
+      remoteIdentityVerified: true,
+    })).toThrow(SessionBrokerError);
+    const verified = restarted.verifyFinalRecoveryRemoteTurn({
+      turnRef: "turn-a",
+      canonicalConversationId: "conversation-a",
+      acceptedUserTurnId: "user-turn-a",
+      remoteIdentityVerified: true,
+    });
+    expect(verified).toMatchObject({ state: "UNRECONCILED", finalDigest: "digest-a" });
+    expect(restarted.getAccountSlotHolder()).toBe("turn-a");
+    expect(() => restarted.rebindVerifiedRemoteTurn({
+      turnRef: "turn-a",
+      canonicalConversationId: "conversation-a",
+      acceptedUserTurnId: "user-turn-a",
+      remoteIdentityVerified: true,
+    })).toThrow(SessionBrokerError);
+    const claim = restarted.beginCompletion("turn-a");
+    expect(restarted.commitCompletion(claim, completionEvidence(null, "digest-a")).state).toBe("COMPLETE");
+  } finally {
+    restarted.close();
+  }
+});
+
 test("final digest acknowledgement is idempotent but conflicting final evidence fails closed", () => {
   const { broker } = fixture();
   try {

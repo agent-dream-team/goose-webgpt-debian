@@ -33,6 +33,7 @@ type StartMessage = {
     resumeAccepted?: {
       canonicalConversationId: string;
       acceptedUserTurnId: string;
+      finalRecoveryOnly?: true;
     };
   };
 };
@@ -97,6 +98,7 @@ function start(message: StartMessage): void {
       !resumeAccepted || typeof resumeAccepted !== "object"
       || typeof resumeAccepted.canonicalConversationId !== "string" || !resumeAccepted.canonicalConversationId
       || typeof resumeAccepted.acceptedUserTurnId !== "string" || !resumeAccepted.acceptedUserTurnId
+      || (resumeAccepted.finalRecoveryOnly !== undefined && resumeAccepted.finalRecoveryOnly !== true)
     ))) {
     throw new Error("Node browser worker start message is invalid");
   }

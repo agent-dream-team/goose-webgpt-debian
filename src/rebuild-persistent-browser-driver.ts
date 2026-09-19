@@ -519,6 +519,7 @@ export function createRebuildPersistentBrowserDriver(
         await sendButton.press("Enter", { noWaitAfter: true, timeout: 0 });
       };
       const sendRecoveryContinuation = async (): Promise<boolean> => {
+        if (input.resumeAccepted?.finalRecoveryOnly) return false;
         if (input.gooseWork.snapshot().activeToolCalls > 0) return false;
         if (!await viewRecoveryAllowed()) return false;
         if (!acceptedConversationId) throw new Error("Persistent ChatGPT recovery continuation has no durable conversation");
@@ -656,6 +657,9 @@ export function createRebuildPersistentBrowserDriver(
               staleObservation = undefined;
               staleObservationRecoveryStage = "refreshed";
             } else {
+              if (input.resumeAccepted?.finalRecoveryOnly) {
+                throw new Error("Accepted-final recovery still shows terminal error after a fresh view reload");
+              }
               if (!await sendRecoveryContinuation()) { await sleep(pollMs); continue; }
               terminalViewRefreshed = false;
             }

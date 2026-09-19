@@ -89,6 +89,8 @@ export interface RebuildPersistentBrowserTurnInput {
   resumeAccepted?: {
     canonicalConversationId: string;
     acceptedUserTurnId: string;
+    /** A durable final already exists; refresh/reobserve only and never send a recovery continuation. */
+    finalRecoveryOnly?: true;
   };
   preSendAbortSignal: AbortSignal;
   gooseWork: {
@@ -662,6 +664,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         resumeAccepted: {
           canonicalConversationId: epoch.conversationId,
           acceptedUserTurnId: turn.acceptedUserTurnId,
+          ...(turn.finalDigest ? { finalRecoveryOnly: true as const } : {}),
         },
         preSendAbortSignal: preSendAbort.signal,
         gooseWork: { snapshot: () => toolProgressSnapshot(turn.turnRef) },
@@ -677,12 +680,14 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
             const acceptedUserTurnId = validatePersistentChatTurnIdentity(
               evidence.acceptedUserTurnId, "reattached accepted user turn",
             );
-            broker.rebindVerifiedRemoteTurn({
+            const recovery = {
               turnRef: turn.turnRef,
               canonicalConversationId: conversationId,
               acceptedUserTurnId,
-              remoteIdentityVerified: true,
-            });
+              remoteIdentityVerified: true as const,
+            };
+            if (turn.finalDigest) broker.verifyFinalRecoveryRemoteTurn(recovery);
+            else broker.rebindVerifiedRemoteTurn(recovery);
             reboundVerified = true;
           },
         },
