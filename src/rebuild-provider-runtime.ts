@@ -847,6 +847,35 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     };
   };
 
+  const acceptedFinalRuntimeCheckpoint = (
+    body: unknown,
+    previous: GooseResponsesProjectionCheckpoint,
+    current: GooseResponsesProjectionCheckpoint,
+  ): GooseResponsesProjectionCheckpoint | null => {
+    if (previous.stableNonInputHash === undefined
+      || current.stableNonInputHash !== previous.stableNonInputHash
+      || current.inputCount !== previous.inputCount
+      || previous.inputCount < 1
+      || !body || typeof body !== "object" || Array.isArray(body)) return null;
+    const request = body as Record<string, unknown>;
+    if (!Array.isArray(request.input) || !Array.isArray(request.tools)) return null;
+    const system = request.input[0];
+    if (!system || typeof system !== "object" || Array.isArray(system)) return null;
+    const systemRecord = system as Record<string, unknown>;
+    if (systemRecord.type !== "message" || systemRecord.role !== "system" || !Array.isArray(systemRecord.content)
+      || systemRecord.content.length !== 1) return null;
+    const systemContent = systemRecord.content[0];
+    if (!systemContent || typeof systemContent !== "object" || Array.isArray(systemContent)) return null;
+    const systemText = (systemContent as Record<string, unknown>).text;
+    if ((systemContent as Record<string, unknown>).type !== "input_text"
+      || typeof systemText !== "string"
+      || !systemText.startsWith("You are a general-purpose AI agent called goose")) return null;
+    for (let index = 1; index < previous.inputCount; index += 1) {
+      if (current.inputItemHashes[index] !== previous.inputItemHashes[index]) return null;
+    }
+    return current;
+  };
+
   const handleResponses = async (request: Request): Promise<Response> => {
     const sessionId = request.headers.get("agent-session-id");
     if (!validSessionId(sessionId)) return jsonError(400, "invalid_agent_session_id", "One valid agent-session-id header is required");
@@ -874,9 +903,15 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         return jsonError(409, "rebind_request_conflict", "Persistent pair rebind requires a valid latest durable Goose Responses checkpoint");
       }
       const recoveredReplay = recoveredTerminalReplayForBody(turn.turnRef, body);
+      const acceptedFinalCheckpoint = turn.finalDigest
+        ? acceptedFinalRuntimeCheckpoint(body, durableCheckpoint, checkpoint)
+        : null;
       let recoveredDecision = null;
       if (durableCheckpoint.requestHash !== checkpoint.requestHash) {
-        if (recoveredReplay) {
+        if (acceptedFinalCheckpoint) {
+          // The durable provider final already closes execution. Only Goose-generated system/tool
+          // projection may migrate here; canonical conversation items remain byte-identical.
+        } else if (recoveredReplay) {
           recoveredDecision = classifyGooseResponsesContinuation({
             body,
             previous: durableCheckpoint,
@@ -893,7 +928,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
             }
           }
         }
-        if (!recoveredReplay || recoveredDecision?.kind !== "TOOL_RESULT") {
+        if (!acceptedFinalCheckpoint && (!recoveredReplay || recoveredDecision?.kind !== "TOOL_RESULT")) {
           return jsonError(
             409,
             "rebind_request_conflict",
@@ -902,7 +937,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         }
         // Recovered +2 continuations are admitted only after the separate recovery cadence has
         // proven the remote UI non-running, no unresolved Goose work, and no contradictory activity.
-        if (!broker.hasRecordedPositiveTerminalSlotRelease(turn.turnRef)) {
+        if (!acceptedFinalCheckpoint && !broker.hasRecordedPositiveTerminalSlotRelease(turn.turnRef)) {
           return jsonError(
             409,
             "rebind_recovery_precondition",
@@ -914,7 +949,14 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         return jsonError(409, "rebind_blocked", "Persistent pair rebind requires unresolved Goose tool/result state to be reconciled first");
       }
       if (durableCheckpoint.requestHash !== checkpoint.requestHash) {
-        turn = broker.recordProgress(turn.turnRef, encodeGooseResponsesProjectionCheckpoint(recoveredDecision!.checkpoint));
+        let upgradedCheckpoint = acceptedFinalCheckpoint;
+        if (!upgradedCheckpoint) {
+          if (recoveredDecision?.kind !== "TOOL_RESULT") {
+            throw new Error("Recovered rebind checkpoint disappeared after request validation");
+          }
+          upgradedCheckpoint = recoveredDecision.checkpoint;
+        }
+        turn = broker.recordProgress(turn.turnRef, encodeGooseResponsesProjectionCheckpoint(upgradedCheckpoint));
       } else if (durableCheckpoint.stableNonInputHash === undefined) {
         // Exact legacy-v2 replay is safe to upgrade because requestHash already proves body identity.
         turn = broker.recordProgress(turn.turnRef, encodeGooseResponsesProjectionCheckpoint(checkpoint));
