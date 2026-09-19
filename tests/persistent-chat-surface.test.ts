@@ -238,6 +238,22 @@ test("inspect waits for the durable user and assistant anchors to hydrate", asyn
   expect(fake.state.closes).toBe(1);
 });
 
+test("inspect hydration wait aborts promptly and closes its disposable connection", async () => {
+  const empty = snapshot({ turnIdentities: [], userIdentities: [], assistantIdentities: [] });
+  const fake = fakeConnection({
+    url: `https://chatgpt.com/c/${CONVERSATION}`,
+    snapshots: [empty],
+  });
+  const controller = new PersistentChatSurfaceController(
+    "/descriptor", async () => fake.connection, 10_000, async () => {},
+  );
+  const abort = new AbortController();
+  const pending = controller.inspect(binding(), abort.signal);
+  setTimeout(() => abort.abort(), 10);
+  await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  expect(fake.state.closes).toBe(1);
+});
+
 test("reopen navigates an idle owned surface to the canonical conversation and reinitializes from fresh DOM", async () => {
   const rebound = snapshot({
     turnIdentities: ["user-old", "assistant-old", "user-accepted", "assistant-after-reopen"],

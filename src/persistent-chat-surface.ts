@@ -178,6 +178,26 @@ async function closeBrowser(browser: Browser): Promise<void> {
   await browser.close().catch(() => {});
 }
 
+function throwIfObservationAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException("Persistent ChatGPT surface observation aborted", "AbortError");
+}
+
+function sleepWithObservationAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise(resolve => setTimeout(resolve, ms));
+  const activeSignal = signal;
+  throwIfObservationAborted(activeSignal);
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(done, ms);
+    const onAbort = () => done(new DOMException("Persistent ChatGPT surface observation aborted", "AbortError"));
+    function done(error?: unknown) {
+      clearTimeout(timer);
+      activeSignal.removeEventListener("abort", onAbort);
+      error ? reject(error) : resolve();
+    }
+    activeSignal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export class PersistentChatSurfaceController {
   constructor(
     private readonly descriptorPath: string,
@@ -191,7 +211,7 @@ export class PersistentChatSurfaceController {
       this.descriptorPath, this.timeoutMs, binding.surfaceId, abortSignal,
     );
     try {
-      return await this.inspectPage(connection.page, binding);
+      return await this.inspectPage(connection.page, binding, abortSignal);
     } finally {
       await closeBrowser(connection.browser);
     }
@@ -219,7 +239,11 @@ export class PersistentChatSurfaceController {
     return this.inspect(binding, abortSignal);
   }
 
-  private async inspectPage(page: Page, binding: PersistentChatBinding): Promise<PersistentChatSurfaceObservation> {
+  private async inspectPage(
+    page: Page,
+    binding: PersistentChatBinding,
+    abortSignal?: AbortSignal,
+  ): Promise<PersistentChatSurfaceObservation> {
     canonicalChatGptConversationUrl(binding.conversationId);
     const location = classifyChatGptConversationUrl(page.url());
     if (location.kind !== "canonical") {
@@ -231,6 +255,7 @@ export class PersistentChatSurfaceController {
     await this.verifyAuthenticated(page, this.timeoutMs);
     const deadline = Date.now() + this.timeoutMs;
     for (;;) {
+      throwIfObservationAborted(abortSignal);
       const snapshot = await capturePersistentChatTurnSnapshot(page);
       if (snapshot.userIdentities.includes(binding.acceptedUserTurnId)) {
         const assistantTurnId = assistantTurnForAcceptedUser(snapshot, binding.acceptedUserTurnId);
@@ -245,7 +270,7 @@ export class PersistentChatSurfaceController {
       if (Date.now() >= deadline) {
         throw new Error("ChatGPT durable turn binding did not hydrate before the observation timeout");
       }
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await sleepWithObservationAbort(100, abortSignal);
     }
   }
 }
