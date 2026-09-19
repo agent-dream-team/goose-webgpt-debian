@@ -1013,7 +1013,7 @@ test("persistent stale observation may hard-refresh repeatedly and never resend 
   expect(sends).toBe(1);
 });
 
-test("running turn ignores the short refresh threshold and refreshes only at the long watchdog", async () => {
+test("running turn ignores the short settle threshold and refreshes only at the observation watchdog", async () => {
   let sent = false;
   let sends = 0;
   let reopenCalls = 0;
@@ -1047,7 +1047,7 @@ test("running turn ignores the short refresh threshold and refreshes only at the
     reopenBinding: async binding => {
       reopenCalls += 1;
       // With the short threshold incorrectly applied to running turns, refresh happens on the
-      // second stable observation. The long watchdog must leave several observations untouched.
+      // second stable observation. The observation watchdog must leave several observations untouched.
       expect(runningObservations).toBeGreaterThanOrEqual(3);
       return { binding, assistantTurnId: "assistant-1", snapshot: snapshotsAfterSend(() => true) };
     },
@@ -1232,7 +1232,7 @@ test("reattached stopped turn refreshes the view then continues privately in the
   expect(refreshed.composerText()).toContain("continue from there");
 });
 
-test("stale-tool observation uses the long watchdog before refreshing and preserves tool authority", async () => {
+test("stale-tool observation uses the observation watchdog before refreshing and preserves tool authority", async () => {
   let sent = false;
   let originalSends = 0;
   let progress = { revision: 1, lastToolBatchRevision: 1, activeToolCalls: 1, lastProgressAt: 0 };

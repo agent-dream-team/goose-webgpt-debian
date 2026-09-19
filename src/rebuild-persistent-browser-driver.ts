@@ -56,7 +56,7 @@ const DEFAULT_POLL_MS = 100;
 const DEFAULT_BOUNDARY_SETTLE_MS = 250;
 const DEFAULT_CONFIRM_SETTLE_MS = 250;
 const DEFAULT_STALE_OBSERVATION_FIRST_REFRESH_MS = 15_000;
-const DEFAULT_STALE_OBSERVATION_SUBSEQUENT_REFRESH_MS = 5 * 60_000;
+const DEFAULT_STALE_OBSERVATION_SUBSEQUENT_REFRESH_MS = 60_000;
 const SEND_ENABLE_GRACE_MS = 10_000;
 const GCW_RECOVERY_CONTINUATION_PROMPT = "You seem to have stopped mid-turn. Work out where you got to and continue from there.";
 
@@ -716,9 +716,10 @@ export function createRebuildPersistentBrowserDriver(
             } else {
               const continuationEligible = staleObservationKind === "missing-completion-action"
                 || staleObservationKind === "stopped-no-final";
-              // Running or tool-blocked state is positive work evidence; only the long watchdog
-              // may refresh that disposable view. A freshly observed stopped view needs only the
-              // short settle cadence before same-chat continuation.
+              // Running or tool-blocked state is positive work evidence, never terminal authority. A stable
+              // view with no semantic progress may still be stale, so the observation watchdog may
+              // refresh that disposable view. A freshly observed stopped view needs only the short
+              // settle cadence before same-chat continuation.
               const recoveryThresholdMs = continuationEligible
                 ? staleObservationFirstRefreshMs
                 : staleObservationSubsequentRefreshMs;
