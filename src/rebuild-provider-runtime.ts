@@ -45,6 +45,7 @@ import {
   type BrokerTurn,
   type PositiveTerminalEvidence,
   type RemoteEpoch,
+  isStrictPrefixDigest,
 } from "./session-broker";
 
 export const REBUILD_PROVIDER_SERVICE = "goose-chatgpt-web-rebuild";
@@ -148,6 +149,9 @@ interface ActiveExecution {
   latestBoundaryOpRef: string | null;
   /** Positive-terminal recovery qualifies only this exact already-terminal boundary. */
   qualifiedTerminalBoundaryOpRef: string | null;
+  /** True only for accepted-final recovery rebind (turn.finalDigest existed before rebind).
+   *  Guards the strict-prefix digest advancement path so ordinary turns cannot use it. */
+  isAcceptedFinalRecovery: boolean;
   final: Promise<string>;
   executionDetach: Promise<void> | null;
 }
@@ -474,15 +478,34 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     }
     if (evidence.remoteNonRunning !== true) throw new Error("Browser final evidence is incomplete");
     const digest = finalDigest(evidence.text);
-    broker.recordFinalDigest(turn.turnRef, digest);
+
+    // Accepted-final recovery: if the stored final digest exists but differs from the
+    // freshly observed final text, permit advancement ONLY when the stored digest is
+    // the SHA-256 of a strict prefix of the fresh text. This is recovery-only and
+    // guarded by isAcceptedFinalRecovery so ordinary turns cannot use this path.
+    let effectiveDigest = digest;
+    if (active.isAcceptedFinalRecovery && turn.finalDigest && turn.finalDigest !== digest) {
+      if (!isStrictPrefixDigest(turn.finalDigest, evidence.text)) {
+        throw new Error("Accepted-final recovery: stored digest is not a strict prefix of the fresh final text");
+      }
+      // Recovery-only CAS: replace the stored digest with the fresh one.
+      // This increments revision and leaves completion_claim_revision null.
+      broker.recordFinalDigestRecovery(turn.turnRef, turn.finalDigest, digest);
+      effectiveDigest = digest;
+    } else {
+      // Ordinary path (including idempotent re-acknowledgement of same digest).
+      broker.recordFinalDigest(turn.turnRef, digest);
+    }
+
     const claim = broker.beginCompletion(turn.turnRef);
     const confirmed = await active.browser.confirmFinal(evidence);
     const confirmedConversationId = normalizeCanonicalChatGptConversationId(confirmed.canonicalConversationId);
     const confirmedUserTurnId = validatePersistentChatTurnIdentity(confirmed.acceptedUserTurnId, "accepted user turn");
+    const confirmedDigest = finalDigest(confirmed.text);
     if (confirmedConversationId !== conversationId
       || confirmedUserTurnId !== acceptedUserTurnId
       || confirmed.remoteNonRunning !== true
-      || finalDigest(confirmed.text) !== digest) {
+      || confirmedDigest !== effectiveDigest) {
       throw new Error("Fresh browser final confirmation does not match the completion candidate");
     }
     const confirmedTurn = broker.getTurn(turn.turnRef);
@@ -493,7 +516,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       acceptedUserTurnId: confirmedUserTurnId,
       noUnresolvedGooseWork: true,
       remoteNonRunning: true,
-      observedFinalDigest: digest,
+      observedFinalDigest: effectiveDigest,
       canonicalHistoryWatermark: encodeGooseCanonicalHistoryWatermark({
         checkpoint: decodeGooseResponsesProjectionCheckpoint(confirmedTurn.checkpointJson),
         finalAssistantText: confirmed.text,
@@ -590,6 +613,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       sendActivated,
       latestBoundaryOpRef: null,
       qualifiedTerminalBoundaryOpRef: null,
+      isAcceptedFinalRecovery: false,
       final: Promise.resolve("") as Promise<string>,
       executionDetach: null,
     };
@@ -705,6 +729,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       sendActivated: true,
       latestBoundaryOpRef: latestTerminal?.answerBoundaryJson ? latestTerminal.opRef : null,
       qualifiedTerminalBoundaryOpRef,
+      isAcceptedFinalRecovery: turn.finalDigest !== null,
       final: Promise.resolve("") as Promise<string>,
       executionDetach: null,
     };
@@ -974,7 +999,20 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         throw error;
       }
       const stage = baton.openStage({ turnRef: turn.turnRef, body });
-      return await serveStage(stage, active, request.signal);
+      try {
+        return await serveStage(stage, active, request.signal);
+      } catch (error: unknown) {
+        if (error instanceof SessionBrokerError) {
+          return Response.json({ error: { type: "invalid_request_error", code: error.code, message: error.message } }, { status: 409 });
+        }
+        // Recovery-specific failures (strict-prefix mismatch, confirmFinal mismatch, etc.)
+        // are client-visible conflicts, not server errors.
+        if (error instanceof Error && (error.message.startsWith("Accepted-final recovery:") ||
+            error.message.startsWith("Fresh browser final confirmation does not match"))) {
+          return jsonError(409, "recovery_conflict", error.message);
+        }
+        throw error;
+      }
     }
     if (turn?.state === "TURN_OUTSTANDING") {
       const active = executions.get(turn.turnRef);

@@ -2,12 +2,14 @@ import { afterEach, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
 import {
   SessionBroker,
   SessionBrokerError,
   type CompletionEvidence,
   type PositiveTerminalEvidence,
+  isStrictPrefixDigest,
 } from "../src/session-broker";
 
 const roots: string[] = [];
@@ -2053,5 +2055,125 @@ test("positive-terminal slot quarantine survives broker restart and remains rebi
     expect(restarted.getAccountSlotHolder()).toBe("turn-a");
   } finally {
     restarted.close();
+  }
+});
+
+test("isStrictPrefixDigest returns true only for strict prefix hashes", () => {
+  const prefix = "hello world";
+  const full = "hello world!";
+  const prefixDigest = createHash("sha256").update(prefix, "utf8").digest("hex");
+  const fullDigest = createHash("sha256").update(full, "utf8").digest("hex");
+
+  expect(isStrictPrefixDigest(prefixDigest, full)).toBe(true);
+  expect(isStrictPrefixDigest(fullDigest, full)).toBe(false); // equal length, not strict prefix
+  expect(isStrictPrefixDigest(prefixDigest, prefix)).toBe(false); // equal, not strict prefix
+  expect(isStrictPrefixDigest("deadbeef".repeat(8), full)).toBe(false); // wrong digest
+  expect(isStrictPrefixDigest(prefixDigest, "different text")).toBe(false); // not a prefix
+  expect(isStrictPrefixDigest("", full)).toBe(false); // empty stored digest
+  expect(isStrictPrefixDigest(prefixDigest, "")).toBe(false); // empty fresh text
+});
+
+test("isStrictPrefixDigest handles Unicode and surrogate pairs correctly", () => {
+  // Text with emoji (surrogate pair)
+  const prefix = "hello 🌍";
+  const full = "hello 🌍!";
+  const prefixDigest = createHash("sha256").update(prefix, "utf8").digest("hex");
+  const fullDigest = createHash("sha256").update(full, "utf8").digest("hex");
+
+  expect(isStrictPrefixDigest(prefixDigest, full)).toBe(true);
+  expect(isStrictPrefixDigest(fullDigest, full)).toBe(false);
+
+  // Multiple emoji
+  const prefix2 = "🎉🎊";
+  const full2 = "🎉🎊🎈";
+  const prefixDigest2 = createHash("sha256").update(prefix2, "utf8").digest("hex");
+  const fullDigest2 = createHash("sha256").update(full2, "utf8").digest("hex");
+
+  expect(isStrictPrefixDigest(prefixDigest2, full2)).toBe(true);
+  expect(isStrictPrefixDigest(fullDigest2, full2)).toBe(false);
+
+  // A digest made from a string cut through the emoji surrogate pair must never match.
+  const splitFull = "hello 🌍!";
+  const splitPrefix = splitFull.slice(0, "hello ".length + 1);
+  expect(splitPrefix.length).toBe("hello ".length + 1);
+  const splitDigest = createHash("sha256").update(splitPrefix, "utf8").digest("hex");
+  expect(isStrictPrefixDigest(splitDigest, splitFull)).toBe(false);
+});
+
+test("recordFinalDigestRecovery replaces digest only under strict recovery conditions", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    broker.admitNext();
+    accept(broker);
+    bindConversation(broker);
+    const initialDigest = createHash("sha256").update("initial", "utf8").digest("hex");
+    broker.recordFinalDigest("turn-a", initialDigest);
+    broker.markUnreconciled("turn-a", "browser_crash");
+
+    // Wrong state (TURN_OUTSTANDING) should fail - create a separate turn in TURN_OUTSTANDING
+    broker.createEpoch({ gooseSessionId: "goose-b" });
+    const turn2 = broker.enqueueTurn({ gooseSessionId: "goose-b", requestHash: "req-b" });
+    broker.admitNext(turn2.turnRef);
+    broker.markSendActivated(turn2.turnRef);
+    broker.recordFinalDigest(turn2.turnRef, initialDigest);
+    expect(() => broker.recordFinalDigestRecovery(turn2.turnRef, initialDigest, "new-digest"))
+      .toThrow(SessionBrokerError);
+
+    // Completion claim in flight should fail
+    broker.recordFinalDigest("turn-a", initialDigest); // re-acknowledge
+    broker.beginCompletion("turn-a");
+    expect(() => broker.recordFinalDigestRecovery("turn-a", initialDigest, "new-digest"))
+      .toThrow(SessionBrokerError);
+
+    // Clear completion claim (simulate restart or invalidation)
+    broker.recordProgress("turn-a");
+
+    // Wrong expected digest should fail
+    expect(() => broker.recordFinalDigestRecovery("turn-a", "wrong-digest", "new-digest"))
+      .toThrow(SessionBrokerError);
+
+    // Same digest should fail
+    expect(() => broker.recordFinalDigestRecovery("turn-a", initialDigest, initialDigest))
+      .toThrow(SessionBrokerError);
+
+    // Empty replacement should fail
+    expect(() => broker.recordFinalDigestRecovery("turn-a", initialDigest, ""))
+      .toThrow(SessionBrokerError);
+
+    // Valid recovery should succeed
+    const newDigest = createHash("sha256").update("initial!", "utf8").digest("hex");
+    const recovered = broker.recordFinalDigestRecovery("turn-a", initialDigest, newDigest);
+    expect(recovered.finalDigest).toBe(newDigest);
+    expect(recovered.revision).toBeGreaterThan(0);
+    expect(recovered.completionClaimRevision).toBeNull();
+  } finally {
+    broker.close();
+  }
+});
+
+test("recordFinalDigestRecovery requires UNRECONCILED state and held slot", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    broker.admitNext();
+    accept(broker);
+    bindConversation(broker);
+    const digest = createHash("sha256").update("final", "utf8").digest("hex");
+    broker.recordFinalDigest("turn-a", digest);
+    broker.markUnreconciled("turn-a", "test");
+
+    // Should work in UNRECONCILED with slot held
+    const newDigest = createHash("sha256").update("final!", "utf8").digest("hex");
+    const recovered = broker.recordFinalDigestRecovery("turn-a", digest, newDigest);
+    expect(recovered.finalDigest).toBe(newDigest);
+
+    // After recovery, turn is still UNRECONCILED with slot held
+    expect(broker.getTurn("turn-a")?.state).toBe("UNRECONCILED");
+    expect(broker.getAccountSlotHolder()).toBe("turn-a");
+  } finally {
+    broker.close();
   }
 });

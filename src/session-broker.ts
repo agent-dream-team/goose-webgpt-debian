@@ -1,5 +1,39 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Database } from "bun:sqlite";
+
+/**
+ * Check if `storedDigest` is the SHA-256 of a strict prefix of `freshText`.
+ * Unicode-safe: iterates code points and never splits a surrogate pair.
+ * Returns true only when the stored digest exactly matches the hash of a proper
+ * prefix (length < freshText.length) of the fresh text.
+ */
+export function isStrictPrefixDigest(storedDigest: string, freshText: string): boolean {
+  if (storedDigest.length !== 64) return false;
+  if (freshText.length === 0) return false;
+  // Fast path: if full text hashes to stored digest, it's not a strict prefix (equal length).
+  const fullDigest = createHash("sha256").update(freshText, "utf8").digest("hex");
+  if (fullDigest === storedDigest) return false;
+
+  // Iterate code points to find the prefix boundary. We need to check each
+  // prefix ending at a code point boundary (not splitting surrogate pairs).
+  // Use createHash().copy() for efficient incremental hashing.
+  let hash = createHash("sha256");
+  let prefixEnd = 0;
+  for (let i = 0; i < freshText.length; ) {
+    const codePoint = freshText.codePointAt(i);
+    if (codePoint === undefined) break;
+    // Advance by the code point's UTF-16 length (1 or 2 for surrogate pairs).
+    const charLength = codePoint <= 0xFFFF ? 1 : 2;
+    prefixEnd += charLength;
+    i += charLength;
+    hash.update(freshText.slice(prefixEnd - charLength, prefixEnd), "utf8");
+    // Only check strict prefixes (prefixEnd < freshText.length).
+    if (prefixEnd < freshText.length) {
+      if (hash.copy().digest("hex") === storedDigest) return true;
+    }
+  }
+  return false;
+}
 
 export type LeaseState = "IDLE" | "TURN_OUTSTANDING" | "UNRECONCILED";
 export type TurnState =
@@ -823,6 +857,56 @@ export class SessionBroker {
         this.db.query("UPDATE turns SET final_digest = ?, completion_claim_revision = NULL, revision = revision + 1, updated_at = ? WHERE turn_ref = ?")
           .run(finalDigest, this.now(), turnRef);
       }
+      return this.getTurnRequired(turnRef);
+    });
+  }
+
+  /**
+   * Recovery-only CAS to replace an existing final digest when the remote answer
+   * has grown by strict prefix extension. This is ONLY for accepted-final recovery
+   * where the stored digest is a strict prefix of the freshly observed final text.
+   *
+   * Conditions (all must hold):
+   * - turn state is UNRECONCILED
+   * - slot is still held (slot_held = 1)
+   * - completion_claim_revision is null
+   * - persisted final_digest exactly equals the caller-provided expectedOldDigest
+   * - replacementDigest is nonempty and different from expectedOldDigest
+   * - there are no unresolved operations (claimed, uncertain, or minted with boundary)
+   *
+   * On success: increments revision, leaves completion_claim_revision null,
+   * and updates final_digest to replacementDigest.
+   */
+  recordFinalDigestRecovery(
+    turnRef: string,
+    expectedOldDigest: string,
+    replacementDigest: string,
+  ): BrokerTurn {
+    if (!expectedOldDigest) this.fail("INVALID_FINAL_DIGEST", "Expected old digest must not be empty");
+    if (!replacementDigest) this.fail("INVALID_FINAL_DIGEST", "Replacement digest must not be empty");
+    if (expectedOldDigest === replacementDigest) {
+      this.fail("INVALID_FINAL_DIGEST", "Replacement digest must differ from expected old digest");
+    }
+    return this.transaction(() => {
+      const turn = this.turnRowRequired(turnRef);
+      if (turn.abandoned_at !== null || turn.state !== "UNRECONCILED") {
+        this.fail("TURN_STATE", "Recovery digest replacement requires an unreconciled turn");
+      }
+      if (this.accountSlotForTurn(turnRef) === null) {
+        this.fail("ACCOUNT_SLOT", "Recovery digest replacement requires the account slot to be held");
+      }
+      if (turn.completion_claim_revision !== null) {
+        this.fail("COMPLETION_IN_FLIGHT", "Cannot replace final digest while a completion claim exists");
+      }
+      if (!turn.final_digest || turn.final_digest !== expectedOldDigest) {
+        this.fail("FINAL_DIGEST_CONFLICT", "Stored final digest does not match expected old digest");
+      }
+      if (this.hasUnresolvedOperation(turnRef)) {
+        this.fail("UNRESOLVED_OPERATION", "Cannot replace final digest with unresolved Goose work");
+      }
+      this.db.query(`UPDATE turns SET final_digest = ?, completion_claim_revision = NULL,
+        revision = revision + 1, updated_at = ? WHERE turn_ref = ?`)
+        .run(replacementDigest, this.now(), turnRef);
       return this.getTurnRequired(turnRef);
     });
   }

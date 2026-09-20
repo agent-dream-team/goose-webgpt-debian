@@ -1088,6 +1088,286 @@ test("provider restart completes an already-accepted post-tool final without res
   expect(runtime.broker.getNextOperationForTurn(seeded.turnRef, 1)?.state).toBe("MINTED");
 });
 
+
+test("accepted-final recovery advances a strict-prefix candidate without replaying the completed tool", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-rebuild-provider-final-prefix-growth-"));
+  roots.push(root);
+  const brokerPath = join(root, "broker.sqlite");
+  const authorizationFile = join(root, "connector-auth.txt");
+  writeFileSync(authorizationFile, `Bearer ${"g".repeat(64)}\n`, { mode: 0o600 });
+  chmodSync(authorizationFile, 0o600);
+  const sessionId = "goose-final-prefix-growth";
+  const initial = requestBody("accepted-final-prefix-growth");
+  const initialCheckpoint = gooseResponsesProjectionCheckpoint(initial);
+  const conversationId = "aaaaaaaa-bbbb-4ccc-8ddd-000000000799";
+  const acceptedUserTurnId = "user-final-prefix-growth";
+  const prefixText = "x".repeat(3_557);
+  const finalText = `${prefixText}\n\nAdd a concrete fix and regression tests`;
+  expect(prefixText.length).toBe(3_557);
+  expect(finalText.length).toBe(3_598);
+  const prefixDigest = createHash("sha256").update(prefixText, "utf8").digest("hex");
+  const finalDigest = createHash("sha256").update(finalText, "utf8").digest("hex");
+  const seed = new SessionBroker(brokerPath, {
+    projectId: "project-final-prefix-growth",
+    instanceId: "seed",
+    terminalReplayWindowMs: 60_000,
+    makeTurnRef: () => "turn-final-prefix-growth",
+    makeSubmitNonce: () => "nonce-final-prefix-growth",
+    makeOpRef: (() => {
+      const refs = ["op-final-prefix-growth", "op-final-prefix-growth-next"];
+      return () => refs.shift() ?? "op-final-prefix-growth-extra";
+    })(),
+  });
+  seed.createEpoch({ gooseSessionId: sessionId });
+  const seeded = seed.enqueueTurn({
+    gooseSessionId: sessionId,
+    requestHash: initialCheckpoint.requestHash,
+    checkpointJson: encodeGooseResponsesProjectionCheckpoint(initialCheckpoint),
+  });
+  const admitted = seed.admitNext()!;
+  seed.markSendActivated(seeded.turnRef);
+  seed.bindConversation({ gooseSessionId: sessionId, epoch: 1, conversationId });
+  seed.markAccepted(seeded.turnRef, acceptedUserTurnId);
+  seed.recordAnswerBoundary(seeded.turnRef, admitted.initialOpRef, '{"text":"before-tool"}');
+  const toolArguments = { path: "." };
+  const inputHash = connectorOperationInputHash("tree", toolArguments);
+  seed.claimOperation({ turnRef: seeded.turnRef, opRef: admitted.initialOpRef, inputHash });
+  const continuation = continuationBody(initial, admitted.initialOpRef, "known-tool-result");
+  seed.completeOperationWithProgress({
+    turnRef: seeded.turnRef,
+    opRef: admitted.initialOpRef,
+    inputHash,
+    outcome: "SUCCESS",
+    resultJson: prepareConnectorTerminalResult({
+      outcome: "SUCCESS", dataClass: "task", content: "known-tool-result",
+    }).resultJson,
+    checkpointJson: encodeGooseResponsesProjectionCheckpoint(gooseResponsesProjectionCheckpoint(continuation)),
+  });
+  seed.recordFinalDigest(seeded.turnRef, prefixDigest);
+  seed.close();
+
+  let browserStarts = 0;
+  let confirmations = 0;
+  let toolReplays = 0;
+  const runtime = startRebuildProviderRuntime({
+    port: 0,
+    model: "gpt-4.1",
+    contextWindow: 200_000,
+    controlToken: "control-token",
+    projectId: "project-final-prefix-growth",
+    connectorIdentity: "Goose Native 2nd Shift",
+    brokerPath,
+    terminalReplayWindowMs: 60_000,
+    connectorPort: 0,
+    connectorAuthorizationFile: authorizationFile,
+    browserDriver: {
+      createTurn(input) {
+        browserStarts += 1;
+        expect(input.prompt).toBe("");
+        expect(input.resumeAccepted?.finalRecoveryOnly).toBeTrue();
+        return {
+          captureAnswerBoundary: async () => {
+            toolReplays += 1;
+            throw new Error("accepted-final recovery must not replay historical tools");
+          },
+          confirmFinal: async evidence => {
+            confirmations += 1;
+            return evidence;
+          },
+          run: async () => {
+            await input.lifecycle.onRebound?.({ canonicalConversationId: conversationId, acceptedUserTurnId });
+            return {
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId,
+              text: finalText,
+              remoteNonRunning: true,
+              contentAdvancedAfterLastTool: true,
+            };
+          },
+        };
+      },
+    },
+  });
+  runtimes.push(runtime);
+
+  const response = await post(runtime, continuation, sessionId);
+  expect(response.status).toBe(200);
+  expect(await response.text()).toContain(JSON.stringify(finalText).slice(1, -1));
+  expect(browserStarts).toBe(1);
+  expect(confirmations).toBe(1);
+  expect(toolReplays).toBe(0);
+  expect(runtime.broker.getTurn(seeded.turnRef)).toMatchObject({
+    state: "COMPLETE", finalDigest,
+  });
+  expect(runtime.broker.getAccountSlotHolder()).toBeNull();
+  expect(runtime.broker.getOperation(admitted.initialOpRef)?.state).toBe("SUCCESS");
+  expect(runtime.broker.getNextOperationForTurn(seeded.turnRef, 1)).toMatchObject({
+    state: "MINTED", inputHash: null, resultJson: null,
+  });
+});
+
+test("accepted-final recovery rejects suffix-only digest similarity", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-rebuild-provider-final-suffix-drift-"));
+  roots.push(root);
+  const brokerPath = join(root, "broker.sqlite");
+  const authorizationFile = join(root, "connector-auth.txt");
+  writeFileSync(authorizationFile, `Bearer ${"s".repeat(64)}\n`, { mode: 0o600 });
+  chmodSync(authorizationFile, 0o600);
+  const sessionId = "goose-final-suffix-drift";
+  const body = requestBody("accepted-final-suffix-drift");
+  const checkpoint = gooseResponsesProjectionCheckpoint(body);
+  const conversationId = "aaaaaaaa-bbbb-4ccc-8ddd-000000000796";
+  const acceptedUserTurnId = "user-final-suffix-drift";
+  const storedText = "shared-tail";
+  const freshText = `different opening ${storedText}`;
+  const storedDigest = createHash("sha256").update(storedText, "utf8").digest("hex");
+  const seed = new SessionBroker(brokerPath, {
+    projectId: "project-final-suffix-drift",
+    instanceId: "seed",
+    terminalReplayWindowMs: 60_000,
+    makeTurnRef: () => "turn-final-suffix-drift",
+    makeSubmitNonce: () => "nonce-final-suffix-drift",
+    makeOpRef: () => "op-final-suffix-drift",
+  });
+  seed.createEpoch({ gooseSessionId: sessionId });
+  const seeded = seed.enqueueTurn({
+    gooseSessionId: sessionId,
+    requestHash: checkpoint.requestHash,
+    checkpointJson: encodeGooseResponsesProjectionCheckpoint(checkpoint),
+  });
+  seed.admitNext();
+  seed.markSendActivated(seeded.turnRef);
+  seed.bindConversation({ gooseSessionId: sessionId, epoch: 1, conversationId });
+  seed.markAccepted(seeded.turnRef, acceptedUserTurnId);
+  seed.recordFinalDigest(seeded.turnRef, storedDigest);
+  seed.close();
+
+  let browserStarts = 0;
+  const runtime = startRebuildProviderRuntime({
+    port: 0,
+    model: "gpt-4.1",
+    contextWindow: 200_000,
+    controlToken: "control-token",
+    projectId: "project-final-suffix-drift",
+    connectorIdentity: "Goose Native 2nd Shift",
+    brokerPath,
+    terminalReplayWindowMs: 60_000,
+    connectorPort: 0,
+    connectorAuthorizationFile: authorizationFile,
+    browserDriver: {
+      createTurn(input) {
+        browserStarts += 1;
+        return {
+          captureAnswerBoundary: async () => { throw new Error("no tool expected"); },
+          confirmFinal: async evidence => evidence,
+          run: async () => {
+            await input.lifecycle.onRebound?.({ canonicalConversationId: conversationId, acceptedUserTurnId });
+            return {
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId,
+              text: freshText,
+              remoteNonRunning: true,
+            };
+          },
+        };
+      },
+    },
+  });
+  runtimes.push(runtime);
+
+  const response = await post(runtime, body, sessionId);
+  expect(response.status).toBe(409);
+  expect((await response.json() as any).error.code).toBe("recovery_conflict");
+  expect(browserStarts).toBe(1);
+  expect(runtime.broker.getTurn(seeded.turnRef)).toMatchObject({
+    state: "UNRECONCILED", finalDigest: storedDigest,
+  });
+  expect(runtime.broker.getAccountSlotHolder()).toBe(seeded.turnRef);
+});
+
+test("accepted-final recovery remains quarantined when fresh confirmation changes after prefix advancement", async () => {
+  const root = mkdtempSync(join(tmpdir(), "cgw-rebuild-provider-final-prefix-confirm-drift-"));
+  roots.push(root);
+  const brokerPath = join(root, "broker.sqlite");
+  const authorizationFile = join(root, "connector-auth.txt");
+  writeFileSync(authorizationFile, `Bearer ${"c".repeat(64)}\n`, { mode: 0o600 });
+  chmodSync(authorizationFile, 0o600);
+  const sessionId = "goose-final-prefix-confirm-drift";
+  const body = requestBody("accepted-final-prefix-confirm-drift");
+  const checkpoint = gooseResponsesProjectionCheckpoint(body);
+  const conversationId = "aaaaaaaa-bbbb-4ccc-8ddd-000000000795";
+  const acceptedUserTurnId = "user-final-prefix-confirm-drift";
+  const storedText = "candidate before crash";
+  const firstFreshText = `${storedText} plus recovered tail`;
+  const secondFreshText = `${firstFreshText} plus later mutation`;
+  const storedDigest = createHash("sha256").update(storedText, "utf8").digest("hex");
+  const firstFreshDigest = createHash("sha256").update(firstFreshText, "utf8").digest("hex");
+  const seed = new SessionBroker(brokerPath, {
+    projectId: "project-final-prefix-confirm-drift",
+    instanceId: "seed",
+    terminalReplayWindowMs: 60_000,
+    makeTurnRef: () => "turn-final-prefix-confirm-drift",
+    makeSubmitNonce: () => "nonce-final-prefix-confirm-drift",
+    makeOpRef: () => "op-final-prefix-confirm-drift",
+  });
+  seed.createEpoch({ gooseSessionId: sessionId });
+  const seeded = seed.enqueueTurn({
+    gooseSessionId: sessionId,
+    requestHash: checkpoint.requestHash,
+    checkpointJson: encodeGooseResponsesProjectionCheckpoint(checkpoint),
+  });
+  seed.admitNext();
+  seed.markSendActivated(seeded.turnRef);
+  seed.bindConversation({ gooseSessionId: sessionId, epoch: 1, conversationId });
+  seed.markAccepted(seeded.turnRef, acceptedUserTurnId);
+  seed.recordFinalDigest(seeded.turnRef, storedDigest);
+  seed.close();
+
+  let confirmations = 0;
+  const runtime = startRebuildProviderRuntime({
+    port: 0,
+    model: "gpt-4.1",
+    contextWindow: 200_000,
+    controlToken: "control-token",
+    projectId: "project-final-prefix-confirm-drift",
+    connectorIdentity: "Goose Native 2nd Shift",
+    brokerPath,
+    terminalReplayWindowMs: 60_000,
+    connectorPort: 0,
+    connectorAuthorizationFile: authorizationFile,
+    browserDriver: {
+      createTurn(input) {
+        return {
+          captureAnswerBoundary: async () => { throw new Error("no tool expected"); },
+          confirmFinal: async evidence => {
+            confirmations += 1;
+            return { ...evidence, text: secondFreshText };
+          },
+          run: async () => {
+            await input.lifecycle.onRebound?.({ canonicalConversationId: conversationId, acceptedUserTurnId });
+            return {
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId,
+              text: firstFreshText,
+              remoteNonRunning: true,
+            };
+          },
+        };
+      },
+    },
+  });
+  runtimes.push(runtime);
+
+  const response = await post(runtime, body, sessionId);
+  expect(response.status).toBe(409);
+  expect((await response.json() as any).error.code).toBe("recovery_conflict");
+  expect(confirmations).toBe(1);
+  expect(runtime.broker.getTurn(seeded.turnRef)).toMatchObject({
+    state: "UNRECONCILED", finalDigest: firstFreshDigest,
+  });
+  expect(runtime.broker.getAccountSlotHolder()).toBe(seeded.turnRef);
+});
+
 test("accepted-final recovery upgrades only Goose-generated system and tool projection drift", async () => {
   const cases = [
     { label: "generated-drift", mutate: (_body: any) => {}, status: 200, starts: 1 },
