@@ -2,6 +2,8 @@
 
 This repository is the Debian/DreamBook build of Goose ChatGPT Web: a ChatGPT-Web-backed provider appliance for Goose with persistent, recoverable provider conversations.
 
+**Operating model:** the server-side ChatGPT conversation is durable; the browser/helper/Playwright surface is only a disposable view and input surface. Browser trouble means refresh/reconstruct the same chat and reassess it, not assume the ChatGPT turn died. `docs/persistent-chat-lifecycle.md` owns the exact recovery classifier and invariants.
+
 - Canonical repository: `agent-dream-team/goose-webgpt-debian`
 - DreamBook checkout: `/home/dreamteam/repos/goose-chatgpt-web-rebuild`
 - Stable installed entrypoint: `~/.local/bin/goose-chatgpt-web`

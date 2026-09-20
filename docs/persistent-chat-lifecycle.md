@@ -33,6 +33,16 @@ The rebuild therefore must manage ChatGPT as a durable server-side conversation 
 11. **Repeated recovery is a context-health signal, not a reason to abandon.** Recovery frequency may inform a later handoff decision, but no fixed recovery count or local budget is an automatic replacement threshold.
 12. **Provider-chat instructions must promote graceful context rollover.** The ChatGPT-side system/Project instructions must preserve the current objective and constraints, prefer a safe checkpoint over grinding into context degradation, and produce a useful handoff when context quality becomes unreliable. Exact wording may evolve; the paired-handoff requirement must remain.
 
+### Operational recovery classifier
+
+Once the canonical ChatGPT conversation id is known, browser state is never the primary diagnosis. Reopen or refresh that same conversation, wait until the page has fully hydrated and its rendered state has settled, then classify the server-side turn:
+
+- `RUNNING` — ChatGPT is still working; do not prompt, retry, or otherwise disturb it.
+- `STALLED_OR_ERROR` — the settled fresh view shows work has stopped without the intended final. When no unresolved Goose tool work remains, send the standard GCW-internal continuation in the same conversation.
+- `FINAL` — the intended final output is present; leave the turn terminal for the owning system to consume.
+
+A partially loaded or stale browser view is not classifiable evidence. If the view becomes unreadable or stale again after the observation threshold, refresh or reconstruct the same conversation, allow it to settle, and repeat the classifier. The exceptional case is browser loss during the first fresh turn before a canonical conversation id exists; without that durable address, fail closed rather than guessing which remote chat accepted the send or resending the original prompt.
+
 ## Consequences
 
 - Current runtime recovery exposes no operation that creates a newly abandoned persistent pair. Legacy persisted `ABANDONED` rows remain readable only for backward-compatible database migration/reconstruction. Account-slot ownership is capacity state, not pair identity: qualified recovery may release and later reacquire a slot while the same Goose session, ChatGPT conversation, accepted user turn, and current epoch remain durable.

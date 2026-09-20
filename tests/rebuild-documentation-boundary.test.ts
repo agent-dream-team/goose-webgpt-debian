@@ -21,6 +21,8 @@ test("persistent-chat lifecycle authority preserves recovery and paired-handoff 
   const followUp = read("docs/persistent-chat-follow-up.md");
 
   expect(agents).toContain("Read `docs/persistent-chat-lifecycle.md`");
+  expect(agents).toContain("Mandatory browser troubleshooting rule");
+  expect(agents).toContain("view failure, not chat failure");
   for (const invariant of [
     "The server-side ChatGPT conversation is durable.",
     "The local Goose session is durable too.",
@@ -31,6 +33,11 @@ test("persistent-chat lifecycle authority preserves recovery and paired-handoff 
     "Provider-chat instructions must promote graceful context rollover.",
   ]) expect(lifecycle).toContain(invariant);
   expect(lifecycle).toContain("do not click ChatGPT Retry");
+  expect(lifecycle).toContain("### Operational recovery classifier");
+  expect(lifecycle).toContain("`RUNNING`");
+  expect(lifecycle).toContain("`STALLED_OR_ERROR`");
+  expect(lifecycle).toContain("`FINAL`");
+  expect(lifecycle).toContain("A partially loaded or stale browser view is not classifiable evidence.");
   expect(lifecycle).toContain("fresh Goose session and a fresh ChatGPT conversation");
   expect(followUp).toContain("### 1. Paired context handoff");
   expect(followUp).toContain("`paired_handoff_required`");
