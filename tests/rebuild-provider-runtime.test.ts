@@ -1128,7 +1128,9 @@ test("accepted-final recovery advances a strict-prefix candidate without replayi
   seed.markSendActivated(seeded.turnRef);
   seed.bindConversation({ gooseSessionId: sessionId, epoch: 1, conversationId });
   seed.markAccepted(seeded.turnRef, acceptedUserTurnId);
-  seed.recordAnswerBoundary(seeded.turnRef, admitted.initialOpRef, '{"text":"before-tool"}');
+  seed.recordAnswerBoundary(seeded.turnRef, admitted.initialOpRef, JSON.stringify({
+    answerTextSha256: createHash("sha256").update("", "utf8").digest("hex"),
+  }));
   const toolArguments = { path: "." };
   const inputHash = connectorOperationInputHash("tree", toolArguments);
   seed.claimOperation({ turnRef: seeded.turnRef, opRef: admitted.initialOpRef, inputHash });
@@ -1181,7 +1183,6 @@ test("accepted-final recovery advances a strict-prefix candidate without replayi
               acceptedUserTurnId,
               text: finalText,
               remoteNonRunning: true,
-              contentAdvancedAfterLastTool: true,
             };
           },
         };

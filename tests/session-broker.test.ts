@@ -636,6 +636,53 @@ test("completion after tool dispatch must prove content advanced beyond the late
   }
 });
 
+test("completion can recover post-tool advancement from the durable boundary text digest", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    const { initialOpRef } = broker.admitNext()!;
+    accept(broker);
+    bindConversation(broker);
+    const beforeDigest = createHash("sha256").update("before-tool", "utf8").digest("hex");
+    const finalDigest = createHash("sha256").update("after-tool final", "utf8").digest("hex");
+    broker.recordAnswerBoundary("turn-a", initialOpRef, JSON.stringify({ answerTextSha256: beforeDigest }));
+    broker.claimOperation({ turnRef: "turn-a", opRef: initialOpRef, inputHash: "input" });
+    broker.completeOperation({ opRef: initialOpRef, inputHash: "input", outcome: "SUCCESS", resultJson: '{"ok":true}' });
+    broker.recordFinalDigest("turn-a", finalDigest);
+    const claim = broker.beginCompletion("turn-a");
+    expect(broker.commitCompletion(claim, {
+      ...completionEvidence(initialOpRef, finalDigest),
+      answerBoundary: { opRef: initialOpRef, contentAdvanced: false },
+    }).state).toBe("COMPLETE");
+  } finally {
+    broker.close();
+  }
+});
+
+test("durable boundary digest equality does not falsely prove post-tool advancement", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    const { initialOpRef } = broker.admitNext()!;
+    accept(broker);
+    bindConversation(broker);
+    const digest = createHash("sha256").update("unchanged", "utf8").digest("hex");
+    broker.recordAnswerBoundary("turn-a", initialOpRef, JSON.stringify({ answerTextSha256: digest }));
+    broker.claimOperation({ turnRef: "turn-a", opRef: initialOpRef, inputHash: "input" });
+    broker.completeOperation({ opRef: initialOpRef, inputHash: "input", outcome: "SUCCESS", resultJson: '{"ok":true}' });
+    broker.recordFinalDigest("turn-a", digest);
+    const claim = broker.beginCompletion("turn-a");
+    expect(() => broker.commitCompletion(claim, {
+      ...completionEvidence(initialOpRef, digest),
+      answerBoundary: { opRef: initialOpRef, contentAdvanced: false },
+    })).toThrow(SessionBrokerError);
+  } finally {
+    broker.close();
+  }
+});
+
 test("canonical conversation identity is unique and cannot be rebound to another epoch", () => {
   const { broker } = fixture();
   try {

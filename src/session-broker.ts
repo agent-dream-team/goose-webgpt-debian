@@ -1475,7 +1475,19 @@ export class SessionBroker {
     if (!evidence.answerBoundary || evidence.answerBoundary.opRef !== latest.op_ref) {
       this.fail("COMPLETION_EVIDENCE", "Completion must reference the latest dispatched operation boundary");
     }
-    if (!evidence.answerBoundary.contentAdvanced && !evidence.answerBoundary.qualifiedTerminal) {
+    let durableTextAdvanced = false;
+    try {
+      const boundary = JSON.parse(latest.answer_boundary_json) as { answerTextSha256?: unknown };
+      const boundaryDigest = boundary.answerTextSha256;
+      durableTextAdvanced = typeof boundaryDigest === "string"
+        && /^[a-f0-9]{64}$/.test(boundaryDigest)
+        && boundaryDigest !== evidence.observedFinalDigest;
+    } catch {
+      // Older/malformed boundary payloads still require the existing live or qualified-terminal proof.
+    }
+    if (!evidence.answerBoundary.contentAdvanced
+      && !evidence.answerBoundary.qualifiedTerminal
+      && !durableTextAdvanced) {
       this.fail("COMPLETION_EVIDENCE", "Completion must prove post-tool content or qualified terminal semantics");
     }
   }
