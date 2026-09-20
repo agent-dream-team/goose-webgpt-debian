@@ -6,6 +6,7 @@ import {
   capturePersistentChatTurnSnapshot,
   canonicalChatGptConversationUrl,
   classifyChatGptConversationUrl,
+  correlatedUserTurnIdentity,
   normalizeCanonicalChatGptConversationId,
   PersistentChatSurfaceController,
   validatePersistentChatTurnIdentity,
@@ -108,6 +109,25 @@ test("canonical conversation and opaque turn identity validators normalize or re
   expect(validatePersistentChatTurnIdentity("user-opaque_123")).toBe("user-opaque_123");
   expect(() => validatePersistentChatTurnIdentity("bad turn id")).toThrow("invalid");
   expect(() => validatePersistentChatTurnIdentity("x".repeat(257))).toThrow("invalid");
+});
+
+test("durable Goose correlation recovers exactly one ChatGPT user-turn identity", async () => {
+  const seen: unknown[] = [];
+  const page = {
+    evaluate: async (_fn: unknown, args: unknown) => {
+      seen.push(args);
+      return ["user-correlated"];
+    },
+  } as unknown as Page;
+  expect(await correlatedUserTurnIdentity(page, "turn_ref_1", "submit_nonce_1")).toBe("user-correlated");
+  expect(seen).toHaveLength(1);
+  expect(seen[0]).toMatchObject({ expectedTurnRef: "turn_ref_1", expectedSubmitNonce: "submit_nonce_1" });
+
+  const duplicate = {
+    evaluate: async () => ["user-a", "user-b"],
+  } as unknown as Page;
+  await expect(correlatedUserTurnIdentity(duplicate, "turn_ref_1", "submit_nonce_1"))
+    .rejects.toThrow("multiple user turns");
 });
 
 test("accepted user anchoring is absolute and fails closed on multiple new user turns", () => {

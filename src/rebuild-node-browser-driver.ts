@@ -245,6 +245,7 @@ export function createRebuildNodeBrowserDriver(
             prompt: input.prompt,
             existingConversationId: input.existingConversationId,
             ...(input.resumeAccepted ? { resumeAccepted: input.resumeAccepted } : {}),
+            ...(input.resumePendingAcceptance ? { resumePendingAcceptance: input.resumePendingAcceptance } : {}),
           },
         });
         const abort = () => { void send({ type: "abort" }).catch(() => {}); };

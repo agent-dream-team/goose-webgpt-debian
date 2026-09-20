@@ -2829,6 +2829,77 @@ test("accepted browser attachment failure rebinds the same persisted pair on exa
   expect(runtime.broker.getAccountSlotHolder()).toBeNull();
 });
 
+test("exact replay recovers a sent retained turn whose browser died before local acceptance binding", async () => {
+  let starts = 0;
+  const conversationId = "aaaaaaaa-bbbb-4ccc-8ddd-000000000778";
+  const driver: RebuildPersistentBrowserDriver = {
+    createTurn(input) {
+      starts += 1;
+      const ordinal = starts;
+      return {
+        captureAnswerBoundary: async () => { throw new Error("no tool expected"); },
+        confirmFinal: async evidence => evidence,
+        run: async () => {
+          if (ordinal === 1) {
+            input.lifecycle.onSendActivated();
+            input.lifecycle.onAccepted({ canonicalConversationId: conversationId, acceptedUserTurnId: "user-seed" });
+            return {
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId: "user-seed",
+              text: "seed-final",
+              remoteNonRunning: true,
+            };
+          }
+          if (ordinal === 2) {
+            expect(input.existingConversationId).toBe(conversationId);
+            input.lifecycle.onSendActivated();
+            throw new Error("synthetic browser loss before local acceptance binding");
+          }
+          expect(input.prompt).toBe("");
+          expect(input.resumeAccepted).toBeUndefined();
+          expect(input.resumePendingAcceptance).toEqual({ canonicalConversationId: conversationId });
+          await input.lifecycle.onRebound?.({
+            canonicalConversationId: conversationId,
+            acceptedUserTurnId: "user-recovered-pending",
+          });
+          return {
+            canonicalConversationId: conversationId,
+            acceptedUserTurnId: "user-recovered-pending",
+            text: "recovered-pending-ok",
+            remoteNonRunning: true,
+          };
+        },
+      };
+    },
+  };
+  const { runtime } = setup(driver);
+  const firstRequest = requestBody("seed pending recovery");
+  const first = await post(runtime, firstRequest, "goose-pending-recovery");
+  expect(first.status).toBe(200);
+  expect(await first.text()).toContain("seed-final");
+
+  const secondRequest = laterTurnBody(firstRequest, "seed-final", "recover this retained turn");
+  const failed = await post(runtime, secondRequest, "goose-pending-recovery");
+  expect(failed.status).toBe(502);
+  expect(runtime.broker.getOpenTurnForSession("goose-pending-recovery")).toMatchObject({
+    state: "UNRECONCILED",
+    acceptedUserTurnId: null,
+    unreconciledReason: "persistent_browser_turn_failed",
+  });
+
+  const recovered = await post(runtime, secondRequest, "goose-pending-recovery");
+  expect(recovered.status).toBe(200);
+  expect(await recovered.text()).toContain("recovered-pending-ok");
+  expect(starts).toBe(3);
+  expect(runtime.broker.getAccountSlotHolder()).toBeNull();
+  expect(runtime.broker.getCurrentEpoch("goose-pending-recovery")).toMatchObject({
+    epoch: 1,
+    conversationId,
+    leaseState: "IDLE",
+    historyWatermark: watermark(secondRequest, "recovered-pending-ok"),
+  });
+});
+
 test("invalid browser acceptance identity cannot partially bind durable remote identity", async () => {
   const driver: RebuildPersistentBrowserDriver = {
     createTurn(input) {

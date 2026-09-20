@@ -35,6 +35,9 @@ type StartMessage = {
       acceptedUserTurnId: string;
       finalRecoveryOnly?: true;
     };
+    resumePendingAcceptance?: {
+      canonicalConversationId: string;
+    };
   };
 };
 
@@ -90,6 +93,7 @@ function start(message: StartMessage): void {
   if (started) throw new Error("Node browser worker already owns a turn");
   const { config, input } = message;
   const resumeAccepted = input.resumeAccepted;
+  const resumePendingAcceptance = input.resumePendingAcceptance;
   if (!config.descriptorPath || !config.projectId || !config.projectName
     || !config.connectorName || !config.connectorMentionQuery
     || !input.turnRef || !input.gooseSessionId || !input.initialOpRef || !input.submitNonce
@@ -99,7 +103,12 @@ function start(message: StartMessage): void {
       || typeof resumeAccepted.canonicalConversationId !== "string" || !resumeAccepted.canonicalConversationId
       || typeof resumeAccepted.acceptedUserTurnId !== "string" || !resumeAccepted.acceptedUserTurnId
       || (resumeAccepted.finalRecoveryOnly !== undefined && resumeAccepted.finalRecoveryOnly !== true)
-    ))) {
+    ))
+    || (resumePendingAcceptance !== undefined && (
+      !resumePendingAcceptance || typeof resumePendingAcceptance !== "object"
+      || typeof resumePendingAcceptance.canonicalConversationId !== "string" || !resumePendingAcceptance.canonicalConversationId
+    ))
+    || (resumeAccepted !== undefined && resumePendingAcceptance !== undefined)) {
     throw new Error("Node browser worker start message is invalid");
   }
   started = true;

@@ -93,6 +93,10 @@ export interface RebuildPersistentBrowserTurnInput {
     /** A durable final already exists; refresh/reobserve only and never send a recovery continuation. */
     finalRecoveryOnly?: true;
   };
+  /** Rediscover a remotely accepted turn whose local browser attachment died before its user-turn id was bound. */
+  resumePendingAcceptance?: {
+    canonicalConversationId: string;
+  };
   preSendAbortSignal: AbortSignal;
   gooseWork: {
     /** Semantic progress guides observation cadence only; it never authorizes tool retirement. */
@@ -661,8 +665,8 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       throw new SessionBrokerError("UNRESOLVED_OPERATION", "Persistent pair rebind requires prior tool/result reconciliation");
     }
     const epoch = broker.getCurrentEpoch(turn.gooseSessionId);
-    if (!epoch || epoch.epoch !== turn.epoch || !epoch.conversationId || !turn.acceptedUserTurnId) {
-      throw new SessionBrokerError("RECOVERY_IDENTITY", "Persistent pair rebind requires durable Goose and ChatGPT identities");
+    if (!epoch || epoch.epoch !== turn.epoch || !epoch.conversationId) {
+      throw new SessionBrokerError("RECOVERY_IDENTITY", "Persistent pair rebind requires the durable Goose session and ChatGPT conversation identity");
     }
     const initialOperation = broker.getInitialOperationForTurn(turn.turnRef);
     const latestTerminal = broker.getLatestTerminalOperationForTurn(turn.turnRef);
@@ -685,11 +689,17 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         submitNonce: turn.submitNonce,
         prompt: "",
         existingConversationId: epoch.conversationId,
-        resumeAccepted: {
-          canonicalConversationId: epoch.conversationId,
-          acceptedUserTurnId: turn.acceptedUserTurnId,
-          ...(turn.finalDigest ? { finalRecoveryOnly: true as const } : {}),
-        },
+        ...(turn.acceptedUserTurnId ? {
+          resumeAccepted: {
+            canonicalConversationId: epoch.conversationId,
+            acceptedUserTurnId: turn.acceptedUserTurnId,
+            ...(turn.finalDigest ? { finalRecoveryOnly: true as const } : {}),
+          },
+        } : {
+          resumePendingAcceptance: {
+            canonicalConversationId: epoch.conversationId,
+          },
+        }),
         preSendAbortSignal: preSendAbort.signal,
         gooseWork: { snapshot: () => toolProgressSnapshot(turn.turnRef) },
         lifecycle: {
@@ -987,18 +997,22 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         turn = broker.recordProgress(turn.turnRef, encodeGooseResponsesProjectionCheckpoint(checkpoint));
       }
       let active: ActiveExecution;
+      let stage: GooseResponsesStageHandle | undefined;
       try {
         turn = await waitForRebindAdmission(turn.turnRef, request.signal);
         if (recoveredReplay) recoveredTerminalReplays.set(turn.turnRef, recoveredReplay);
+        // Restore Goose tool-name authority before the remote conversation is observed again: a
+        // recovered ChatGPT turn may immediately resume with a connector call.
+        stage = baton.openStage({ turnRef: turn.turnRef, body });
         active = startRebindExecution(turn);
       } catch (error) {
+        stage?.releaseBeforeDispatch();
         recoveredTerminalReplays.delete(turn.turnRef);
         if (error instanceof SessionBrokerError) {
           return Response.json({ error: { type: "invalid_request_error", code: error.code, message: error.message } }, { status: 409 });
         }
         throw error;
       }
-      const stage = baton.openStage({ turnRef: turn.turnRef, body });
       try {
         return await serveStage(stage, active, request.signal);
       } catch (error: unknown) {

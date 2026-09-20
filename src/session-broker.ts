@@ -663,8 +663,13 @@ export class SessionBroker {
       this.requireSlotHolder(input.turnRef);
       const epoch = this.epochRowRequired(turn.goose_session_id, turn.epoch);
       if (epoch.conversation_id !== input.canonicalConversationId
-        || turn.accepted_user_turn_id !== input.acceptedUserTurnId) {
+        || (turn.accepted_user_turn_id !== null && turn.accepted_user_turn_id !== input.acceptedUserTurnId)) {
         this.fail("RECOVERY_IDENTITY", "Recovery identity does not match the durable conversation/turn binding");
+      }
+      if (turn.accepted_user_turn_id === null) {
+        // A browser/helper can die after the durable send fence but before local acceptance binding.
+        // Positive remote correlation evidence may bind that missing identity; it may never replace one.
+        this.bindAcceptedUserTurnId(turn, input.acceptedUserTurnId);
       }
       if (turn.final_digest) this.fail("RECOVERY_FINAL", "A turn with accepted final content cannot resume as running");
       if (this.hasAmbiguousOperation(input.turnRef)) {

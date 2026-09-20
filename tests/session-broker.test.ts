@@ -1714,6 +1714,35 @@ test("an older request fingerprint may become a new logical turn after interveni
   }
 });
 
+test("verified rebind may bind one missing post-send accepted-user identity without replacing it later", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    broker.admitNext();
+    broker.markSendActivated("turn-a");
+    bindConversation(broker);
+    broker.markUnreconciled("turn-a", "browser_lost_before_local_acceptance_binding");
+    expect(broker.getTurn("turn-a")).toMatchObject({ state: "UNRECONCILED", acceptedUserTurnId: null });
+
+    const rebound = broker.rebindVerifiedRemoteTurn({
+      turnRef: "turn-a",
+      canonicalConversationId: "conversation-a",
+      acceptedUserTurnId: "user-recovered",
+      remoteIdentityVerified: true,
+    });
+    expect(rebound).toMatchObject({ state: "TURN_OUTSTANDING", acceptedUserTurnId: "user-recovered" });
+    expect(() => broker.rebindVerifiedRemoteTurn({
+      turnRef: "turn-a",
+      canonicalConversationId: "conversation-a",
+      acceptedUserTurnId: "user-different",
+      remoteIdentityVerified: true,
+    })).toThrow(SessionBrokerError);
+  } finally {
+    broker.close();
+  }
+});
+
 test("verified persistent-pair rebind enforces remote identity and remains idempotent", () => {
   const { broker } = fixture();
   try {

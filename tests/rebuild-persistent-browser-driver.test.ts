@@ -143,6 +143,7 @@ function projection(text: string): RebuildAnswerProjection {
 function makeInput(options: {
   existingConversationId?: string | null;
   resumeAccepted?: RebuildPersistentBrowserTurnInput["resumeAccepted"];
+  resumePendingAcceptance?: RebuildPersistentBrowserTurnInput["resumePendingAcceptance"];
   prompt?: string;
   toolInFlight?: () => boolean;
   gooseWork?: RebuildPersistentBrowserTurnInput["gooseWork"];
@@ -182,6 +183,7 @@ function makeInput(options: {
     prompt: options.prompt ?? "submit_browser_driver_1:op_browser_driver_1",
     existingConversationId: options.existingConversationId ?? null,
     ...(options.resumeAccepted ? { resumeAccepted: options.resumeAccepted } : {}),
+    ...(options.resumePendingAcceptance ? { resumePendingAcceptance: options.resumePendingAcceptance } : {}),
     preSendAbortSignal: controller.signal,
     gooseWork,
     lifecycle: {
@@ -195,6 +197,7 @@ function makeInput(options: {
 function createHarness(options: {
   surface: FakeSurface;
   captureSnapshot: (page?: Page) => Promise<PersistentChatTurnSnapshot>;
+  correlatedUserTurn?: (page: Page, turnRef: string, submitNonce: string) => Promise<string | undefined>;
   captureAnswer?: (page?: Page) => Promise<RebuildAnswerProjection>;
   prepareFresh?: (page: Page, input: RebuildPersistentBrowserTurnInput) => Promise<void>;
   clearConnectorComposer?: (...args: any[]) => Promise<void>;
@@ -257,6 +260,7 @@ function createHarness(options: {
       }) as any,
       connectSurface: options.connectSurface ?? (async () => connection) as any,
       captureSnapshot: async page => await options.captureSnapshot(page),
+      correlatedUserTurn: options.correlatedUserTurn,
       captureAnswer: async page => options.captureAnswer ? await options.captureAnswer(page) : projection("final answer"),
       verifyAuthenticated: async () => {},
       clearConnectorComposer: options.clearConnectorComposer ?? (async () => {}),
@@ -860,7 +864,53 @@ test("pre-acceptance terminal UI does not retire an uncertain accepted send", as
   expect(harness.activities.filter(activity => activity.phase === "end")).toEqual([]);
 });
 
-test("send-activated identity acquisition fails promptly when its browser surface closes", async () => {
+test("retained turn refreshes a lost browser before acceptance binding without resending", async () => {
+  let sends = 0;
+  let sent = false;
+  let firstPostSendObservations = 0;
+  const before: PersistentChatTurnSnapshot = {
+    turnIdentities: ["user-old", "assistant-old"],
+    userIdentities: ["user-old"],
+    assistantIdentities: ["assistant-old"],
+  };
+  const after: PersistentChatTurnSnapshot = {
+    turnIdentities: ["user-old", "assistant-old", "user-1", "assistant-1"],
+    userIdentities: ["user-old", "user-1"],
+    assistantIdentities: ["assistant-old", "assistant-1"],
+  };
+  const first = fakeSurface(() => { sends += 1; sent = true; }, `https://chatgpt.com/c/${CONVERSATION}`);
+  const recovered = fakeSurface(() => { throw new Error("recovered observer must never resend"); });
+  const connections = [browserConnection(first), browserConnection(recovered)];
+  let connects = 0;
+  const harness = createHarness({
+    surface: first,
+    recoveryStartLease: {
+      surfaceId: "r".repeat(32), reused: false, connectorBound: false, surfaceRecreated: true,
+    },
+    connectSurface: async () => connections[connects++]!,
+    captureSnapshot: async page => {
+      if (!sent) return before;
+      if (page === first.page) {
+        firstPostSendObservations += 1;
+        if (firstPostSendObservations === 1) first.setClosed(true);
+        return before;
+      }
+      return after;
+    },
+    captureAnswer: async () => ({ ...projection("recovered before local acceptance"), assistantTurnId: "assistant-1" }),
+  });
+  const execution = harness.driver.createTurn(makeInput({ existingConversationId: CONVERSATION }));
+
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("recovered before local acceptance");
+  expect(candidate.acceptedUserTurnId).toBe("user-1");
+  expect(sends).toBe(1);
+  expect(harness.activities.filter(activity => activity.phase === "start")).toHaveLength(2);
+  expect(recovered.gotos).toEqual([`https://chatgpt.com/c/${CONVERSATION}`]);
+  await execution.confirmFinal(candidate);
+});
+
+test("fresh send without a durable conversation still fails closed if its pre-acceptance browser surface closes", async () => {
   let sent = false;
   let postSendSnapshots = 0;
   let surface!: FakeSurface;
@@ -1142,6 +1192,55 @@ test("tool activity clears a stale episode so later staleness starts with refres
   expect(connects).toBe(3);
   expect(reopenCalls).toBe(2);
   await execution.confirmFinal(candidate);
+});
+
+test("pending-acceptance rebind holds answer-boundary capture until remote identity is rebound", async () => {
+  const correlation = deferred<string | undefined>();
+  let reboundCalls = 0;
+  let boundaryResolved = false;
+  const surface = fakeSurface(() => { throw new Error("pending-acceptance rebind must never send"); }, `https://chatgpt.com/c/${CONVERSATION}`);
+  surface.setRunning(false);
+  const snapshot: PersistentChatTurnSnapshot = {
+    turnIdentities: ["user-recovered", "assistant-1"],
+    userIdentities: ["user-recovered"],
+    assistantIdentities: ["assistant-1"],
+  };
+  const harness = createHarness({
+    surface,
+    captureSnapshot: async () => snapshot,
+    correlatedUserTurn: async () => await correlation.promise,
+    captureAnswer: async () => projection("recovered pending acceptance"),
+  });
+  const input = makeInput({
+    existingConversationId: CONVERSATION,
+    resumePendingAcceptance: { canonicalConversationId: CONVERSATION },
+    prompt: "",
+    onSendActivated: () => { throw new Error("pending-acceptance rebind must not arm another send"); },
+    onAccepted: () => { throw new Error("pending-acceptance rebind must not create a replacement accepted turn"); },
+    onRebound: (conversationId, userTurnId) => {
+      expect(conversationId).toBe(CONVERSATION);
+      expect(userTurnId).toBe("user-recovered");
+      reboundCalls += 1;
+    },
+  });
+  const execution = harness.driver.createTurn(input);
+  const runPromise = execution.run();
+  await Bun.sleep(5);
+  const boundaryPromise = execution.captureAnswerBoundary(input.initialOpRef).then(value => {
+    boundaryResolved = true;
+    return value;
+  });
+  await Bun.sleep(5);
+  expect(boundaryResolved).toBeFalse();
+
+  correlation.resolve("user-recovered");
+  const boundary = await boundaryPromise;
+  expect(boundary).toContain("user-recovered");
+  expect(boundary).toContain(input.initialOpRef);
+  expect(reboundCalls).toBe(1);
+
+  await execution.detachExecution?.("pending-acceptance boundary hold test complete");
+  await expect(runPromise).rejects.toThrow("detached");
 });
 
 test("reattach mode proves the same accepted pair and observes final without sending another Goose prompt", async () => {

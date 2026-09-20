@@ -123,6 +123,32 @@ export function acceptedUserTurnIdentity(
   return identity ? validatePersistentChatTurnIdentity(identity, "accepted user turn") : undefined;
 }
 
+export async function correlatedUserTurnIdentity(
+  page: Page,
+  turnRef: string,
+  submitNonce: string,
+): Promise<string | undefined> {
+  if (!turnRef || !submitNonce) throw new Error("Persistent ChatGPT correlation identity is incomplete");
+  const matches = await page.evaluate(({ selector, expectedTurnRef, expectedSubmitNonce }) => {
+    const turnNeedle = `"turn_ref":${JSON.stringify(expectedTurnRef)}`;
+    const submitNeedle = `"submit_nonce":${JSON.stringify(expectedSubmitNonce)}`;
+    return [...document.querySelectorAll(selector)].flatMap(element => {
+      const text = element.textContent ?? "";
+      if (!text.includes(turnNeedle) || !text.includes(submitNeedle)) return [];
+      const identity = element.getAttribute("data-turn-id");
+      if (!identity) throw new Error("Correlated ChatGPT user turn is missing data-turn-id");
+      return [identity];
+    });
+  }, {
+    selector: CHATGPT_USER_TURN_SELECTOR,
+    expectedTurnRef: turnRef,
+    expectedSubmitNonce: submitNonce,
+  });
+  const identities = uniqueIdentities(matches, "correlated user-turn");
+  if (identities.length > 1) throw new Error("ChatGPT exposed multiple user turns for one durable Goose submission identity");
+  return identities[0];
+}
+
 export function assistantTurnForAcceptedUser(
   snapshot: PersistentChatTurnSnapshot,
   acceptedUserTurnId: string,
