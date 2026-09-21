@@ -42,8 +42,8 @@ test("persistent-chat lifecycle authority preserves recovery and paired-handoff 
   expect(followUp).toContain("### 1. Paired context handoff");
   expect(followUp).toContain("`paired_handoff_required`");
   expect(followUp).toContain("### 2. Persistent-chat recovery fault matrix");
-  expect(followUp).toContain("### 6. Reboot reconstruction");
-  expect(followUp).toContain("Do not reboot DreamBook for GCW qualification without explicit operator approval.");
+  expect(followUp).toContain("### 6. Fixed-package full-reboot confirmation");
+  expect(followUp).toContain("Do not reboot DreamBook solely for this confirmation without explicit operator approval.");
 });
 
 test("obsolete inherited Codex operator documents are removed from the DreamBook product surface", () => {

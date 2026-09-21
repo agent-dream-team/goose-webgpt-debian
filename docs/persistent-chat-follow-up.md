@@ -1,7 +1,7 @@
 ---
 type: plan
 status: current
-as_of: 2026-09-16
+as_of: 2026-09-21
 ---
 
 # Goose ChatGPT Web current follow-up plan
@@ -12,18 +12,19 @@ as_of: 2026-09-16
 
 ## Current qualified runtime
 
-The non-reboot V1 appliance is installed and operational on DreamBook through `~/.local/bin/goose-chatgpt-web` and the immutable package under `~/.local/lib/goose-chatgpt-web/`.
+The V1 appliance is installed and operational on DreamBook through `~/.local/bin/goose-chatgpt-web` and the immutable package under `~/.local/lib/goose-chatgpt-web/`. The enabled deployment owner is the system service `/etc/systemd/system/second-shift-gcw.service`, running as `dreamteam`; XDG desktop autostart is not the service authority.
 
-The currently installed runtime behavior was built from source checkpoint `15fbb7e25e00b7eed63e5313a090e79818fa4bf3` (`Support two persistent GCW execution slots`):
+The currently installed runtime behavior was built from source checkpoint `c74493b32759014a27611f14bbc4e74d688e7d06` (`Make broker ownership robust to PID reuse`):
 
-- immutable bundle `bf526d243be697bf7d116a5c3f3394e3948307f80ffa61223e25753c16b2090d`;
-- AppImage SHA-256 `7bd181efad6cee39144f5ddcf90e556aad73fdd0b95ae04aa735e367187b4311`;
-- runtime-manifest SHA-256 `6a00bca55ec5ac0584341e138503df6c8c285f8e812e7adf90cab69e1a0f3c33`, freshly reproduced from the clean source checkpoint and matching the active runtime manifest and bundle ID;
-- exactly two concurrent persistent browser turns qualified live as one GCW parent/orchestrator plus one native-Goose GCW child/worker, including a tool-capable child and two consecutive stock-Goose async parent/child runs;
-- clean slot release back to zero after the qualified paired runs;
+- immutable bundle `dc133c72e88d8802cb5abc892e974f2cbcb83b2ad3196111ac6e07a7ca0f3a3e`;
+- AppImage SHA-256 `7472332120a62769a935f0c3268361691b48384d823cbd106e76e7ef72eb42ce`;
+- runtime-manifest SHA-256 `1cf400c6e407cbe0dbea1a2068db9ba2f3d9e97ce65ed940f7076c79cd9dbd8c` for the package built from that checkpoint;
+- exactly two concurrent persistent browser turns remain the qualified capacity, intended for one GCW parent/orchestrator plus one native-Goose GCW child/worker;
+- broker process ownership now records Linux boot identity plus process start identity, so PID reuse cannot by itself make a dead broker appear live; legacy unencoded owners remain fail-closed and require explicit reconciliation when independently proven stale;
+- after the 2026-09-21 machine reboot exposed the legacy PID-reuse defect, the fixed package was installed, passed package/ABI smoke, restored provider and BrowserHost health, completed an ordinary Goose→GCW turn, released its second slot, survived a controlled system-service restart, and completed another ordinary turn after that restart while the preserved unreconciled pair remained unchanged;
 - local conversation-budget estimates no longer reject tool work, cap otherwise valid output, or force provider-chat rollover.
 
-The installed AppImage hash records the exact activated package; byte-for-byte AppImage reproducibility is not claimed. Draft PR #8 retains the detailed source, package, and live-qualification evidence. Repository HEAD may contain later source, documentation, or test robustness fixes. Do not describe source after this checkpoint as installed until a package built from it is independently qualified and activated.
+The installed AppImage hash records the exact activated package; byte-for-byte AppImage reproducibility is not claimed. Git history and the active PR retain detailed qualification evidence. Repository HEAD may contain later source, documentation, or test changes. Do not describe source after this checkpoint as installed until a package built from it is independently qualified and activated.
 
 The old DreamBook appliance and its mutable state are retired. The active repository is `agent-dream-team/goose-webgpt-debian`; the separate `luke-m-selway/goose-chatgpt-web` repository is the MBP/macOS target.
 
@@ -73,11 +74,11 @@ Any observed sibling-chat bleed is a blocking correctness defect for the shared-
 
 Run genuinely long multi-turn work with tools/delegation, controlled view failures, repeated refresh/continuation recovery, and at least one deliberate paired Goose/ChatGPT handoff. Success means no duplicate side effects, stale authority, independent provider-chat rollover, cross-session bleed, or security/account warnings.
 
-### 6. Reboot reconstruction
+### 6. Fixed-package full-reboot confirmation
 
-Package/install/autostart/headless ownership are qualified without a machine reboot. The remaining deployment proof is an actual DreamBook reboot followed by stable XDG-autostart reconstruction, account-fence ownership, authenticated BrowserHost, provider health, managed tunnel readiness, and a final ordinary-Goose/no-held-slot sanity check.
+The 2026-09-21 DreamBook reboot proved system-service launcher reconstruction, account-fence ownership, and authenticated BrowserHost reconstruction, and exposed a stale legacy broker owner whose PID had been reused after boot. The installed fix prevents recurrence for newly encoded broker owners and has passed focused PID-reuse coverage plus a live controlled service restart.
 
-This reboot is deliberately deferred to a coordinated multi-system reboot window. **Do not reboot DreamBook for GCW qualification without explicit operator approval.**
+A second full-machine reboot of the fixed package remains the strict end-to-end confirmation that all repaired components reconstruct together from power-on. It is not required for ordinary operation now that the live appliance and controlled restart are qualified. **Do not reboot DreamBook solely for this confirmation without explicit operator approval.**
 
 ## Non-goals
 
