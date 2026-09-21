@@ -1275,6 +1275,38 @@ test("dead broker owner is safely taken over before restart reconciliation", () 
   }
 });
 
+
+test("legacy broker owner with a genuinely live PID remains fail-closed", () => {
+  const { broker, path } = fixture();
+  createSession(broker);
+  broker.close();
+
+  const db = new Database(path, { strict: true });
+  db.query("UPDATE broker_owner SET owner_id = 'legacy-owner', pid = ? WHERE singleton = 1")
+    .run(process.pid);
+  db.close();
+
+  expect(() => open(path, "broker-against-live-legacy-owner")).toThrow(SessionBrokerError);
+});
+
+test("broker process identity prevents same-PID reuse from looking live", () => {
+  const { broker, path } = fixture();
+  createSession(broker);
+  broker.close();
+
+  const db = new Database(path, { strict: true });
+  db.query("UPDATE broker_owner SET owner_id = 'process-v1|wrong-boot|1|old-owner', pid = ?, updated_at = ? WHERE singleton = 1")
+    .run(process.pid, Date.now());
+  db.close();
+
+  const restarted = open(path, "broker-after-pid-reuse");
+  try {
+    expect(restarted.getCurrentEpoch("goose-a")?.epoch).toBe(1);
+  } finally {
+    restarted.close();
+  }
+});
+
 test("positive-terminal demotion rejects mismatched durable conversation or user-turn identity", () => {
   const { broker } = fixture();
   try {

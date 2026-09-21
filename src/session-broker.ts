@@ -1,5 +1,24 @@
 import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { Database } from "bun:sqlite";
+
+const BROKER_PROCESS_OWNER_PREFIX = "process-v1|";
+
+function linuxProcessIdentity(pid: number): string | null {
+  if (process.platform !== "linux") return null;
+  try {
+    const bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8").trim();
+    const commandEnd = stat.lastIndexOf(")");
+    if (!bootId || commandEnd < 0) return null;
+    const fieldsAfterCommand = stat.slice(commandEnd + 2).split(/\s+/);
+    const startTicks = fieldsAfterCommand[19];
+    return startTicks ? `${bootId}|${startTicks}` : null;
+  } catch {
+    return null;
+  }
+}
+
 
 /**
  * Check if `storedDigest` is the SHA-256 of a strict prefix of `freshText`.
@@ -379,6 +398,7 @@ export class SessionBroker {
   private readonly makeSubmitNonce: () => string;
   private readonly makeOpRef: () => string;
   private readonly instanceId: string;
+  private readonly brokerOwnerId: string;
   private readonly terminalReplayWindowMs: number;
 
   constructor(databasePath: string, options: SessionBrokerOptions) {
@@ -394,6 +414,10 @@ export class SessionBroker {
     this.makeSubmitNonce = options.makeSubmitNonce ?? (() => `submit_${randomUUID()}`);
     this.makeOpRef = options.makeOpRef ?? (() => `op_${randomUUID()}`);
     this.instanceId = options.instanceId ?? `broker_${randomUUID()}`;
+    const processIdentity = linuxProcessIdentity(process.pid);
+    this.brokerOwnerId = processIdentity
+      ? `${BROKER_PROCESS_OWNER_PREFIX}${processIdentity}|${this.instanceId}`
+      : this.instanceId;
     this.terminalReplayWindowMs = options.terminalReplayWindowMs;
     this.db = new Database(databasePath, { create: true, strict: true });
     this.db.query("PRAGMA journal_mode = WAL").get();
@@ -409,7 +433,7 @@ export class SessionBroker {
     } catch (error) {
       try {
         this.db.query("UPDATE broker_owner SET owner_id = NULL, pid = NULL, updated_at = ? WHERE singleton = 1 AND owner_id = ?")
-          .run(this.now(), this.instanceId);
+          .run(this.now(), this.brokerOwnerId);
       } catch {
         // Preserve the original constructor failure; process death remains fail-closed fallback.
       }
@@ -421,7 +445,7 @@ export class SessionBroker {
   close(): void {
     this.transaction(() => {
       this.db.query("UPDATE broker_owner SET owner_id = NULL, pid = NULL, updated_at = ? WHERE singleton = 1 AND owner_id = ?")
-        .run(this.now(), this.instanceId);
+        .run(this.now(), this.brokerOwnerId);
     });
     this.db.close();
   }
@@ -1275,13 +1299,34 @@ export class SessionBroker {
 
   private claimBrokerOwnership(): void {
     this.transaction(() => {
-      const row = this.db.query("SELECT owner_id, pid FROM broker_owner WHERE singleton = 1").get() as { owner_id: string | null; pid: number | null };
-      if (row.owner_id && row.pid !== null && this.processIsAlive(row.pid)) {
+      const row = this.db.query("SELECT owner_id, pid FROM broker_owner WHERE singleton = 1").get() as {
+        owner_id: string | null;
+        pid: number | null;
+      };
+      if (row.owner_id && row.pid !== null && this.brokerOwnerIsLive(row.owner_id, row.pid)) {
         this.fail("BROKER_BUSY", "Another live Session Broker owns this database");
       }
       this.db.query("UPDATE broker_owner SET owner_id = ?, pid = ?, updated_at = ? WHERE singleton = 1")
-        .run(this.instanceId, process.pid, this.now());
+        .run(this.brokerOwnerId, process.pid, this.now());
     });
+  }
+
+  private brokerOwnerIsLive(ownerId: string, pid: number): boolean {
+    if (ownerId.startsWith(BROKER_PROCESS_OWNER_PREFIX)) {
+      const stored = ownerId.slice(BROKER_PROCESS_OWNER_PREFIX.length).split("|");
+      if (stored.length >= 3) {
+        const currentIdentity = linuxProcessIdentity(pid);
+        if (currentIdentity !== null) {
+          return currentIdentity === `${stored[0]}|${stored[1]}`;
+        }
+      }
+      // When process identity cannot be established, retain the old fail-closed PID check.
+      return this.processIsAlive(pid);
+    }
+
+    // Legacy rows cannot prove process identity, so keep their historical fail-closed PID rule.
+    // A verified stale legacy owner may be cleared only by an explicit reconciliation step.
+    return this.processIsAlive(pid);
   }
 
   private migrateSchema(): void {
