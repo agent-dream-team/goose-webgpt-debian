@@ -1,7 +1,7 @@
 ---
 type: plan
 status: current
-as_of: 2026-09-21
+as_of: 2026-09-22
 ---
 
 # Goose ChatGPT Web current follow-up plan
@@ -14,14 +14,16 @@ as_of: 2026-09-21
 
 The V1 appliance is installed and operational on DreamBook through `~/.local/bin/goose-chatgpt-web` and the immutable package under `~/.local/lib/goose-chatgpt-web/`. The enabled deployment owner is the system service `/etc/systemd/system/second-shift-gcw.service`, running as `dreamteam`; XDG desktop autostart is not the service authority.
 
-The currently installed runtime behavior was built from source checkpoint `c74493b32759014a27611f14bbc4e74d688e7d06` (`Make broker ownership robust to PID reuse`):
+The currently installed runtime behavior was built from source checkpoint `948010baaf38604d6e877d31245a8afe9bb7ef6a` (`Allow safe pre-acceptance projection rebind`):
 
-- immutable bundle `dc133c72e88d8802cb5abc892e974f2cbcb83b2ad3196111ac6e07a7ca0f3a3e`;
-- AppImage SHA-256 `7472332120a62769a935f0c3268361691b48384d823cbd106e76e7ef72eb42ce`;
-- runtime-manifest SHA-256 `1cf400c6e407cbe0dbea1a2068db9ba2f3d9e97ce65ed940f7076c79cd9dbd8c` for the package built from that checkpoint;
+- immutable bundle `1789d88f81716b3f3ac10d3e3c689975dc8ff0545bdcbd135e410dffeff4cd5c`;
+- AppImage SHA-256 `515c291a435c2b8d374fc62b5e071aff8e4a2808e127ca284e5e16e117bbba7a`;
+- runtime-manifest SHA-256 `aa3ea59fdfb1c5283fa045d714178f6ecc475675ea8cbe5b81b18c6b317e8e48` for the package built from that checkpoint;
 - exactly two concurrent persistent browser turns remain the qualified capacity, intended for one GCW parent/orchestrator plus one native-Goose GCW child/worker;
 - broker process ownership now records Linux boot identity plus process start identity, so PID reuse cannot by itself make a dead broker appear live; legacy unencoded owners remain fail-closed and require explicit reconciliation when independently proven stale;
 - after the 2026-09-21 machine reboot exposed the legacy PID-reuse defect, the fixed package was installed, passed package/ABI smoke, restored provider and BrowserHost health, completed an ordinary Goose→GCW turn, released its second slot, survived a controlled system-service restart, and completed another ordinary turn after that restart while the preserved unreconciled pair remained unchanged;
+- pre-acceptance same-pair rebind now tolerates only generated Goose system/tool projection drift when stable request fields and every canonical history item remain exact and the sole broker operation is still pristine `MINTED`; all history, stable-request, or tool-progress ambiguity remains fail-closed;
+- the preserved turn-328 specimen recovered under its original Goose Control request and Goose session, became `COMPLETE` with durable accepted-user/final identity, released its retained slot, and the same Goose Control request reconciled to completion; a subsequent fresh Goose→GCW smoke returned `GCW_CLEAN_BASELINE_OK`, after which both account slots and both active-turn counters were zero;
 - local conversation-budget estimates no longer reject tool work, cap otherwise valid output, or force provider-chat rollover.
 
 The installed AppImage hash records the exact activated package; byte-for-byte AppImage reproducibility is not claimed. Git history and the active PR retain detailed qualification evidence. Repository HEAD may contain later source, documentation, or test changes. Do not describe source after this checkpoint as installed until a package built from it is independently qualified and activated.
@@ -46,7 +48,7 @@ The current lifecycle decision supersedes older independent provider-epoch rollo
 
 Qualify this for ordinary context pressure and for non-append-compatible history such as compaction/truncation/fork-style divergence. Richer and multimodal history must not be silently repaired by rolling only the provider chat.
 
-Current candidate source no longer creates a replacement provider epoch under an existing Goose session when canonical history diverges. It returns `paired_handoff_required` and leaves the existing pair intact. Remaining work is to qualify and automate the deliberate paired-handoff transaction itself; this source behavior is not installed authority until separately packaged and activated.
+The installed source no longer creates a replacement provider epoch under an existing Goose session when canonical history diverges. It returns `paired_handoff_required` and leaves the existing pair intact. Remaining work is to qualify and automate the deliberate paired-handoff transaction itself.
 
 ### 2. Persistent-chat recovery fault matrix
 
