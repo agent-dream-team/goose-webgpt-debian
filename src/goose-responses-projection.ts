@@ -4,6 +4,8 @@ export interface GooseResponsesProjectionCheckpoint {
   version: 2;
   requestHash: string;
   nonInputHash: string;
+  /** Stable request fields excluding input and the tool registry; absent only on legacy v2 checkpoints. */
+  stableNonInputHash?: string;
   inputHash: string;
   inputItemHashes: string[];
   inputCount: number;
@@ -36,10 +38,13 @@ export function gooseResponsesProjectionCheckpoint(body: unknown): GooseResponse
   if (!Array.isArray(request.input)) throw new Error("Responses request input must be an array");
   const nonInput = { ...request };
   delete nonInput.input;
+  const stableNonInput = { ...nonInput };
+  delete stableNonInput.tools;
   return {
     version: 2,
     requestHash: canonicalJsonSha256(request),
     nonInputHash: canonicalJsonSha256(nonInput),
+    stableNonInputHash: canonicalJsonSha256(stableNonInput),
     inputHash: canonicalJsonSha256(request.input),
     inputItemHashes: request.input.map(item => canonicalJsonSha256(item)),
     inputCount: request.input.length,
@@ -59,6 +64,8 @@ export function decodeGooseResponsesProjectionCheckpoint(value: string | null): 
   if (checkpoint.version !== 2
     || typeof checkpoint.requestHash !== "string" || !/^[a-f0-9]{64}$/.test(checkpoint.requestHash)
     || typeof checkpoint.nonInputHash !== "string" || !/^[a-f0-9]{64}$/.test(checkpoint.nonInputHash)
+    || (checkpoint.stableNonInputHash !== undefined
+      && (typeof checkpoint.stableNonInputHash !== "string" || !/^[a-f0-9]{64}$/.test(checkpoint.stableNonInputHash)))
     || typeof checkpoint.inputHash !== "string" || !/^[a-f0-9]{64}$/.test(checkpoint.inputHash)
     || !Array.isArray(checkpoint.inputItemHashes)
     || checkpoint.inputItemHashes.some(hash => typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash))
@@ -67,6 +74,19 @@ export function decodeGooseResponsesProjectionCheckpoint(value: string | null): 
     throw new Error("Goose Responses projection checkpoint has invalid fields");
   }
   return checkpoint as unknown as GooseResponsesProjectionCheckpoint;
+}
+
+export function gooseToolMayChangeResponsesProjection(expectedTool: ExpectedGooseToolCall): boolean {
+  if (expectedTool.toolName !== "extensionmanager__manage_extensions"
+    && expectedTool.toolName !== "manage_extensions") return false;
+  let args: unknown;
+  try { args = JSON.parse(expectedTool.argumentsJson); } catch { return false; }
+  if (!args || typeof args !== "object" || Array.isArray(args)) return false;
+  const value = args as Record<string, unknown>;
+  return exactKeys(value, ["action", "extension_name"])
+    && (value.action === "enable" || value.action === "disable")
+    && typeof value.extension_name === "string"
+    && value.extension_name.length > 0;
 }
 
 export function classifyGooseResponsesContinuation(input: {
@@ -83,16 +103,43 @@ export function classifyGooseResponsesContinuation(input: {
     return { kind: "DIVERGED", reason: error instanceof Error ? error.message : String(error) };
   }
   if (current.requestHash === input.previous.requestHash) return { kind: "REPLAY", checkpoint: current };
+  const projectionMayChange = gooseToolMayChangeResponsesProjection(input.expectedTool);
   if (current.nonInputHash !== input.previous.nonInputHash) {
-    return { kind: "DIVERGED", reason: "non-input Responses projection changed during tool continuation" };
+    if (!projectionMayChange) {
+      return { kind: "DIVERGED", reason: "non-input Responses projection changed during tool continuation" };
+    }
+    // New checkpoints pin every non-input field except tools. Legacy v2 checkpoints predate this
+    // digest; extension mutation remains compatible because it is itself the durable tool result.
+    if (input.previous.stableNonInputHash !== undefined
+      && current.stableNonInputHash !== input.previous.stableNonInputHash) {
+      return { kind: "DIVERGED", reason: "stable non-tool Responses projection changed during tool continuation" };
+    }
   }
   const items = request.input as unknown[];
   if (items.length !== input.previous.inputCount + 2) {
     return { kind: "DIVERGED", reason: "tool continuation must append exactly two input items" };
   }
-  const prefix = items.slice(0, input.previous.inputCount);
-  if (canonicalJsonSha256(prefix) !== input.previous.inputHash) {
-    return { kind: "DIVERGED", reason: "tool continuation changed the prior canonical input prefix" };
+  if (projectionMayChange) {
+    if (input.previous.inputCount < 1) {
+      return { kind: "DIVERGED", reason: "extension mutation continuation requires a prior system message" };
+    }
+    let currentSystem: Record<string, unknown>;
+    try { currentSystem = record(items[0], "system message"); } catch (error) {
+      return { kind: "DIVERGED", reason: error instanceof Error ? error.message : String(error) };
+    }
+    if (currentSystem.type !== "message" || currentSystem.role !== "system") {
+      return { kind: "DIVERGED", reason: "extension mutation continuation requires the system message to remain first" };
+    }
+    for (let index = 1; index < input.previous.inputCount; index += 1) {
+      if (current.inputItemHashes[index] !== input.previous.inputItemHashes[index]) {
+        return { kind: "DIVERGED", reason: "extension mutation changed prior conversation history" };
+      }
+    }
+  } else {
+    const prefix = items.slice(0, input.previous.inputCount);
+    if (canonicalJsonSha256(prefix) !== input.previous.inputHash) {
+      return { kind: "DIVERGED", reason: "tool continuation changed the prior canonical input prefix" };
+    }
   }
 
   let call: Record<string, unknown>;

@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import { canonicalJsonSha256 } from "./canonical-json";
 import { readJsonRequestBody } from "./http-body";
 import {
   advertisedGooseToolNames,
@@ -15,13 +16,24 @@ import {
   type RebuildConnectorHttpServer,
 } from "./rebuild-connector-http";
 import { ChatGptUpstreamTerminalError } from "./chatgpt-terminal-state";
-import { decodeGooseResponsesProjectionCheckpoint, encodeGooseResponsesProjectionCheckpoint, gooseResponsesProjectionCheckpoint } from "./goose-responses-projection";
+import {
+  classifyGooseResponsesContinuation,
+  decodeGooseResponsesProjectionCheckpoint,
+  encodeGooseResponsesProjectionCheckpoint,
+  gooseResponsesProjectionCheckpoint,
+  type ExpectedGooseToolCall,
+  type GooseResponsesProjectionCheckpoint,
+} from "./goose-responses-projection";
 import {
   classifyGooseCanonicalHistory,
   encodeGooseCanonicalHistoryWatermark,
   renderGoosePersistentPrompt,
 } from "./goose-canonical-history";
 import { buildRebuildResponsesSse, rebuildResponsesSseResponse } from "./rebuild-responses-sse";
+import {
+  ChatGptExternalTurnProgress,
+  type ChatGptExternalTurnProgressSnapshot,
+} from "./adapters/chatgpt-web/turn-progress";
 import { VERSION } from "./version";
 import {
   normalizeCanonicalChatGptConversationId,
@@ -33,6 +45,7 @@ import {
   type BrokerTurn,
   type PositiveTerminalEvidence,
   type RemoteEpoch,
+  isStrictPrefixDigest,
 } from "./session-broker";
 
 export const REBUILD_PROVIDER_SERVICE = "goose-chatgpt-web-rebuild";
@@ -61,6 +74,8 @@ export interface RebuildBrowserTurnLifecycle {
   onSendActivated(): void | Promise<void>;
   /** Called only after semantic submission + canonical conversation/user-turn identity are proven. */
   onAccepted(evidence: RebuildBrowserAcceptedEvidence): void | Promise<void>;
+  /** Called when recovery reopens the same accepted remote turn without sending anything new. */
+  onRebound?(evidence: RebuildBrowserAcceptedEvidence): void | Promise<void>;
 }
 
 export interface RebuildPersistentBrowserTurnInput {
@@ -71,8 +86,22 @@ export interface RebuildPersistentBrowserTurnInput {
   submitNonce: string;
   prompt: string;
   existingConversationId: string | null;
+  /** Reattach to an already accepted remote turn without sending another Goose prompt. */
+  resumeAccepted?: {
+    canonicalConversationId: string;
+    acceptedUserTurnId: string;
+    /** A durable final already exists; refresh/reobserve only and never send a recovery continuation. */
+    finalRecoveryOnly?: true;
+  };
+  /** Rediscover a remotely accepted turn whose local browser attachment died before its user-turn id was bound. */
+  resumePendingAcceptance?: {
+    canonicalConversationId: string;
+  };
   preSendAbortSignal: AbortSignal;
-  gooseWork: { isToolWorkInFlight(): boolean };
+  gooseWork: {
+    /** Semantic progress guides observation cadence only; it never authorizes tool retirement. */
+    snapshot(): ChatGptExternalTurnProgressSnapshot;
+  };
   lifecycle: RebuildBrowserTurnLifecycle;
 }
 
@@ -83,6 +112,8 @@ export interface RebuildPersistentBrowserTurnExecution {
   confirmFinal(candidate: RebuildBrowserFinalEvidence): Promise<RebuildBrowserFinalEvidence>;
   /** Must freshly observe the exact persistent surface after qualified renderer catch-up/quiescence. */
   captureAnswerBoundary(opRef: string): Promise<string>;
+  /** Detach only the process-local browser/execution attachment; both persistent chats remain durable. */
+  detachExecution?(reason: string): Promise<void>;
 }
 
 export interface RebuildPersistentBrowserDriver {
@@ -120,13 +151,35 @@ interface ActiveExecution {
   preSendAbort: AbortController;
   sendActivated: boolean;
   latestBoundaryOpRef: string | null;
+  /** Positive-terminal recovery qualifies only this exact already-terminal boundary. */
+  qualifiedTerminalBoundaryOpRef: string | null;
+  /** True only for accepted-final recovery rebind (turn.finalDigest existed before rebind).
+   *  Guards the strict-prefix digest advancement path so ordinary turns cannot use it. */
+  isAcceptedFinalRecovery: boolean;
   final: Promise<string>;
+  executionDetach: Promise<void> | null;
 }
 
 interface CompletedResponse {
   turnRef: string;
   requestHash: string;
   sse: string;
+}
+
+interface TurnToolActivity {
+  readonly progress: ChatGptExternalTurnProgress;
+  activeOpRef: string | null;
+}
+
+interface RecoveredTerminalReplay {
+  turnRef: string;
+  opRef: string;
+  seq: number;
+  inputHash: string;
+  outcome: "SUCCESS" | "FAILURE";
+  resultJson: string;
+  nextOpRef: string;
+  expectedTool: ExpectedGooseToolCall;
 }
 
 function validSessionId(value: string | null): value is string {
@@ -183,25 +236,120 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
   });
   const baton = new GooseToolRendezvous({ loadCheckpoint: turnRef => broker.getTurn(turnRef)?.checkpointJson ?? null });
   const executions = new Map<string, ActiveExecution>();
-  const toolActivityByTurn = new Map<string, number>();
-  const beginToolActivity = (turnRef: string) => {
-    toolActivityByTurn.set(turnRef, (toolActivityByTurn.get(turnRef) ?? 0) + 1);
+  const toolActivityByTurn = new Map<string, TurnToolActivity>();
+  const toolActivity = (turnRef: string): TurnToolActivity => {
+    let activity = toolActivityByTurn.get(turnRef);
+    if (!activity) {
+      activity = { progress: new ChatGptExternalTurnProgress(), activeOpRef: null };
+      toolActivityByTurn.set(turnRef, activity);
+    }
+    return activity;
   };
-  const endToolActivity = (turnRef: string) => {
-    const next = (toolActivityByTurn.get(turnRef) ?? 1) - 1;
-    if (next <= 0) toolActivityByTurn.delete(turnRef);
-    else toolActivityByTurn.set(turnRef, next);
+  const beginToolActivity = (turnRef: string, opRef: string) => {
+    const activity = toolActivity(turnRef);
+    if (activity.activeOpRef) throw new Error("Persistent rebuild supports only one serial Goose tool operation per turn");
+    activity.activeOpRef = opRef;
+    activity.progress.recordToolBatch(1);
+  };
+  const endToolActivity = (turnRef: string, opRef: string) => {
+    const activity = toolActivityByTurn.get(turnRef);
+    if (!activity || activity.activeOpRef !== opRef) return;
+    activity.activeOpRef = null;
+    if (activity.progress.snapshot().activeToolCalls > 0) activity.progress.recordToolResult();
+  };
+  const quarantineDetachedToolActivity = (
+    turnRef: string,
+    reason: string,
+    expectedRevision?: number,
+  ): boolean => {
+    const activity = toolActivityByTurn.get(turnRef);
+    if (!activity?.activeOpRef) return false;
+    const snapshot = activity.progress.snapshot();
+    if (expectedRevision !== undefined && snapshot.revision !== expectedRevision) return false;
+    const decision = broker.quarantineOwnedOperation({ turnRef, opRef: activity.activeOpRef, reason });
+    if (decision.kind === "TERMINAL") return false;
+    baton.quarantineTurn(turnRef, "Goose tool outcome is uncertain; explicit reconciliation is required");
+    activity.progress.retire(new GooseToolRendezvousError("TURN_UNCERTAIN", reason));
+    activity.activeOpRef = null;
+    return true;
   };
   // Keep only the latest completed transport payload per Goose session. Active executions, raw
   // request bodies, browser closures, and tool literals are released as soon as the turn ends.
   const completedResponses = new Map<string, CompletedResponse>();
+  const recoveredTerminalReplays = new Map<string, RecoveredTerminalReplay>();
+
+  const recoveredTerminalReplayForBody = (turnRef: string, body: unknown): RecoveredTerminalReplay | null => {
+    const terminal = broker.getLatestTerminalOperationForTurn(turnRef);
+    if (!terminal || (terminal.state !== "SUCCESS" && terminal.state !== "FAILURE")
+      || !terminal.inputHash || !terminal.resultJson || !terminal.answerBoundaryJson) return null;
+    const next = broker.getNextOperationForTurn(turnRef, terminal.seq);
+    if (!next || next.state !== "MINTED") return null;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+    const items = (body as Record<string, unknown>).input;
+    if (!Array.isArray(items) || items.length < 2) return null;
+    const callValue = items[items.length - 2];
+    const outputValue = items[items.length - 1];
+    if (!callValue || typeof callValue !== "object" || Array.isArray(callValue)
+      || !outputValue || typeof outputValue !== "object" || Array.isArray(outputValue)) return null;
+    const call = callValue as Record<string, unknown>;
+    const output = outputValue as Record<string, unknown>;
+    const callKeys = Object.keys(call).sort();
+    const outputKeys = Object.keys(output).sort();
+    if (callKeys.join("\0") !== ["arguments", "call_id", "name", "type"].join("\0")
+      || outputKeys.join("\0") !== ["call_id", "output", "type"].join("\0")
+      || call.type !== "function_call" || output.type !== "function_call_output"
+      || call.call_id !== terminal.opRef || output.call_id !== terminal.opRef
+      || typeof call.name !== "string" || !call.name || typeof call.arguments !== "string"
+      || typeof output.output !== "string") return null;
+    let args: unknown;
+    try { args = JSON.parse(call.arguments); } catch { return null; }
+    if (!args || typeof args !== "object" || Array.isArray(args)
+      || connectorOperationInputHash(call.name, args as Record<string, unknown>) !== terminal.inputHash) return null;
+    let expectedOutput: string;
+    try { expectedOutput = connectorStoredResultOutput(terminal.resultJson); } catch { return null; }
+    if (output.output !== expectedOutput) return null;
+    return {
+      turnRef,
+      opRef: terminal.opRef,
+      seq: terminal.seq,
+      inputHash: terminal.inputHash,
+      outcome: terminal.state,
+      resultJson: terminal.resultJson,
+      nextOpRef: next.opRef,
+      expectedTool: {
+        opRef: terminal.opRef,
+        toolName: call.name,
+        argumentsJson: call.arguments,
+      },
+    };
+  };
+
   let draining = false;
   let activeHttpTurns = 0;
   let stopped = false;
 
   const authority = createConnectorOperationAuthority({
-    claimOperation: input => broker.claimOperation(input),
-    classifyMissingOperationRef: (turnRef, inputHash) => broker.classifyMissingOperationRef(turnRef, inputHash),
+    claimOperation: input => {
+      const recovered = recoveredTerminalReplays.get(input.turnRef);
+      if (recovered?.opRef === input.opRef && recovered.inputHash === input.inputHash) {
+        return {
+          kind: "REPLAY",
+          opRef: recovered.opRef,
+          seq: recovered.seq,
+          outcome: recovered.outcome,
+          resultJson: recovered.resultJson,
+          nextOpRef: recovered.nextOpRef,
+        };
+      }
+      return broker.claimOperation(input);
+    },
+    classifyMissingOperationRef: (turnRef, inputHash) => {
+      const recovered = recoveredTerminalReplays.get(turnRef);
+      if (recovered?.inputHash === inputHash) {
+        return { kind: "UNCERTAIN", matchingOpRefs: [recovered.opRef] };
+      }
+      return broker.classifyMissingOperationRef(turnRef, inputHash);
+    },
     boundOperationInputHash: (turnRef, opRef) => {
       const op = broker.getOperation(opRef);
       return op?.turnRef === turnRef ? op.inputHash : null;
@@ -243,15 +391,16 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       active.latestBoundaryOpRef = request.opRef;
     },
     rendezvous: async request => {
-      beginToolActivity(request.turnRef);
+      beginToolActivity(request.turnRef, request.opRef);
       let released = false;
       const releaseActivity = () => {
         if (released) return;
         released = true;
-        endToolActivity(request.turnRef);
+        endToolActivity(request.turnRef, request.opRef);
       };
       try {
         const continuation = await baton.dispatchTool(request);
+        toolActivityByTurn.get(request.turnRef)?.progress.recordActivity();
         return {
           outcome: "SUCCESS",
           dataClass: "task",
@@ -276,12 +425,126 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
   const ensureEpoch = (sessionId: string): RemoteEpoch =>
     broker.getCurrentEpoch(sessionId) ?? broker.createEpoch({ gooseSessionId: sessionId });
 
+  const detachBrowserExecution = (active: ActiveExecution, reason: string): Promise<void> => {
+    if (active.executionDetach) return active.executionDetach;
+    active.executionDetach = active.browser.detachExecution?.(reason) ?? Promise.resolve();
+    return active.executionDetach;
+  };
+
   const durableToolResult = (opRef: string): string => {
     const operation = broker.getOperation(opRef);
     if (!operation || (operation.state !== "SUCCESS" && operation.state !== "FAILURE") || !operation.resultJson) {
       throw new Error(`Canonical epoch seed cannot resolve durable connector result for ${opRef}`);
     }
     return connectorStoredResultOutput(operation.resultJson);
+  };
+
+  const toolProgressSnapshot = (turnRef: string): ChatGptExternalTurnProgressSnapshot => {
+    const local = toolActivityByTurn.get(turnRef);
+    if (local) return local.progress.snapshot();
+    // After process/runtime attachment loss, unresolved durable Goose work must continue to block
+    // provider-internal continuation even though the process-local activity broadcaster is gone.
+    if (broker.hasBlockingOperation(turnRef)) {
+      return { revision: 0, lastToolBatchRevision: 0, activeToolCalls: 1 };
+    }
+    return { revision: 0, lastToolBatchRevision: 0, activeToolCalls: 0 };
+  };
+
+  const cacheCompletedResponse = (turn: BrokerTurn, sse: string) => {
+    completedResponses.delete(turn.gooseSessionId);
+    completedResponses.set(turn.gooseSessionId, {
+      turnRef: turn.turnRef,
+      requestHash: turn.requestHash,
+      sse,
+    });
+    while (completedResponses.size > COMPLETED_RESPONSE_CACHE_LIMIT) {
+      const oldestSession = completedResponses.keys().next().value as string | undefined;
+      if (oldestSession === undefined) break;
+      completedResponses.delete(oldestSession);
+    }
+  };
+
+  const finalizeExecutionEvidence = async (
+    turn: BrokerTurn,
+    active: ActiveExecution,
+    evidence: RebuildBrowserFinalEvidence,
+  ): Promise<string> => {
+    const conversationId = normalizeCanonicalChatGptConversationId(evidence.canonicalConversationId);
+    const acceptedUserTurnId = validatePersistentChatTurnIdentity(evidence.acceptedUserTurnId, "accepted user turn");
+    const current = broker.getTurn(turn.turnRef);
+    if (!current) throw new Error("Broker turn disappeared before browser completion");
+    const currentEpoch = broker.getCurrentEpoch(turn.gooseSessionId);
+    if (!currentEpoch
+      || currentEpoch.epoch !== turn.epoch
+      || currentEpoch.conversationId !== conversationId
+      || current.acceptedUserTurnId !== acceptedUserTurnId) {
+      throw new Error("Browser final identity does not match durable broker identity");
+    }
+    if (evidence.remoteNonRunning !== true) throw new Error("Browser final evidence is incomplete");
+    const digest = finalDigest(evidence.text);
+
+    // Accepted-final recovery: if the stored final digest exists but differs from the
+    // freshly observed final text, permit advancement ONLY when the stored digest is
+    // the SHA-256 of a strict prefix of the fresh text. This is recovery-only and
+    // guarded by isAcceptedFinalRecovery so ordinary turns cannot use this path.
+    let effectiveDigest = digest;
+    if (active.isAcceptedFinalRecovery && turn.finalDigest && turn.finalDigest !== digest) {
+      if (!isStrictPrefixDigest(turn.finalDigest, evidence.text)) {
+        throw new Error("Accepted-final recovery: stored digest is not a strict prefix of the fresh final text");
+      }
+      // Recovery-only CAS: replace the stored digest with the fresh one.
+      // This increments revision and leaves completion_claim_revision null.
+      broker.recordFinalDigestRecovery(turn.turnRef, turn.finalDigest, digest);
+      effectiveDigest = digest;
+    } else {
+      // Ordinary path (including idempotent re-acknowledgement of same digest).
+      broker.recordFinalDigest(turn.turnRef, digest);
+    }
+
+    const claim = broker.beginCompletion(turn.turnRef);
+    const confirmed = await active.browser.confirmFinal(evidence);
+    const confirmedConversationId = normalizeCanonicalChatGptConversationId(confirmed.canonicalConversationId);
+    const confirmedUserTurnId = validatePersistentChatTurnIdentity(confirmed.acceptedUserTurnId, "accepted user turn");
+    const confirmedDigest = finalDigest(confirmed.text);
+    if (confirmedConversationId !== conversationId
+      || confirmedUserTurnId !== acceptedUserTurnId
+      || confirmed.remoteNonRunning !== true
+      || confirmedDigest !== effectiveDigest) {
+      throw new Error("Fresh browser final confirmation does not match the completion candidate");
+    }
+    const confirmedTurn = broker.getTurn(turn.turnRef);
+    if (!confirmedTurn?.checkpointJson) throw new Error("Broker projection checkpoint disappeared before completion");
+    broker.commitCompletion(claim, {
+      connectorFinal: "UNAVAILABLE",
+      canonicalConversationId: confirmedConversationId,
+      acceptedUserTurnId: confirmedUserTurnId,
+      noUnresolvedGooseWork: true,
+      remoteNonRunning: true,
+      observedFinalDigest: effectiveDigest,
+      canonicalHistoryWatermark: encodeGooseCanonicalHistoryWatermark({
+        checkpoint: decodeGooseResponsesProjectionCheckpoint(confirmedTurn.checkpointJson),
+        finalAssistantText: confirmed.text,
+      }),
+      answerBoundary: active.latestBoundaryOpRef
+        ? {
+            opRef: active.latestBoundaryOpRef,
+            contentAdvanced: confirmed.contentAdvancedAfterLastTool === true,
+            ...(
+              confirmed.qualifiedTerminalAfterLastTool === true
+              || active.qualifiedTerminalBoundaryOpRef === active.latestBoundaryOpRef
+                ? { qualifiedTerminal: true }
+                : {}
+            ),
+          }
+        : null,
+    });
+    const finalSse = buildRebuildResponsesSse({
+      model: options.model,
+      text: confirmed.text,
+      id: deterministicResponseId(turn.turnRef, "final"),
+    });
+    cacheCompletedResponse(turn, finalSse);
+    return finalSse;
   };
 
   const startExecution = (
@@ -324,7 +587,9 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       prompt,
       existingConversationId: epoch.conversationId,
       preSendAbortSignal: preSendAbort.signal,
-      gooseWork: { isToolWorkInFlight: () => (toolActivityByTurn.get(turn.turnRef) ?? 0) > 0 },
+      gooseWork: {
+        snapshot: () => toolProgressSnapshot(turn.turnRef),
+      },
       lifecycle: {
         onSendActivated: () => {
           if (preSendAbort.signal.aborted) throw abortError();
@@ -351,7 +616,10 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       preSendAbort,
       sendActivated,
       latestBoundaryOpRef: null,
+      qualifiedTerminalBoundaryOpRef: null,
+      isAcceptedFinalRecovery: false,
       final: Promise.resolve("") as Promise<string>,
+      executionDetach: null,
     };
     executions.set(turn.turnRef, active);
 
@@ -362,75 +630,8 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     if (requestSignal.aborted) onInitialDisconnect();
     active.final = Promise.resolve()
       .then(() => browser.run())
-      .then(async evidence => {
-        const conversationId = normalizeCanonicalChatGptConversationId(evidence.canonicalConversationId);
-        const acceptedUserTurnId = validatePersistentChatTurnIdentity(evidence.acceptedUserTurnId, "accepted user turn");
-        const current = broker.getTurn(turn.turnRef);
-        if (!current) throw new Error("Broker turn disappeared before browser completion");
-        const currentEpoch = broker.getCurrentEpoch(turn.gooseSessionId);
-        if (!currentEpoch
-          || currentEpoch.epoch !== turn.epoch
-          || currentEpoch.conversationId !== conversationId
-          || current.acceptedUserTurnId !== acceptedUserTurnId) {
-          throw new Error("Browser final identity does not match durable broker identity");
-        }
-        if (evidence.remoteNonRunning !== true) {
-          throw new Error("Browser final evidence is incomplete");
-        }
-        const digest = finalDigest(evidence.text);
-        broker.recordFinalDigest(turn.turnRef, digest);
-        const claim = broker.beginCompletion(turn.turnRef);
-        const confirmed = await browser.confirmFinal(evidence);
-        const confirmedConversationId = normalizeCanonicalChatGptConversationId(confirmed.canonicalConversationId);
-        const confirmedUserTurnId = validatePersistentChatTurnIdentity(confirmed.acceptedUserTurnId, "accepted user turn");
-        if (confirmedConversationId !== conversationId
-          || confirmedUserTurnId !== acceptedUserTurnId
-          || confirmed.remoteNonRunning !== true
-          || finalDigest(confirmed.text) !== digest) {
-          throw new Error("Fresh browser final confirmation does not match the completion candidate");
-        }
-        const confirmedTurn = broker.getTurn(turn.turnRef);
-        if (!confirmedTurn?.checkpointJson) throw new Error("Broker projection checkpoint disappeared before completion");
-        broker.commitCompletion(claim, {
-          // Gate E has not yet qualified a connector-final digest/summary acknowledgement.
-          // The local browser-final digest is durable, but it must not borrow that separate authority.
-          connectorFinal: "UNAVAILABLE",
-          canonicalConversationId: confirmedConversationId,
-          acceptedUserTurnId: confirmedUserTurnId,
-          noUnresolvedGooseWork: true,
-          remoteNonRunning: true,
-          observedFinalDigest: digest,
-          canonicalHistoryWatermark: encodeGooseCanonicalHistoryWatermark({
-            checkpoint: decodeGooseResponsesProjectionCheckpoint(confirmedTurn.checkpointJson),
-            finalAssistantText: confirmed.text,
-          }),
-          answerBoundary: active.latestBoundaryOpRef
-            ? {
-                opRef: active.latestBoundaryOpRef,
-                contentAdvanced: confirmed.contentAdvancedAfterLastTool === true,
-                ...(confirmed.qualifiedTerminalAfterLastTool === true ? { qualifiedTerminal: true } : {}),
-              }
-            : null,
-        });
-        const finalSse = buildRebuildResponsesSse({
-          model: options.model,
-          text: confirmed.text,
-          id: deterministicResponseId(turn.turnRef, "final"),
-        });
-        completedResponses.delete(turn.gooseSessionId);
-        completedResponses.set(turn.gooseSessionId, {
-          turnRef: turn.turnRef,
-          requestHash: turn.requestHash,
-          sse: finalSse,
-        });
-        while (completedResponses.size > COMPLETED_RESPONSE_CACHE_LIMIT) {
-          const oldestSession = completedResponses.keys().next().value as string | undefined;
-          if (oldestSession === undefined) break;
-          completedResponses.delete(oldestSession);
-        }
-        return finalSse;
-      })
-      .catch(error => {
+      .then(evidence => finalizeExecutionEvidence(turn, active, evidence))
+      .catch(async error => {
         const current = broker.getTurn(turn.turnRef);
         if (current?.state === "QUEUED") {
           // No irreversible send fence was armed. Local preparation failure or transport-owner
@@ -439,13 +640,131 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         } else if (current?.state === "TURN_OUTSTANDING") {
           try { broker.markUnreconciled(turn.turnRef, "persistent_browser_turn_failed"); } catch {}
         }
+        if (current?.state !== "QUEUED") {
+          try { await detachBrowserExecution(active, "runtime_attachment_failed"); } catch {}
+        }
         if (executions.get(turn.turnRef) === active) executions.delete(turn.turnRef);
         throw error;
       })
       .finally(() => {
         requestSignal.removeEventListener("abort", onInitialDisconnect);
         if (executions.get(turn.turnRef) === active) executions.delete(turn.turnRef);
+        if (toolActivityByTurn.get(turn.turnRef)?.activeOpRef === null) toolActivityByTurn.delete(turn.turnRef);
       });
+    void active.final.catch(() => {});
+    return active;
+  };
+
+  const startRebindExecution = (turn: BrokerTurn): ActiveExecution => {
+    const existing = executions.get(turn.turnRef);
+    if (existing) return existing;
+    if (turn.state !== "UNRECONCILED") {
+      throw new SessionBrokerError("TURN_STATE", "Persistent pair rebind requires an unreconciled turn");
+    }
+    if (broker.hasBlockingOperation(turn.turnRef)) {
+      throw new SessionBrokerError("UNRESOLVED_OPERATION", "Persistent pair rebind requires prior tool/result reconciliation");
+    }
+    const epoch = broker.getCurrentEpoch(turn.gooseSessionId);
+    if (!epoch || epoch.epoch !== turn.epoch || !epoch.conversationId) {
+      throw new SessionBrokerError("RECOVERY_IDENTITY", "Persistent pair rebind requires the durable Goose session and ChatGPT conversation identity");
+    }
+    const initialOperation = broker.getInitialOperationForTurn(turn.turnRef);
+    const latestTerminal = broker.getLatestTerminalOperationForTurn(turn.turnRef);
+    const preSendAbort = new AbortController();
+    const restoreSlotOnPreReboundFailure = broker.hasRecordedPositiveTerminalSlotRelease(turn.turnRef);
+    // Provisional only: finalizeExecutionEvidence can consume this after browser.run() has passed
+    // onRebound, which freshly verifies the durable remote conversation/user identity.
+    const qualifiedTerminalBoundaryOpRef = restoreSlotOnPreReboundFailure && latestTerminal?.answerBoundaryJson
+      ? latestTerminal.opRef
+      : null;
+    let reboundVerified = false;
+    let active!: ActiveExecution;
+    let browser: RebuildPersistentBrowserTurnExecution;
+    try {
+      browser = options.browserDriver.createTurn({
+        turnRef: turn.turnRef,
+        gooseSessionId: turn.gooseSessionId,
+        epoch: turn.epoch,
+        initialOpRef: initialOperation.opRef,
+        submitNonce: turn.submitNonce,
+        prompt: "",
+        existingConversationId: epoch.conversationId,
+        ...(turn.acceptedUserTurnId ? {
+          resumeAccepted: {
+            canonicalConversationId: epoch.conversationId,
+            acceptedUserTurnId: turn.acceptedUserTurnId,
+            ...(turn.finalDigest ? { finalRecoveryOnly: true as const } : {}),
+          },
+        } : {
+          resumePendingAcceptance: {
+            canonicalConversationId: epoch.conversationId,
+          },
+        }),
+        preSendAbortSignal: preSendAbort.signal,
+        gooseWork: { snapshot: () => toolProgressSnapshot(turn.turnRef) },
+        lifecycle: {
+          onSendActivated: () => {
+            throw new Error("Persistent pair rebind must never resend the original Goose prompt");
+          },
+          onAccepted: () => {
+            throw new Error("Persistent pair rebind must never create a replacement ChatGPT user turn");
+          },
+          onRebound: evidence => {
+            const conversationId = normalizeCanonicalChatGptConversationId(evidence.canonicalConversationId);
+            const acceptedUserTurnId = validatePersistentChatTurnIdentity(
+              evidence.acceptedUserTurnId, "reattached accepted user turn",
+            );
+            const recovery = {
+              turnRef: turn.turnRef,
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId,
+              remoteIdentityVerified: true as const,
+            };
+            if (turn.finalDigest) broker.verifyFinalRecoveryRemoteTurn(recovery);
+            else broker.rebindVerifiedRemoteTurn(recovery);
+            reboundVerified = true;
+          },
+        },
+      });
+    } catch (error) {
+      if (restoreSlotOnPreReboundFailure) {
+        try { broker.restorePositiveTerminalSlotRelease(turn.turnRef); } catch {}
+      }
+      throw error;
+    }
+    active = {
+      turnRef: turn.turnRef,
+      browser,
+      preSendAbort,
+      sendActivated: true,
+      latestBoundaryOpRef: latestTerminal?.answerBoundaryJson ? latestTerminal.opRef : null,
+      qualifiedTerminalBoundaryOpRef,
+      isAcceptedFinalRecovery: turn.finalDigest !== null,
+      final: Promise.resolve("") as Promise<string>,
+      executionDetach: null,
+    };
+    executions.set(turn.turnRef, active);
+    active.final = Promise.resolve()
+      .then(() => browser.run())
+      .then(evidence => finalizeExecutionEvidence(turn, active, evidence))
+      .catch(async error => {
+        const current = broker.getTurn(turn.turnRef);
+        if (current?.state === "TURN_OUTSTANDING") {
+          try { broker.markUnreconciled(turn.turnRef, "persistent_pair_rebind_failed"); } catch {}
+        }
+        if (restoreSlotOnPreReboundFailure && !reboundVerified) {
+          try { broker.restorePositiveTerminalSlotRelease(turn.turnRef); } catch {}
+        }
+        try { await detachBrowserExecution(active, "runtime_attachment_failed"); } catch {}
+        if (executions.get(turn.turnRef) === active) executions.delete(turn.turnRef);
+        throw error;
+      })
+      .finally(() => {
+        if (executions.get(turn.turnRef) === active) executions.delete(turn.turnRef);
+        recoveredTerminalReplays.delete(turn.turnRef);
+        if (toolActivityByTurn.get(turn.turnRef)?.activeOpRef === null) toolActivityByTurn.delete(turn.turnRef);
+      });
+    void active.final.catch(() => {});
     return active;
   };
 
@@ -460,8 +779,23 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
       }
       // admitNext is globally FIFO. Another request may observe that an older queued turn won the
       // slot; this waiter never executes that other turn and simply waits for its own turn.
-      const admitted = broker.admitNext();
+      const admitted = broker.admitNext(turnRef);
       if (admitted?.turn.turnRef === turnRef) return admitted;
+      await sleep(POLL_MS, signal);
+    }
+  };
+
+  const waitForRebindAdmission = async (turnRef: string, signal: AbortSignal): Promise<BrokerTurn> => {
+    for (;;) {
+      if (signal.aborted) throw abortError();
+      const turn = broker.getTurn(turnRef);
+      if (!turn) throw new Error("Unreconciled broker turn disappeared before pair rebind");
+      if (turn.state !== "UNRECONCILED") {
+        throw new Error(`Broker turn left unreconciled recovery unexpectedly (${turn.state})`);
+      }
+      if (broker.getAccountSlotHolders().some(holder => holder.turnRef === turnRef)) return turn;
+      const reacquired = broker.reacquireReleasedSlotForRebind(turnRef);
+      if (reacquired) return reacquired;
       await sleep(POLL_MS, signal);
     }
   };
@@ -506,6 +840,77 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     }
   };
 
+  const legacyRecoveredRuntimeCheckpoint = (
+    body: unknown,
+    previous: GooseResponsesProjectionCheckpoint,
+    current: GooseResponsesProjectionCheckpoint,
+  ): GooseResponsesProjectionCheckpoint | null => {
+    if (previous.stableNonInputHash !== undefined) return null;
+    if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+    const request = body as Record<string, unknown>;
+    const allowed = new Set(["input", "tools", "model", "stream", "store", "max_output_tokens"]);
+    if (Object.keys(request).some(key => !allowed.has(key))) return null;
+    if (!Array.isArray(request.input) || !Array.isArray(request.tools)) return null;
+    if (request.model !== options.model || request.stream !== true || request.store !== false) return null;
+    if (request.max_output_tokens !== undefined
+      && (!Number.isSafeInteger(request.max_output_tokens) || Number(request.max_output_tokens) <= 0)) return null;
+    if (previous.inputCount < 1 || request.input.length !== previous.inputCount + 2) return null;
+
+    const system = request.input[0];
+    if (!system || typeof system !== "object" || Array.isArray(system)) return null;
+    const systemRecord = system as Record<string, unknown>;
+    if (systemRecord.type !== "message" || systemRecord.role !== "system" || !Array.isArray(systemRecord.content)
+      || systemRecord.content.length !== 1) return null;
+    const systemContent = systemRecord.content[0];
+    if (!systemContent || typeof systemContent !== "object" || Array.isArray(systemContent)) return null;
+    const systemText = (systemContent as Record<string, unknown>).text;
+    if ((systemContent as Record<string, unknown>).type !== "input_text"
+      || typeof systemText !== "string"
+      || !systemText.startsWith("You are a general-purpose AI agent called goose")) return null;
+
+    for (let index = 1; index < previous.inputCount; index += 1) {
+      if (current.inputItemHashes[index] !== previous.inputItemHashes[index]) return null;
+    }
+    return {
+      ...previous,
+      // Only the generated system message and advertised tool projection may cross this one-way
+      // legacy migration boundary. The strict classifier still validates the appended tool pair.
+      nonInputHash: current.nonInputHash,
+      stableNonInputHash: current.stableNonInputHash,
+      inputHash: canonicalJsonSha256(request.input.slice(0, previous.inputCount)),
+      inputItemHashes: current.inputItemHashes.slice(0, previous.inputCount),
+    };
+  };
+
+  const generatedProjectionRuntimeCheckpoint = (
+    body: unknown,
+    previous: GooseResponsesProjectionCheckpoint,
+    current: GooseResponsesProjectionCheckpoint,
+  ): GooseResponsesProjectionCheckpoint | null => {
+    if (previous.stableNonInputHash === undefined
+      || current.stableNonInputHash !== previous.stableNonInputHash
+      || current.inputCount !== previous.inputCount
+      || previous.inputCount < 1
+      || !body || typeof body !== "object" || Array.isArray(body)) return null;
+    const request = body as Record<string, unknown>;
+    if (!Array.isArray(request.input) || !Array.isArray(request.tools)) return null;
+    const system = request.input[0];
+    if (!system || typeof system !== "object" || Array.isArray(system)) return null;
+    const systemRecord = system as Record<string, unknown>;
+    if (systemRecord.type !== "message" || systemRecord.role !== "system" || !Array.isArray(systemRecord.content)
+      || systemRecord.content.length !== 1) return null;
+    const systemContent = systemRecord.content[0];
+    if (!systemContent || typeof systemContent !== "object" || Array.isArray(systemContent)) return null;
+    const systemText = (systemContent as Record<string, unknown>).text;
+    if ((systemContent as Record<string, unknown>).type !== "input_text"
+      || typeof systemText !== "string"
+      || !systemText.startsWith("You are a general-purpose AI agent called goose")) return null;
+    for (let index = 1; index < previous.inputCount; index += 1) {
+      if (current.inputItemHashes[index] !== previous.inputItemHashes[index]) return null;
+    }
+    return current;
+  };
+
   const handleResponses = async (request: Request): Promise<Response> => {
     const sessionId = request.headers.get("agent-session-id");
     if (!validSessionId(sessionId)) return jsonError(400, "invalid_agent_session_id", "One valid agent-session-id header is required");
@@ -526,7 +931,123 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     let turn = broker.getOpenTurnForSession(sessionId);
 
     if (turn?.state === "UNRECONCILED") {
-      return jsonError(409, "turn_unreconciled", "The persistent remote turn requires explicit recovery before more Goose work");
+      let durableCheckpoint;
+      try {
+        durableCheckpoint = decodeGooseResponsesProjectionCheckpoint(turn.checkpointJson);
+      } catch {
+        return jsonError(409, "rebind_request_conflict", "Persistent pair rebind requires a valid latest durable Goose Responses checkpoint");
+      }
+      const recoveredReplay = recoveredTerminalReplayForBody(turn.turnRef, body);
+      const generatedProjectionCheckpoint = generatedProjectionRuntimeCheckpoint(
+        body,
+        durableCheckpoint,
+        checkpoint,
+      );
+      const acceptedFinalCheckpoint = turn.finalDigest ? generatedProjectionCheckpoint : null;
+      const initialOperation = broker.getInitialOperationForTurn(turn.turnRef);
+      const pendingAcceptanceProjectionCheckpoint = !turn.acceptedUserTurnId
+        && !turn.finalDigest
+        && initialOperation.state === "MINTED"
+        && initialOperation.inputHash === null
+        && initialOperation.resultJson === null
+        && initialOperation.ownerId === null
+        && initialOperation.answerBoundaryJson === null
+        && initialOperation.terminalAt === null
+        && broker.getNextOperationForTurn(turn.turnRef, initialOperation.seq) === null
+        ? generatedProjectionCheckpoint
+        : null;
+      let recoveredDecision = null;
+      if (durableCheckpoint.requestHash !== checkpoint.requestHash) {
+        if (acceptedFinalCheckpoint) {
+          // The durable provider final already closes execution. Only Goose-generated system/tool
+          // projection may migrate here; canonical conversation items remain byte-identical.
+        } else if (pendingAcceptanceProjectionCheckpoint) {
+          // A retained pre-acceptance turn has no dispatched Goose tool work yet. Allow only the
+          // generated Goose system/tool projection to migrate while every canonical history item
+          // remains byte-identical; the browser still rebinds the same durable conversation.
+        } else if (recoveredReplay) {
+          recoveredDecision = classifyGooseResponsesContinuation({
+            body,
+            previous: durableCheckpoint,
+            expectedTool: recoveredReplay.expectedTool,
+          });
+          if (recoveredDecision.kind === "DIVERGED") {
+            const legacyCheckpoint = legacyRecoveredRuntimeCheckpoint(body, durableCheckpoint, checkpoint);
+            if (legacyCheckpoint) {
+              recoveredDecision = classifyGooseResponsesContinuation({
+                body,
+                previous: legacyCheckpoint,
+                expectedTool: recoveredReplay.expectedTool,
+              });
+            }
+          }
+        }
+        if (!acceptedFinalCheckpoint && !pendingAcceptanceProjectionCheckpoint
+          && (!recoveredReplay || recoveredDecision?.kind !== "TOOL_RESULT")) {
+          return jsonError(
+            409,
+            "rebind_request_conflict",
+            "Persistent pair rebind requires the latest durable request or its exact recovered terminal-tool continuation",
+          );
+        }
+        // Recovered +2 continuations are admitted only after the separate recovery cadence has
+        // proven the remote UI non-running, no unresolved Goose work, and no contradictory activity.
+        if (!acceptedFinalCheckpoint && !pendingAcceptanceProjectionCheckpoint
+          && !broker.hasRecordedPositiveTerminalSlotRelease(turn.turnRef)) {
+          return jsonError(
+            409,
+            "rebind_recovery_precondition",
+            "Recovered terminal-tool continuation requires qualified positive-terminal slot release before pair rebind",
+          );
+        }
+      }
+      if (broker.hasBlockingOperation(turn.turnRef)) {
+        return jsonError(409, "rebind_blocked", "Persistent pair rebind requires unresolved Goose tool/result state to be reconciled first");
+      }
+      if (durableCheckpoint.requestHash !== checkpoint.requestHash) {
+        let upgradedCheckpoint = acceptedFinalCheckpoint ?? pendingAcceptanceProjectionCheckpoint;
+        if (!upgradedCheckpoint) {
+          if (recoveredDecision?.kind !== "TOOL_RESULT") {
+            throw new Error("Recovered rebind checkpoint disappeared after request validation");
+          }
+          upgradedCheckpoint = recoveredDecision.checkpoint;
+        }
+        turn = broker.recordProgress(turn.turnRef, encodeGooseResponsesProjectionCheckpoint(upgradedCheckpoint));
+      } else if (durableCheckpoint.stableNonInputHash === undefined) {
+        // Exact legacy-v2 replay is safe to upgrade because requestHash already proves body identity.
+        turn = broker.recordProgress(turn.turnRef, encodeGooseResponsesProjectionCheckpoint(checkpoint));
+      }
+      let active: ActiveExecution;
+      let stage: GooseResponsesStageHandle | undefined;
+      try {
+        turn = await waitForRebindAdmission(turn.turnRef, request.signal);
+        if (recoveredReplay) recoveredTerminalReplays.set(turn.turnRef, recoveredReplay);
+        // Restore Goose tool-name authority before the remote conversation is observed again: a
+        // recovered ChatGPT turn may immediately resume with a connector call.
+        stage = baton.openStage({ turnRef: turn.turnRef, body });
+        active = startRebindExecution(turn);
+      } catch (error) {
+        stage?.releaseBeforeDispatch();
+        recoveredTerminalReplays.delete(turn.turnRef);
+        if (error instanceof SessionBrokerError) {
+          return Response.json({ error: { type: "invalid_request_error", code: error.code, message: error.message } }, { status: 409 });
+        }
+        throw error;
+      }
+      try {
+        return await serveStage(stage, active, request.signal);
+      } catch (error: unknown) {
+        if (error instanceof SessionBrokerError) {
+          return Response.json({ error: { type: "invalid_request_error", code: error.code, message: error.message } }, { status: 409 });
+        }
+        // Recovery-specific failures (strict-prefix mismatch, confirmFinal mismatch, etc.)
+        // are client-visible conflicts, not server errors.
+        if (error instanceof Error && (error.message.startsWith("Accepted-final recovery:") ||
+            error.message.startsWith("Fresh browser final confirmation does not match"))) {
+          return jsonError(409, "recovery_conflict", error.message);
+        }
+        throw error;
+      }
     }
     if (turn?.state === "TURN_OUTSTANDING") {
       const active = executions.get(turn.turnRef);
@@ -552,12 +1073,19 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         }
       }
 
-      let epoch = ensureEpoch(sessionId);
+      const epoch = ensureEpoch(sessionId);
       if (epoch.conversationId) {
         const history = epoch.historyWatermark
           ? classifyGooseCanonicalHistory(body, epoch.historyWatermark)
           : { kind: "ROLLOVER" as const, reason: "bound_epoch_missing_history_watermark", items: [] };
-        if (history.kind !== "APPEND") epoch = broker.createEpoch({ gooseSessionId: sessionId });
+        if (history.kind !== "APPEND") {
+          const reason = history.kind === "ROLLOVER" ? history.reason : "bound_epoch_unexpected_seed";
+          return jsonError(
+            409,
+            "paired_handoff_required",
+            `Canonical Goose history is no longer append-compatible (${reason}); start a fresh Goose session and ChatGPT conversation together from a deliberate handoff`,
+          );
+        }
       }
       turn = broker.enqueueTurn({
         gooseSessionId: sessionId,
@@ -599,6 +1127,35 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     return await serveStage(stage, active, request.signal);
   };
 
+  const detachAuthoritativeExecution = async (input: {
+    turnRef: string;
+    gooseSessionId: string;
+    reason: "controller_detached" | "transport_lost";
+  }): Promise<BrokerTurn> => {
+    const turn = broker.getTurn(input.turnRef);
+    if (!turn || turn.gooseSessionId !== input.gooseSessionId) {
+      throw new SessionBrokerError("TURN_IDENTITY", "Execution detach identity does not match the broker turn");
+    }
+    if (turn.state !== "TURN_OUTSTANDING" && turn.state !== "UNRECONCILED") {
+      throw new SessionBrokerError("TURN_STATE", "Execution detach requires a remotely outstanding turn");
+    }
+    const active = executions.get(input.turnRef);
+    if (!active) {
+      if (turn.state === "UNRECONCILED") return turn;
+      throw new SessionBrokerError("TURN_EXECUTION", "Outstanding process-local execution attachment is unavailable");
+    }
+    if (!active.browser.detachExecution) {
+      throw new SessionBrokerError("TURN_EXECUTION", "Browser driver cannot detach the process-local execution attachment");
+    }
+    const durableReason = `goose_execution_${input.reason}`;
+    quarantineDetachedToolActivity(input.turnRef, durableReason);
+    const current = broker.getTurn(input.turnRef);
+    if (current?.state === "TURN_OUTSTANDING") broker.markUnreconciled(input.turnRef, durableReason);
+    await detachBrowserExecution(active, input.reason);
+    await active.final.catch(() => {});
+    return broker.getTurn(input.turnRef)!;
+  };
+
   let server!: ReturnType<typeof Bun.serve>;
   const stop = async () => {
     if (stopped) return;
@@ -626,8 +1183,48 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
           port: server.port,
           accepting_turns: !draining,
           active_http_turns: activeHttpTurns,
-          active_browser_turns: broker.getAccountSlotHolder() ? 1 : 0,
+          active_browser_turns: broker.getActiveAccountSlotCount(),
         });
+      }
+      if (request.method === "POST" && url.pathname === "/admin/detach-turn-execution") {
+        if (!safeEqualBearer(request.headers.get("authorization") ?? "", options.controlToken)) {
+          return new Response("Unauthorized", { status: 401 });
+        }
+        let body: unknown;
+        try { body = await readJsonRequestBody(request); } catch {
+          return jsonError(400, "invalid_execution_detach", "Execution detach body must be valid JSON");
+        }
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          return jsonError(400, "invalid_execution_detach", "Execution detach must be an object");
+        }
+        const terminal = body as Record<string, unknown>;
+        const turnRef = terminal.turn_ref;
+        const gooseSessionId = terminal.goose_session_id;
+        const reason = terminal.reason;
+        if (typeof turnRef !== "string" || !turnRef
+          || typeof gooseSessionId !== "string" || !validSessionId(gooseSessionId)
+          || (reason !== "controller_detached" && reason !== "transport_lost")) {
+          return jsonError(
+            400,
+            "invalid_execution_detach",
+            "Execution detach requires turn_ref, goose_session_id, and a supported reason",
+          );
+        }
+        try {
+          const turn = await detachAuthoritativeExecution({ turnRef, gooseSessionId, reason });
+          return Response.json({
+            status: "ok",
+            turn_ref: turn.turnRef,
+            turn_state: turn.state,
+            unreconciled_reason: turn.unreconciledReason,
+            slot_retained: broker.getAccountSlotHolders().some(holder => holder.turnRef === turn.turnRef),
+          });
+        } catch (error) {
+          if (error instanceof SessionBrokerError) {
+            return Response.json({ status: "rejected", code: error.code }, { status: 409 });
+          }
+          throw error;
+        }
       }
       if (request.method === "POST" && url.pathname === "/admin/reconcile-operation") {
         if (!safeEqualBearer(request.headers.get("authorization") ?? "", options.controlToken)) {
@@ -680,7 +1277,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
           throw error;
         }
       }
-      if (request.method === "POST" && url.pathname === "/admin/abandon-unreconciled") {
+      if (request.method === "POST" && url.pathname === "/admin/release-unreconciled-slot") {
         if (!safeEqualBearer(request.headers.get("authorization") ?? "", options.controlToken)) {
           return new Response("Unauthorized", { status: 401 });
         }
@@ -694,8 +1291,10 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         const recovery = body as Record<string, unknown>;
         const turnRef = recovery.turn_ref;
         const evidenceValue = recovery.positive_terminal_evidence;
-        if (typeof turnRef !== "string" || !turnRef || !evidenceValue || typeof evidenceValue !== "object" || Array.isArray(evidenceValue)) {
-          return jsonError(400, "invalid_recovery_request", "Abandon request requires turn_ref and positive_terminal_evidence");
+        if (typeof turnRef !== "string" || !turnRef || !evidenceValue
+          || typeof evidenceValue !== "object" || Array.isArray(evidenceValue)) {
+          return jsonError(400, "invalid_recovery_request",
+            "Slot release requires turn_ref and positive_terminal_evidence");
         }
         const rawEvidence = evidenceValue as Record<string, unknown>;
         let evidence: PositiveTerminalEvidence;
@@ -708,7 +1307,8 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
               typeof rawEvidence.accepted_user_turn_id === "string" ? rawEvidence.accepted_user_turn_id : "",
               "accepted user turn",
             ),
-            remoteUiNonRunningAcrossQualifiedSettle: rawEvidence.remote_ui_non_running_across_qualified_settle === true,
+            remoteUiNonRunningAcrossQualifiedSettle:
+              rawEvidence.remote_ui_non_running_across_qualified_settle === true,
             noUnresolvedGooseWork: rawEvidence.no_unresolved_goose_work === true,
             noContradictoryActivity: rawEvidence.no_contradictory_activity === true,
           };
@@ -716,16 +1316,17 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
           return jsonError(400, "invalid_recovery_request", "Positive-terminal recovery identity is invalid");
         }
         if (executions.has(turnRef) || toolActivityByTurn.has(turnRef)) {
-          return jsonError(409, "recovery_owner_active", "Process-local turn/tool ownership must be gone before abandonment");
+          return jsonError(409, "recovery_owner_active",
+            "Process-local turn/tool ownership must be gone before account-slot release");
         }
         try {
-          broker.releaseSlotAfterPositiveTerminal(turnRef, evidence);
-          const abandoned = broker.abandonUnreconciled(turnRef);
+          const released = broker.releaseSlotAfterPositiveTerminal(turnRef, evidence);
           return Response.json({
             status: "ok",
             turn_ref: turnRef,
-            turn_state: abandoned.state,
-            account_slot_holder: broker.getAccountSlotHolder(),
+            turn_state: released.state,
+            pair_retained: true,
+            account_slot_holders: broker.getAccountSlotHolders(),
           });
         } catch (error) {
           if (error instanceof SessionBrokerError) {
@@ -740,9 +1341,9 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         }
         if (url.pathname === "/admin/resume") {
           draining = false;
-          return Response.json({ status: "ok", accepting_turns: true, active_http_turns: activeHttpTurns, active_browser_turns: broker.getAccountSlotHolder() ? 1 : 0 });
+          return Response.json({ status: "ok", accepting_turns: true, active_http_turns: activeHttpTurns, active_browser_turns: broker.getActiveAccountSlotCount() });
         }
-        const activeBrowserTurns = broker.getAccountSlotHolder() ? 1 : 0;
+        const activeBrowserTurns = broker.getActiveAccountSlotCount();
         if (activeHttpTurns !== 0 || activeBrowserTurns !== 0) {
           return Response.json({
             status: "busy",
@@ -758,7 +1359,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         if (!safeEqualBearer(request.headers.get("authorization") ?? "", options.controlToken)) {
           return new Response("Unauthorized", { status: 401 });
         }
-        if (!draining || activeHttpTurns !== 0 || broker.getAccountSlotHolder()) {
+        if (!draining || activeHttpTurns !== 0 || broker.getActiveAccountSlotCount() !== 0) {
           return Response.json({ status: "refused", accepting_turns: !draining }, { status: 409 });
         }
         setTimeout(() => { void stop(); }, 0);

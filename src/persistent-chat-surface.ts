@@ -123,6 +123,32 @@ export function acceptedUserTurnIdentity(
   return identity ? validatePersistentChatTurnIdentity(identity, "accepted user turn") : undefined;
 }
 
+export async function correlatedUserTurnIdentity(
+  page: Page,
+  turnRef: string,
+  submitNonce: string,
+): Promise<string | undefined> {
+  if (!turnRef || !submitNonce) throw new Error("Persistent ChatGPT correlation identity is incomplete");
+  const matches = await page.evaluate(({ selector, expectedTurnRef, expectedSubmitNonce }) => {
+    const turnNeedle = `"turn_ref":${JSON.stringify(expectedTurnRef)}`;
+    const submitNeedle = `"submit_nonce":${JSON.stringify(expectedSubmitNonce)}`;
+    return [...document.querySelectorAll(selector)].flatMap(element => {
+      const text = element.textContent ?? "";
+      if (!text.includes(turnNeedle) || !text.includes(submitNeedle)) return [];
+      const identity = element.getAttribute("data-turn-id");
+      if (!identity) throw new Error("Correlated ChatGPT user turn is missing data-turn-id");
+      return [identity];
+    });
+  }, {
+    selector: CHATGPT_USER_TURN_SELECTOR,
+    expectedTurnRef: turnRef,
+    expectedSubmitNonce: submitNonce,
+  });
+  const identities = uniqueIdentities(matches, "correlated user-turn");
+  if (identities.length > 1) throw new Error("ChatGPT exposed multiple user turns for one durable Goose submission identity");
+  return identities[0];
+}
+
 export function assistantTurnForAcceptedUser(
   snapshot: PersistentChatTurnSnapshot,
   acceptedUserTurnId: string,
@@ -178,6 +204,26 @@ async function closeBrowser(browser: Browser): Promise<void> {
   await browser.close().catch(() => {});
 }
 
+function throwIfObservationAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException("Persistent ChatGPT surface observation aborted", "AbortError");
+}
+
+function sleepWithObservationAbort(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise(resolve => setTimeout(resolve, ms));
+  const activeSignal = signal;
+  throwIfObservationAborted(activeSignal);
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(done, ms);
+    const onAbort = () => done(new DOMException("Persistent ChatGPT surface observation aborted", "AbortError"));
+    function done(error?: unknown) {
+      clearTimeout(timer);
+      activeSignal.removeEventListener("abort", onAbort);
+      error ? reject(error) : resolve();
+    }
+    activeSignal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export class PersistentChatSurfaceController {
   constructor(
     private readonly descriptorPath: string,
@@ -191,7 +237,7 @@ export class PersistentChatSurfaceController {
       this.descriptorPath, this.timeoutMs, binding.surfaceId, abortSignal,
     );
     try {
-      return await this.inspectPage(connection.page, binding);
+      return await this.inspectPage(connection.page, binding, abortSignal);
     } finally {
       await closeBrowser(connection.browser);
     }
@@ -219,7 +265,11 @@ export class PersistentChatSurfaceController {
     return this.inspect(binding, abortSignal);
   }
 
-  private async inspectPage(page: Page, binding: PersistentChatBinding): Promise<PersistentChatSurfaceObservation> {
+  private async inspectPage(
+    page: Page,
+    binding: PersistentChatBinding,
+    abortSignal?: AbortSignal,
+  ): Promise<PersistentChatSurfaceObservation> {
     canonicalChatGptConversationUrl(binding.conversationId);
     const location = classifyChatGptConversationUrl(page.url());
     if (location.kind !== "canonical") {
@@ -229,12 +279,24 @@ export class PersistentChatSurfaceController {
       throw new Error("ChatGPT reopened a different canonical conversation");
     }
     await this.verifyAuthenticated(page, this.timeoutMs);
-    const snapshot = await capturePersistentChatTurnSnapshot(page);
-    const assistantTurnId = assistantTurnForAcceptedUser(snapshot, binding.acceptedUserTurnId);
-    return {
-      binding: { ...binding, conversationId: location.conversationId },
-      ...(assistantTurnId ? { assistantTurnId } : {}),
-      snapshot,
-    };
+    const deadline = Date.now() + this.timeoutMs;
+    for (;;) {
+      throwIfObservationAborted(abortSignal);
+      const snapshot = await capturePersistentChatTurnSnapshot(page);
+      if (snapshot.userIdentities.includes(binding.acceptedUserTurnId)) {
+        const assistantTurnId = assistantTurnForAcceptedUser(snapshot, binding.acceptedUserTurnId);
+        if (assistantTurnId) {
+          return {
+            binding: { ...binding, conversationId: location.conversationId },
+            assistantTurnId,
+            snapshot,
+          };
+        }
+      }
+      if (Date.now() >= deadline) {
+        throw new Error("ChatGPT durable turn binding did not hydrate before the observation timeout");
+      }
+      await sleepWithObservationAbort(100, abortSignal);
+    }
   }
 }

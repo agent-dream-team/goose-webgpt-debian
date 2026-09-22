@@ -61,27 +61,6 @@ test("inline Web context emits a distinct agent_message envelope", () => {
   expect(compiled.text).toContain("Exclude agent_message inputs");
 });
 
-test("multipart Web context emits the same agent_message envelope", () => {
-  const compiled = compileChatGptWebPrompt(
-    request(),
-    capabilities,
-    turnToken,
-    { experimentalMultipartParts: 2 },
-  );
-  const records = compiled.multipart!.parts.flatMap(part => (
-    (JSON.parse(part) as { records: Array<Record<string, unknown>> }).records
-  ));
-  const messages = records
-    .filter(record => record.kind === "message")
-    .map(record => record.message as Record<string, unknown>);
-  expect(messages[0]).toEqual({
-    role: "agent_message",
-    author: "parent",
-    recipient: "child",
-    content: "Inspect the failing request and report evidence.",
-  });
-});
-
 test("ordinary user messages do not gain agent metadata", () => {
   const messages = inlineMessages(compileChatGptWebPrompt(request(), capabilities, turnToken).text);
   expect(messages[1]).not.toHaveProperty("author");

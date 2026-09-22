@@ -119,21 +119,18 @@ test("browser interaction mode changes reuse the transactional setup and refresh
     mode: "full",
     browserHost: "launcher",
     appName: "Codex Native2",
-    experimentalBiggerContext: true,
   };
   const manual = hostFor(config);
   const manualResult = await manual.host.setBrowserInteractionMode("manual");
   assert.equal(manualResult.mode, "manual");
   assert.equal(manual.invocation().args.includes("--zero-risk-browser-interaction"), true);
   assert.equal(manual.invocation().args.includes("--refresh-account-capabilities"), false);
-  assert.equal(manual.invocation().args.includes("--standard-context"), true);
 
   const automatic = hostFor(config);
   const automaticResult = await automatic.host.setBrowserInteractionMode("automatic");
   assert.equal(automaticResult.mode, "automatic");
   assert.equal(automatic.invocation().args.includes("--automatic-browser-interaction"), true);
   assert.equal(automatic.invocation().args.includes("--refresh-account-capabilities"), true);
-  assert.equal(automatic.invocation().args.includes("--bigger-context"), true);
 });
 
 test("switching back from Zero Risk preserves the saved automatic connector identity", async () => {
@@ -172,45 +169,6 @@ test("DEV core setup configures only the isolated harness contract", async () =>
   assert.equal(fixture.invocation().args.includes("--restart-service"), false);
 });
 
-test("Bigger Context uses the setup transaction and refreshes the production Codex catalog", async () => {
-  const fixture = hostFor({ mode: "full", appName: "Codex Native2" });
-  const result = await fixture.host.setBiggerContext(true);
-  assert.equal(result.enabled, true);
-  assert.deepEqual(fixture.invocation(), {
-    name: "bigger-context",
-    args: [
-      "setup",
-      "--full",
-      "--browser-host-descriptor",
-      "/runtime/launcher-browser.json",
-      "--automatic-browser-interaction",
-      "--replace-codex-route",
-      "--acknowledge-unofficial",
-      "--restart-service",
-      "--bigger-context",
-    ],
-  });
-});
-
-test("Bigger Context updates the isolated DEV config without installing a Codex route", async () => {
-  const fixture = devHostFor({ mode: "browser-only" });
-  const result = await fixture.host.setBiggerContext(false);
-  assert.equal(result.enabled, false);
-  assert.deepEqual(fixture.invocation(), {
-    name: "bigger-context",
-    args: [
-      "dev",
-      "setup",
-      "--browser-only",
-      "--browser-host-descriptor",
-      "/dev/runtime/launcher-browser.json",
-      "--automatic-browser-interaction",
-      "--acknowledge-unofficial",
-      "--standard-context",
-    ],
-  });
-});
-
 test("Zero Risk Pro transaction installs or removes only its explicit model profile", async () => {
   const config = {
     mode: "full",
@@ -231,7 +189,6 @@ test("Zero Risk Pro transaction installs or removes only its explicit model prof
       "/runtime/launcher-browser.json",
       "--zero-risk-browser-interaction",
       "--acknowledge-unofficial",
-      "--standard-context",
       "--zero-risk-pro",
       "--replace-codex-route",
       "--restart-service",

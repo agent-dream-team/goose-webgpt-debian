@@ -2,12 +2,14 @@ import { afterEach, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
 import {
   SessionBroker,
   SessionBrokerError,
   type CompletionEvidence,
   type PositiveTerminalEvidence,
+  isStrictPrefixDigest,
 } from "../src/session-broker";
 
 const roots: string[] = [];
@@ -160,6 +162,36 @@ test("accepted remote turn becomes unreconciled on broker restart without releas
     expect(restarted.getTurn("turn-a")?.state).toBe("UNRECONCILED");
     expect(restarted.getCurrentEpoch("goose-a")?.leaseState).toBe("UNRECONCILED");
     expect(restarted.getAccountSlotHolder()).toBe("turn-a");
+  } finally {
+    restarted.close();
+  }
+});
+
+test("restart preserves both post-send slot owners while demoting both turns to unreconciled", () => {
+  const { broker, path } = fixture();
+  createSession(broker, "goose-a");
+  createSession(broker, "goose-b");
+  enqueue(broker, "goose-a", "turn-a", "req-a");
+  enqueue(broker, "goose-b", "turn-b", "req-b");
+  expect(broker.admitNext("turn-a")?.turn.turnRef).toBe("turn-a");
+  accept(broker, "turn-a");
+  expect(broker.admitNext("turn-b")?.turn.turnRef).toBe("turn-b");
+  accept(broker, "turn-b");
+  expect(broker.getAccountSlotHolders()).toEqual([
+    { slotId: 1, turnRef: "turn-a" },
+    { slotId: 2, turnRef: "turn-b" },
+  ]);
+  broker.close();
+
+  const restarted = open(path, "broker-b");
+  try {
+    expect(restarted.getTurn("turn-a")?.state).toBe("UNRECONCILED");
+    expect(restarted.getTurn("turn-b")?.state).toBe("UNRECONCILED");
+    expect(restarted.getAccountSlotHolders()).toEqual([
+      { slotId: 1, turnRef: "turn-a" },
+      { slotId: 2, turnRef: "turn-b" },
+    ]);
+    expect(restarted.getActiveAccountSlotCount()).toBe(2);
   } finally {
     restarted.close();
   }
@@ -329,22 +361,136 @@ test("operator-known terminal reconciliation requires post-owner uncertainty and
   }
 });
 
-test("timeout or silence alone never releases account slot; positive terminal evidence releases only the slot", () => {
+test("owned claimed operation quarantine is idempotent and retains the slot until reconciliation", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    const { initialOpRef } = broker.admitNext()!;
+    accept(broker);
+    bindConversation(broker);
+    broker.recordAnswerBoundary("turn-a", initialOpRef, '{"chars":10}');
+    broker.claimOperation({ turnRef: "turn-a", opRef: initialOpRef, inputHash: "known-input" });
+
+    const first = broker.quarantineOwnedOperation({
+      turnRef: "turn-a", opRef: initialOpRef, reason: "semantic_progress_stalled",
+    });
+    expect(first.kind).toBe("QUARANTINED");
+    expect(first.operation.state).toBe("UNCERTAIN");
+    expect(broker.getTurn("turn-a")).toMatchObject({
+      state: "UNRECONCILED", unreconciledReason: "semantic_progress_stalled",
+    });
+    expect(broker.getAccountSlotHolder()).toBe("turn-a");
+
+    expect(broker.quarantineOwnedOperation({
+      turnRef: "turn-a", opRef: initialOpRef, reason: "semantic_progress_stalled",
+    }).kind).toBe("ALREADY_UNCERTAIN");
+    const terminal = broker.reconcileKnownOperationTerminal({
+      turnRef: "turn-a",
+      opRef: initialOpRef,
+      inputHash: "known-input",
+      outcome: "SUCCESS",
+      resultJson: '{"ok":true}',
+    });
+    expect(terminal.operation.state).toBe("SUCCESS");
+    expect(broker.getAccountSlotHolder()).toBe("turn-a");
+  } finally {
+    broker.close();
+  }
+});
+
+test("terminal operation commit wins cleanly over a later quarantine attempt", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    const { initialOpRef } = broker.admitNext()!;
+    accept(broker);
+    bindConversation(broker);
+    broker.recordAnswerBoundary("turn-a", initialOpRef, '{"chars":10}');
+    broker.claimOperation({ turnRef: "turn-a", opRef: initialOpRef, inputHash: "known-input" });
+    broker.completeOperation({
+      opRef: initialOpRef, inputHash: "known-input", outcome: "SUCCESS", resultJson: '{"ok":true}',
+    });
+
+    const decision = broker.quarantineOwnedOperation({
+      turnRef: "turn-a", opRef: initialOpRef, reason: "late_timeout",
+    });
+    expect(decision.kind).toBe("TERMINAL");
+    expect(decision.operation.state).toBe("SUCCESS");
+    expect(broker.getTurn("turn-a")?.state).toBe("TURN_OUTSTANDING");
+  } finally {
+    broker.close();
+  }
+});
+
+test("uncertain tool owner keeps its slot while a safe second-slot completion admits the queued turn", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker, "goose-a");
+    createSession(broker, "goose-b");
+    createSession(broker, "goose-c");
+    enqueue(broker, "goose-a", "turn-a", "req-a");
+    enqueue(broker, "goose-b", "turn-b", "req-b");
+    enqueue(broker, "goose-c", "turn-c", "req-c");
+
+    const a = broker.admitNext("turn-a")!;
+    accept(broker, "turn-a");
+    bindConversation(broker, "goose-a", "conversation-a");
+    broker.recordAnswerBoundary("turn-a", a.initialOpRef, '{"chars":10}');
+    broker.claimOperation({ turnRef: "turn-a", opRef: a.initialOpRef, inputHash: "input-a" });
+    broker.quarantineOwnedOperation({ turnRef: "turn-a", opRef: a.initialOpRef, reason: "semantic_progress_stalled" });
+
+    broker.admitNext("turn-b");
+    accept(broker, "turn-b");
+    bindConversation(broker, "goose-b", "conversation-b");
+    expect(broker.admitNext("turn-c")).toBeNull();
+    broker.recordFinalDigest("turn-b", "digest-b");
+    const claim = broker.beginCompletion("turn-b");
+    broker.commitCompletion(claim, {
+      connectorFinal: "ACKNOWLEDGED",
+      canonicalConversationId: "conversation-b",
+      acceptedUserTurnId: "user-turn-b",
+      noUnresolvedGooseWork: true,
+      remoteNonRunning: true,
+      observedFinalDigest: "digest-b",
+      canonicalHistoryWatermark: "wm-b",
+      answerBoundary: null,
+    });
+
+    expect(broker.admitNext("turn-c")?.turn.turnRef).toBe("turn-c");
+    expect(broker.getAccountSlotHolders()).toEqual([
+      { slotId: 1, turnRef: "turn-a" },
+      { slotId: 2, turnRef: "turn-c" },
+    ]);
+    expect(broker.getOperation(a.initialOpRef)?.state).toBe("UNCERTAIN");
+  } finally {
+    broker.close();
+  }
+});
+
+test("timeout or silence alone never releases its slot while the second slot remains independent", () => {
   let now = 1_000;
   const { broker } = fixture("broker-a", () => now);
   try {
     createSession(broker, "goose-a");
     createSession(broker, "goose-b");
+    createSession(broker, "goose-c");
     enqueue(broker, "goose-a", "turn-a", "req-a");
     enqueue(broker, "goose-b", "turn-b", "req-b");
-    broker.admitNext();
+    enqueue(broker, "goose-c", "turn-c", "req-c");
+    expect(broker.admitNext("turn-a")?.turn.turnRef).toBe("turn-a");
     accept(broker, "turn-a");
     broker.bindConversation({ gooseSessionId: "goose-a", epoch: 1, conversationId: "conversation-a" });
     broker.markUnreconciled("turn-a", "ui_stale");
+    expect(broker.admitNext("turn-b")?.turn.turnRef).toBe("turn-b");
     now += 24 * 60 * 60 * 1_000;
 
-    expect(broker.getAccountSlotHolder()).toBe("turn-a");
-    expect(broker.admitNext()).toBeNull();
+    expect(broker.getAccountSlotHolders()).toEqual([
+      { slotId: 1, turnRef: "turn-a" },
+      { slotId: 2, turnRef: "turn-b" },
+    ]);
+    expect(broker.admitNext("turn-c")).toBeNull();
     expect(() => broker.releaseSlotAfterPositiveTerminal("turn-a", {
       ...positiveTerminal,
       remoteUiNonRunningAcrossQualifiedSettle: false,
@@ -352,8 +498,12 @@ test("timeout or silence alone never releases account slot; positive terminal ev
 
     broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
     expect(broker.getCurrentEpoch("goose-a")?.leaseState).toBe("UNRECONCILED");
-    expect(broker.getAccountSlotHolder()).toBeNull();
-    expect(broker.admitNext()?.turn.turnRef).toBe("turn-b");
+    expect(broker.getAccountSlotHolders()).toEqual([{ slotId: 2, turnRef: "turn-b" }]);
+    expect(broker.admitNext("turn-c")?.turn.turnRef).toBe("turn-c");
+    expect(broker.getAccountSlotHolders()).toEqual([
+      { slotId: 1, turnRef: "turn-c" },
+      { slotId: 2, turnRef: "turn-b" },
+    ]);
     expect(broker.getCurrentEpoch("goose-a")?.leaseState).toBe("UNRECONCILED");
   } finally {
     broker.close();
@@ -486,6 +636,53 @@ test("completion after tool dispatch must prove content advanced beyond the late
   }
 });
 
+test("completion can recover post-tool advancement from the durable boundary text digest", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    const { initialOpRef } = broker.admitNext()!;
+    accept(broker);
+    bindConversation(broker);
+    const beforeDigest = createHash("sha256").update("before-tool", "utf8").digest("hex");
+    const finalDigest = createHash("sha256").update("after-tool final", "utf8").digest("hex");
+    broker.recordAnswerBoundary("turn-a", initialOpRef, JSON.stringify({ answerTextSha256: beforeDigest }));
+    broker.claimOperation({ turnRef: "turn-a", opRef: initialOpRef, inputHash: "input" });
+    broker.completeOperation({ opRef: initialOpRef, inputHash: "input", outcome: "SUCCESS", resultJson: '{"ok":true}' });
+    broker.recordFinalDigest("turn-a", finalDigest);
+    const claim = broker.beginCompletion("turn-a");
+    expect(broker.commitCompletion(claim, {
+      ...completionEvidence(initialOpRef, finalDigest),
+      answerBoundary: { opRef: initialOpRef, contentAdvanced: false },
+    }).state).toBe("COMPLETE");
+  } finally {
+    broker.close();
+  }
+});
+
+test("durable boundary digest equality does not falsely prove post-tool advancement", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    const { initialOpRef } = broker.admitNext()!;
+    accept(broker);
+    bindConversation(broker);
+    const digest = createHash("sha256").update("unchanged", "utf8").digest("hex");
+    broker.recordAnswerBoundary("turn-a", initialOpRef, JSON.stringify({ answerTextSha256: digest }));
+    broker.claimOperation({ turnRef: "turn-a", opRef: initialOpRef, inputHash: "input" });
+    broker.completeOperation({ opRef: initialOpRef, inputHash: "input", outcome: "SUCCESS", resultJson: '{"ok":true}' });
+    broker.recordFinalDigest("turn-a", digest);
+    const claim = broker.beginCompletion("turn-a");
+    expect(() => broker.commitCompletion(claim, {
+      ...completionEvidence(initialOpRef, digest),
+      answerBoundary: { opRef: initialOpRef, contentAdvanced: false },
+    })).toThrow(SessionBrokerError);
+  } finally {
+    broker.close();
+  }
+});
+
 test("canonical conversation identity is unique and cannot be rebound to another epoch", () => {
   const { broker } = fixture();
   try {
@@ -595,86 +792,26 @@ test("positive-terminal slot demotion alone preserves the quarantined lease and 
   }
 });
 
-test("explicit abandonment requires prior positive-terminal slot demotion evidence", () => {
-  const { broker, path } = fixture();
-  try {
-    createSession(broker);
-    enqueue(broker);
-    broker.admitNext();
-    accept(broker);
-    bindConversation(broker);
-    broker.markUnreconciled("turn-a", "stopped_incomplete");
-
-    expect(() => broker.abandonUnreconciled("turn-a")).toThrow(SessionBrokerError);
-
-    const inspect = new Database(path, { strict: true });
-    try {
-      inspect.query("UPDATE turns SET slot_held = 0 WHERE turn_ref = 'turn-a'").run();
-      expect(() => inspect.query("UPDATE turns SET abandoned_at = 1 WHERE turn_ref = 'turn-a'").run()).toThrow();
-    } finally {
-      inspect.close();
-    }
-    let failure: unknown;
-    try {
-      broker.abandonUnreconciled("turn-a");
-    } catch (error) {
-      failure = error;
-    }
-    expect(failure).toBeInstanceOf(SessionBrokerError);
-    expect((failure as SessionBrokerError).code).toBe("POSITIVE_TERMINAL_REQUIRED");
-    expect(broker.getTurn("turn-a")?.state).toBe("UNRECONCILED");
-  } finally {
-    broker.close();
-  }
-});
-
-test("explicit abandonment ends only the quarantined conversation lease and permits epoch rollover", () => {
-  const { broker, path } = fixture();
-  try {
-    createSession(broker);
-    enqueue(broker);
-    broker.admitNext();
-    accept(broker);
-    bindConversation(broker);
-    broker.markUnreconciled("turn-a", "irrecoverable_remote_identity");
-    broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
-
-    expect(broker.abandonUnreconciled("turn-a").state).toBe("ABANDONED");
-    expect(broker.abandonUnreconciled("turn-a").state).toBe("ABANDONED");
-    expect(broker.getCurrentEpoch("goose-a")).toBeNull();
-    expect(broker.createEpoch({ gooseSessionId: "goose-a", historyWatermark: "wm-new" }).epoch).toBe(2);
-
-    const inspect = new Database(path, { strict: true });
-    try {
-      const retained = inspect.query(`SELECT state, abandoned_at, unreconciled_reason, positive_terminal_evidence_json
-        FROM turns WHERE turn_ref = 'turn-a'`).get() as {
-          state: string; abandoned_at: number | null; unreconciled_reason: string | null; positive_terminal_evidence_json: string | null;
-        };
-      expect(retained.state).toBe("UNRECONCILED");
-      expect(retained.abandoned_at).not.toBeNull();
-      expect(retained.unreconciled_reason).toBe("irrecoverable_remote_identity");
-      expect(retained.positive_terminal_evidence_json).toBe(JSON.stringify(positiveTerminal));
-    } finally {
-      inspect.close();
-    }
-  } finally {
-    broker.close();
-  }
-});
-
-test("abandoned quarantine remains terminal across broker restart", () => {
+test("legacy abandoned rows remain readable and terminal across broker restart", () => {
   const { broker, path } = fixture();
   createSession(broker);
   enqueue(broker);
   broker.admitNext();
   accept(broker);
   bindConversation(broker);
-  broker.markUnreconciled("turn-a", "irrecoverable_remote_identity");
+  broker.markUnreconciled("turn-a", "legacy_abandoned_pair");
   broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
-  broker.abandonUnreconciled("turn-a");
   broker.close();
 
-  const restarted = open(path, "broker-b");
+  const legacy = new Database(path, { strict: true });
+  try {
+    legacy.query("UPDATE turns SET abandoned_at = 1 WHERE turn_ref = 'turn-a'").run();
+    legacy.query("UPDATE remote_epochs SET is_current = 0 WHERE goose_session_id = 'goose-a' AND epoch = 1").run();
+  } finally {
+    legacy.close();
+  }
+
+  const restarted = open(path, "broker-legacy-abandoned");
   try {
     expect(restarted.getTurn("turn-a")?.state).toBe("ABANDONED");
     expect(restarted.getAccountSlotHolder()).toBeNull();
@@ -685,15 +822,9 @@ test("abandoned quarantine remains terminal across broker restart", () => {
   }
 });
 
-test("legacy pre-abandonment broker schema migrates additively and can abandon without table rebuild", () => {
+test("legacy pre-abandonment schema migrates abandoned_at compatibility without a current abandonment API", () => {
   const { broker, path } = fixture();
   createSession(broker);
-  enqueue(broker);
-  broker.admitNext();
-  accept(broker);
-  bindConversation(broker);
-  broker.markUnreconciled("turn-a", "irrecoverable_remote_identity");
-  broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
   broker.close();
 
   const legacy = new Database(path, { strict: true });
@@ -720,9 +851,44 @@ test("legacy pre-abandonment broker schema migrates additively and can abandon w
     } finally {
       inspect.close();
     }
-    expect(restarted.abandonUnreconciled("turn-a").state).toBe("ABANDONED");
-    expect(restarted.getCurrentEpoch("goose-a")).toBeNull();
-    expect(restarted.createEpoch({ gooseSessionId: "goose-a" }).epoch).toBe(2);
+  } finally {
+    restarted.close();
+  }
+});
+
+test("legacy one-slot broker migrates its outstanding owner into durable slot 1", () => {
+  const { broker, path } = fixture();
+  createSession(broker);
+  enqueue(broker);
+  broker.admitNext();
+  accept(broker);
+  bindConversation(broker);
+  broker.close();
+
+  const legacy = new Database(path, { strict: true });
+  try {
+    legacy.exec(`DROP TABLE account_slots;
+      CREATE UNIQUE INDEX one_account_slot_holder ON turns(slot_held) WHERE slot_held = 1;`);
+    const holder = legacy.query("SELECT turn_ref FROM turns WHERE slot_held = 1").get() as { turn_ref: string };
+    expect(holder.turn_ref).toBe("turn-a");
+  } finally {
+    legacy.close();
+  }
+
+  const restarted = open(path, "broker-legacy-account-slot");
+  try {
+    expect(restarted.getTurn("turn-a")?.state).toBe("UNRECONCILED");
+    expect(restarted.getAccountSlotHolders()).toEqual([{ slotId: 1, turnRef: "turn-a" }]);
+    expect(restarted.getActiveAccountSlotCount()).toBe(1);
+
+    const inspect = new Database(path, { strict: true });
+    try {
+      expect(inspect.query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'one_account_slot_holder'").get()).toBeNull();
+      expect(inspect.query("SELECT turn_ref FROM account_slots WHERE slot_id = 1").get()).toEqual({ turn_ref: "turn-a" });
+      expect(inspect.query("SELECT turn_ref FROM account_slots WHERE slot_id = 2").get()).toEqual({ turn_ref: null });
+    } finally {
+      inspect.close();
+    }
   } finally {
     restarted.close();
   }
@@ -737,13 +903,11 @@ test("restart retires a legacy abandoned epoch that was still marked current", (
   bindConversation(broker);
   broker.markUnreconciled("turn-a", "legacy_abandoned_current_epoch");
   broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
-  broker.abandonUnreconciled("turn-a");
   broker.close();
 
-  // Recreate the exact durable shape written by the pre-fix checkpoint: the turn is already
-  // abandoned, but its remote epoch was accidentally left current. Broker open must repair it.
   const legacy = new Database(path, { strict: true });
   try {
+    legacy.query("UPDATE turns SET abandoned_at = 1 WHERE turn_ref = 'turn-a'").run();
     legacy.query("UPDATE remote_epochs SET is_current = 1 WHERE goose_session_id = 'goose-a' AND epoch = 1").run();
   } finally {
     legacy.close();
@@ -756,6 +920,39 @@ test("restart retires a legacy abandoned epoch that was still marked current", (
     expect(restarted.createEpoch({ gooseSessionId: "goose-a" }).epoch).toBe(2);
   } finally {
     restarted.close();
+  }
+});
+
+test("two independent sessions fill the bounded slots and FIFO refills only the freed slot", () => {
+  const { broker } = fixture();
+  try {
+    for (const session of ["goose-a", "goose-b", "goose-c", "goose-d"]) createSession(broker, session);
+    enqueue(broker, "goose-a", "turn-a", "req-a");
+    enqueue(broker, "goose-b", "turn-b", "req-b");
+    enqueue(broker, "goose-c", "turn-c", "req-c");
+    enqueue(broker, "goose-d", "turn-d", "req-d");
+
+    expect(broker.admitNext("turn-a")?.turn.turnRef).toBe("turn-a");
+    expect(broker.admitNext("turn-b")?.turn.turnRef).toBe("turn-b");
+    expect(broker.getActiveAccountSlotCount()).toBe(2);
+    expect(broker.admitNext("turn-d")).toBeNull();
+
+    broker.cancelBeforeSend("turn-a");
+    expect(broker.getAccountSlotHolders()).toEqual([{ slotId: 2, turnRef: "turn-b" }]);
+    expect(broker.admitNext("turn-d")?.turn.turnRef).toBe("turn-c");
+    expect(broker.getAccountSlotHolders()).toEqual([
+      { slotId: 1, turnRef: "turn-c" },
+      { slotId: 2, turnRef: "turn-b" },
+    ]);
+
+    broker.cancelBeforeSend("turn-b");
+    expect(broker.admitNext("turn-d")?.turn.turnRef).toBe("turn-d");
+    expect(broker.getAccountSlotHolders()).toEqual([
+      { slotId: 1, turnRef: "turn-c" },
+      { slotId: 2, turnRef: "turn-d" },
+    ]);
+  } finally {
+    broker.close();
   }
 });
 
@@ -795,6 +992,46 @@ test("accepted final digest is durable before completion and blocks positive-ter
     expect(restarted.getTurn("turn-a")?.state).toBe("UNRECONCILED");
     expect(() => restarted.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal)).toThrow(SessionBrokerError);
     expect(restarted.getAccountSlotHolder()).toBe("turn-a");
+  } finally {
+    restarted.close();
+  }
+});
+
+test("accepted final recovery verifies the same remote pair without resuming it as running", () => {
+  const { broker, path } = fixture();
+  createSession(broker);
+  enqueue(broker);
+  broker.admitNext();
+  accept(broker);
+  bindConversation(broker);
+  broker.recordFinalDigest("turn-a", "digest-a");
+  broker.close();
+
+  const restarted = open(path, "broker-b");
+  try {
+    expect(restarted.getTurn("turn-a")?.state).toBe("UNRECONCILED");
+    expect(() => restarted.verifyFinalRecoveryRemoteTurn({
+      turnRef: "turn-a",
+      canonicalConversationId: "wrong-conversation",
+      acceptedUserTurnId: "user-turn-a",
+      remoteIdentityVerified: true,
+    })).toThrow(SessionBrokerError);
+    const verified = restarted.verifyFinalRecoveryRemoteTurn({
+      turnRef: "turn-a",
+      canonicalConversationId: "conversation-a",
+      acceptedUserTurnId: "user-turn-a",
+      remoteIdentityVerified: true,
+    });
+    expect(verified).toMatchObject({ state: "UNRECONCILED", finalDigest: "digest-a" });
+    expect(restarted.getAccountSlotHolder()).toBe("turn-a");
+    expect(() => restarted.rebindVerifiedRemoteTurn({
+      turnRef: "turn-a",
+      canonicalConversationId: "conversation-a",
+      acceptedUserTurnId: "user-turn-a",
+      remoteIdentityVerified: true,
+    })).toThrow(SessionBrokerError);
+    const claim = restarted.beginCompletion("turn-a");
+    expect(restarted.commitCompletion(claim, completionEvidence(null, "digest-a")).state).toBe("COMPLETE");
   } finally {
     restarted.close();
   }
@@ -975,6 +1212,7 @@ test("positive-terminal release does not hide a missing account-slot invariant",
   broker.close();
 
   const db = new Database(path, { strict: true });
+  db.query("UPDATE account_slots SET turn_ref = NULL WHERE turn_ref = 'turn-a'").run();
   db.query("UPDATE turns SET slot_held = 0 WHERE turn_ref = 'turn-a'").run();
   db.close();
 
@@ -1030,6 +1268,38 @@ test("dead broker owner is safely taken over before restart reconciliation", () 
   db.close();
 
   const restarted = open(path, "broker-b");
+  try {
+    expect(restarted.getCurrentEpoch("goose-a")?.epoch).toBe(1);
+  } finally {
+    restarted.close();
+  }
+});
+
+
+test("legacy broker owner with a genuinely live PID remains fail-closed", () => {
+  const { broker, path } = fixture();
+  createSession(broker);
+  broker.close();
+
+  const db = new Database(path, { strict: true });
+  db.query("UPDATE broker_owner SET owner_id = 'legacy-owner', pid = ? WHERE singleton = 1")
+    .run(process.pid);
+  db.close();
+
+  expect(() => open(path, "broker-against-live-legacy-owner")).toThrow(SessionBrokerError);
+});
+
+test("broker process identity prevents same-PID reuse from looking live", () => {
+  const { broker, path } = fixture();
+  createSession(broker);
+  broker.close();
+
+  const db = new Database(path, { strict: true });
+  db.query("UPDATE broker_owner SET owner_id = 'process-v1|wrong-boot|1|old-owner', pid = ?, updated_at = ? WHERE singleton = 1")
+    .run(process.pid, Date.now());
+  db.close();
+
+  const restarted = open(path, "broker-after-pid-reuse");
   try {
     expect(restarted.getCurrentEpoch("goose-a")?.epoch).toBe(1);
   } finally {
@@ -1122,7 +1392,7 @@ test("checkpoint progress is durable and invalidates an in-flight completion cla
   }
 });
 
-test("SQLite enforces one global account slot and globally unique submit nonce", () => {
+test("SQLite enforces two durable slot identities, unique owners, and globally unique submit nonce", () => {
   const { broker, path } = fixture();
   createSession(broker, "goose-a");
   createSession(broker, "goose-b");
@@ -1133,8 +1403,11 @@ test("SQLite enforces one global account slot and globally unique submit nonce",
   const db = new Database(path, { strict: true });
   try {
     db.exec("PRAGMA foreign_keys = ON");
-    db.query("UPDATE turns SET slot_held = 1 WHERE turn_ref = 'turn-a'").run();
-    expect(() => db.query("UPDATE turns SET slot_held = 1 WHERE turn_ref = 'turn-b'").run()).toThrow();
+    db.query("UPDATE account_slots SET turn_ref = 'turn-a' WHERE slot_id = 1").run();
+    db.query("UPDATE account_slots SET turn_ref = 'turn-b' WHERE slot_id = 2").run();
+    expect(() => db.query("INSERT INTO account_slots(slot_id, turn_ref, updated_at) VALUES (1, NULL, 1)").run()).toThrow();
+    expect(() => db.query("UPDATE account_slots SET turn_ref = 'turn-a' WHERE slot_id = 2").run()).toThrow();
+    expect(() => db.query("INSERT INTO account_slots(slot_id, turn_ref, updated_at) VALUES (3, NULL, 1)").run()).toThrow();
     expect(() => db.query(`INSERT INTO turns(
       turn_ref, goose_session_id, epoch, request_hash, submit_nonce, state, revision, created_at, updated_at
     ) VALUES ('turn-collision', 'goose-b', 1, 'req-collision', 'nonce-turn-a', 'CANCELLED', 0, 1, 1)`).run()).toThrow();
@@ -1421,17 +1694,17 @@ test("boundary-bearing MINTED op stays non-executed until exact running-turn rec
     })).toEqual({ kind: "UNCERTAIN", opRef: initialOpRef, seq: 1 });
     expect(restarted.getOperation(initialOpRef)?.state).toBe("MINTED");
 
-    expect(() => restarted.resumeVerifiedRemoteTurn({
+    expect(() => restarted.rebindVerifiedRemoteTurn({
       turnRef: "turn-a",
       canonicalConversationId: "wrong-conversation",
       acceptedUserTurnId: "user-turn-a",
-      remoteRunning: true,
+      remoteIdentityVerified: true,
     })).toThrow(SessionBrokerError);
-    expect(restarted.resumeVerifiedRemoteTurn({
+    expect(restarted.rebindVerifiedRemoteTurn({
       turnRef: "turn-a",
       canonicalConversationId: "conversation-a",
       acceptedUserTurnId: "user-turn-a",
-      remoteRunning: true,
+      remoteIdentityVerified: true,
     }).state).toBe("TURN_OUTSTANDING");
     expect(restarted.claimOperation({
       turnRef: "turn-a",
@@ -1473,7 +1746,36 @@ test("an older request fingerprint may become a new logical turn after interveni
   }
 });
 
-test("verified running-turn recovery enforces runtime running evidence and identity on idempotent calls", () => {
+test("verified rebind may bind one missing post-send accepted-user identity without replacing it later", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    broker.admitNext();
+    broker.markSendActivated("turn-a");
+    bindConversation(broker);
+    broker.markUnreconciled("turn-a", "browser_lost_before_local_acceptance_binding");
+    expect(broker.getTurn("turn-a")).toMatchObject({ state: "UNRECONCILED", acceptedUserTurnId: null });
+
+    const rebound = broker.rebindVerifiedRemoteTurn({
+      turnRef: "turn-a",
+      canonicalConversationId: "conversation-a",
+      acceptedUserTurnId: "user-recovered",
+      remoteIdentityVerified: true,
+    });
+    expect(rebound).toMatchObject({ state: "TURN_OUTSTANDING", acceptedUserTurnId: "user-recovered" });
+    expect(() => broker.rebindVerifiedRemoteTurn({
+      turnRef: "turn-a",
+      canonicalConversationId: "conversation-a",
+      acceptedUserTurnId: "user-different",
+      remoteIdentityVerified: true,
+    })).toThrow(SessionBrokerError);
+  } finally {
+    broker.close();
+  }
+});
+
+test("verified persistent-pair rebind enforces remote identity and remains idempotent", () => {
   const { broker } = fixture();
   try {
     createSession(broker);
@@ -1483,25 +1785,25 @@ test("verified running-turn recovery enforces runtime running evidence and ident
     bindConversation(broker);
     broker.markUnreconciled("turn-a", "transport_lost");
 
-    expect(() => broker.resumeVerifiedRemoteTurn({
+    expect(() => broker.rebindVerifiedRemoteTurn({
       turnRef: "turn-a",
       canonicalConversationId: "conversation-a",
       acceptedUserTurnId: "user-turn-a",
-      remoteRunning: false as true,
+      remoteIdentityVerified: false as true,
     })).toThrow(SessionBrokerError);
 
-    expect(broker.resumeVerifiedRemoteTurn({
+    expect(broker.rebindVerifiedRemoteTurn({
       turnRef: "turn-a",
       canonicalConversationId: "conversation-a",
       acceptedUserTurnId: "user-turn-a",
-      remoteRunning: true,
+      remoteIdentityVerified: true,
     }).state).toBe("TURN_OUTSTANDING");
 
-    expect(() => broker.resumeVerifiedRemoteTurn({
+    expect(() => broker.rebindVerifiedRemoteTurn({
       turnRef: "turn-a",
       canonicalConversationId: "wrong-conversation",
       acceptedUserTurnId: "user-turn-a",
-      remoteRunning: true,
+      remoteIdentityVerified: true,
     })).toThrow(SessionBrokerError);
   } finally {
     broker.close();
@@ -1735,6 +2037,250 @@ test("serial tool work is never pre-rejected by a local conversation-growth budg
       state: "TURN_OUTSTANDING", budgetReservedTokens: null,
       budgetPromptTokens: null, budgetGrowthConsumedTokens: null,
     });
+  } finally {
+    broker.close();
+  }
+});
+
+test("positive-terminal slot quarantine can reacquire capacity and rebind the same persistent pair", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    broker.admitNext();
+    accept(broker);
+    bindConversation(broker);
+    broker.markUnreconciled("turn-a", "qualified_terminal_slot_quarantine");
+
+    broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
+    expect(broker.getAccountSlotHolder()).toBeNull();
+    expect(broker.getCurrentEpoch("goose-a")).toMatchObject({
+      epoch: 1,
+      conversationId: "conversation-a",
+      leaseState: "UNRECONCILED",
+      leaseTurnRef: "turn-a",
+    });
+
+    const reacquired = broker.reacquireReleasedSlotForRebind("turn-a");
+    expect(reacquired).toMatchObject({
+      turnRef: "turn-a",
+      state: "UNRECONCILED",
+      acceptedUserTurnId: "user-turn-a",
+    });
+    expect(broker.getAccountSlotHolder()).toBe("turn-a");
+    expect(broker.rebindVerifiedRemoteTurn({
+      turnRef: "turn-a",
+      canonicalConversationId: "conversation-a",
+      acceptedUserTurnId: "user-turn-a",
+      remoteIdentityVerified: true,
+    }).state).toBe("TURN_OUTSTANDING");
+    expect(broker.hasRecordedPositiveTerminalSlotRelease("turn-a")).toBeFalse();
+    expect(broker.getCurrentEpoch("goose-a")).toMatchObject({
+      epoch: 1,
+      conversationId: "conversation-a",
+      leaseState: "TURN_OUTSTANDING",
+      leaseTurnRef: "turn-a",
+    });
+  } finally {
+    broker.close();
+  }
+});
+
+test("failed pre-rebind attachment can restore the prior positive-terminal slot release", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    broker.admitNext();
+    accept(broker);
+    bindConversation(broker);
+    broker.markUnreconciled("turn-a", "qualified_terminal_slot_quarantine");
+    broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
+
+    expect(broker.reacquireReleasedSlotForRebind("turn-a")?.state).toBe("UNRECONCILED");
+    expect(broker.getAccountSlotHolder()).toBe("turn-a");
+    const restored = broker.restorePositiveTerminalSlotRelease("turn-a");
+    expect(restored).toMatchObject({ state: "UNRECONCILED", acceptedUserTurnId: "user-turn-a" });
+    expect(broker.getAccountSlotHolder()).toBeNull();
+    expect(broker.hasRecordedPositiveTerminalSlotRelease("turn-a")).toBeTrue();
+  } finally {
+    broker.close();
+  }
+});
+
+test("slot-quarantined pair waits when both bounded account slots are occupied", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker, "goose-a");
+    createSession(broker, "goose-b");
+    createSession(broker, "goose-c");
+    enqueue(broker, "goose-a", "turn-a", "req-a");
+    broker.admitNext("turn-a");
+    accept(broker, "turn-a");
+    bindConversation(broker, "goose-a", "conversation-a");
+    broker.markUnreconciled("turn-a", "qualified_terminal_slot_quarantine");
+    broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
+
+    enqueue(broker, "goose-b", "turn-b", "req-b");
+    enqueue(broker, "goose-c", "turn-c", "req-c");
+    expect(broker.admitNext("turn-b")?.turn.turnRef).toBe("turn-b");
+    expect(broker.admitNext("turn-c")?.turn.turnRef).toBe("turn-c");
+    expect(broker.reacquireReleasedSlotForRebind("turn-a")).toBeNull();
+    expect(broker.getCurrentEpoch("goose-a")).toMatchObject({
+      conversationId: "conversation-a", leaseState: "UNRECONCILED", leaseTurnRef: "turn-a",
+    });
+  } finally {
+    broker.close();
+  }
+});
+
+test("positive-terminal slot quarantine survives broker restart and remains rebindable", () => {
+  const { broker, path } = fixture();
+  createSession(broker);
+  enqueue(broker);
+  broker.admitNext();
+  accept(broker);
+  bindConversation(broker);
+  broker.markUnreconciled("turn-a", "qualified_terminal_slot_quarantine");
+  broker.releaseSlotAfterPositiveTerminal("turn-a", positiveTerminal);
+  broker.close();
+
+  const restarted = open(path, "broker-b");
+  try {
+    expect(restarted.getTurn("turn-a")).toMatchObject({
+      state: "UNRECONCILED", acceptedUserTurnId: "user-turn-a",
+    });
+    expect(restarted.getCurrentEpoch("goose-a")).toMatchObject({
+      epoch: 1,
+      conversationId: "conversation-a",
+      leaseState: "UNRECONCILED",
+      leaseTurnRef: "turn-a",
+      isCurrent: true,
+    });
+    expect(restarted.getAccountSlotHolder()).toBeNull();
+    expect(restarted.hasRecordedPositiveTerminalSlotRelease("turn-a")).toBeTrue();
+    expect(restarted.reacquireReleasedSlotForRebind("turn-a")?.state).toBe("UNRECONCILED");
+    expect(restarted.getAccountSlotHolder()).toBe("turn-a");
+  } finally {
+    restarted.close();
+  }
+});
+
+test("isStrictPrefixDigest returns true only for strict prefix hashes", () => {
+  const prefix = "hello world";
+  const full = "hello world!";
+  const prefixDigest = createHash("sha256").update(prefix, "utf8").digest("hex");
+  const fullDigest = createHash("sha256").update(full, "utf8").digest("hex");
+
+  expect(isStrictPrefixDigest(prefixDigest, full)).toBe(true);
+  expect(isStrictPrefixDigest(fullDigest, full)).toBe(false); // equal length, not strict prefix
+  expect(isStrictPrefixDigest(prefixDigest, prefix)).toBe(false); // equal, not strict prefix
+  expect(isStrictPrefixDigest("deadbeef".repeat(8), full)).toBe(false); // wrong digest
+  expect(isStrictPrefixDigest(prefixDigest, "different text")).toBe(false); // not a prefix
+  expect(isStrictPrefixDigest("", full)).toBe(false); // empty stored digest
+  expect(isStrictPrefixDigest(prefixDigest, "")).toBe(false); // empty fresh text
+});
+
+test("isStrictPrefixDigest handles Unicode and surrogate pairs correctly", () => {
+  // Text with emoji (surrogate pair)
+  const prefix = "hello 🌍";
+  const full = "hello 🌍!";
+  const prefixDigest = createHash("sha256").update(prefix, "utf8").digest("hex");
+  const fullDigest = createHash("sha256").update(full, "utf8").digest("hex");
+
+  expect(isStrictPrefixDigest(prefixDigest, full)).toBe(true);
+  expect(isStrictPrefixDigest(fullDigest, full)).toBe(false);
+
+  // Multiple emoji
+  const prefix2 = "🎉🎊";
+  const full2 = "🎉🎊🎈";
+  const prefixDigest2 = createHash("sha256").update(prefix2, "utf8").digest("hex");
+  const fullDigest2 = createHash("sha256").update(full2, "utf8").digest("hex");
+
+  expect(isStrictPrefixDigest(prefixDigest2, full2)).toBe(true);
+  expect(isStrictPrefixDigest(fullDigest2, full2)).toBe(false);
+
+  // A digest made from a string cut through the emoji surrogate pair must never match.
+  const splitFull = "hello 🌍!";
+  const splitPrefix = splitFull.slice(0, "hello ".length + 1);
+  expect(splitPrefix.length).toBe("hello ".length + 1);
+  const splitDigest = createHash("sha256").update(splitPrefix, "utf8").digest("hex");
+  expect(isStrictPrefixDigest(splitDigest, splitFull)).toBe(false);
+});
+
+test("recordFinalDigestRecovery replaces digest only under strict recovery conditions", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    broker.admitNext();
+    accept(broker);
+    bindConversation(broker);
+    const initialDigest = createHash("sha256").update("initial", "utf8").digest("hex");
+    broker.recordFinalDigest("turn-a", initialDigest);
+    broker.markUnreconciled("turn-a", "browser_crash");
+
+    // Wrong state (TURN_OUTSTANDING) should fail - create a separate turn in TURN_OUTSTANDING
+    broker.createEpoch({ gooseSessionId: "goose-b" });
+    const turn2 = broker.enqueueTurn({ gooseSessionId: "goose-b", requestHash: "req-b" });
+    broker.admitNext(turn2.turnRef);
+    broker.markSendActivated(turn2.turnRef);
+    broker.recordFinalDigest(turn2.turnRef, initialDigest);
+    expect(() => broker.recordFinalDigestRecovery(turn2.turnRef, initialDigest, "new-digest"))
+      .toThrow(SessionBrokerError);
+
+    // Completion claim in flight should fail
+    broker.recordFinalDigest("turn-a", initialDigest); // re-acknowledge
+    broker.beginCompletion("turn-a");
+    expect(() => broker.recordFinalDigestRecovery("turn-a", initialDigest, "new-digest"))
+      .toThrow(SessionBrokerError);
+
+    // Clear completion claim (simulate restart or invalidation)
+    broker.recordProgress("turn-a");
+
+    // Wrong expected digest should fail
+    expect(() => broker.recordFinalDigestRecovery("turn-a", "wrong-digest", "new-digest"))
+      .toThrow(SessionBrokerError);
+
+    // Same digest should fail
+    expect(() => broker.recordFinalDigestRecovery("turn-a", initialDigest, initialDigest))
+      .toThrow(SessionBrokerError);
+
+    // Empty replacement should fail
+    expect(() => broker.recordFinalDigestRecovery("turn-a", initialDigest, ""))
+      .toThrow(SessionBrokerError);
+
+    // Valid recovery should succeed
+    const newDigest = createHash("sha256").update("initial!", "utf8").digest("hex");
+    const recovered = broker.recordFinalDigestRecovery("turn-a", initialDigest, newDigest);
+    expect(recovered.finalDigest).toBe(newDigest);
+    expect(recovered.revision).toBeGreaterThan(0);
+    expect(recovered.completionClaimRevision).toBeNull();
+  } finally {
+    broker.close();
+  }
+});
+
+test("recordFinalDigestRecovery requires UNRECONCILED state and held slot", () => {
+  const { broker } = fixture();
+  try {
+    createSession(broker);
+    enqueue(broker);
+    broker.admitNext();
+    accept(broker);
+    bindConversation(broker);
+    const digest = createHash("sha256").update("final", "utf8").digest("hex");
+    broker.recordFinalDigest("turn-a", digest);
+    broker.markUnreconciled("turn-a", "test");
+
+    // Should work in UNRECONCILED with slot held
+    const newDigest = createHash("sha256").update("final!", "utf8").digest("hex");
+    const recovered = broker.recordFinalDigestRecovery("turn-a", digest, newDigest);
+    expect(recovered.finalDigest).toBe(newDigest);
+
+    // After recovery, turn is still UNRECONCILED with slot held
+    expect(broker.getTurn("turn-a")?.state).toBe("UNRECONCILED");
+    expect(broker.getAccountSlotHolder()).toBe("turn-a");
   } finally {
     broker.close();
   }

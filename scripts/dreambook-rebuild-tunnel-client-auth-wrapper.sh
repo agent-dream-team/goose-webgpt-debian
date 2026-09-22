@@ -56,6 +56,12 @@ if [[ ${#CGW_REBUILD_CONNECTOR_AUTHORIZATION} -lt 32 \
 fi
 export CGW_REBUILD_CONNECTOR_AUTHORIZATION
 
+if [[ "${1:-}" == "runtimes" && "${2:-}" == "connect" ]]; then
+  export MCP_EXTRA_HEADERS='Authorization: env:CGW_REBUILD_CONNECTOR_AUTHORIZATION'
+  export MCP_DISCOVERY_EXTRA_HEADERS='Authorization: env:CGW_REBUILD_CONNECTOR_AUTHORIZATION'
+  exec "$REAL" "$@"
+fi
+
 exec "$REAL" "$@" \
   --mcp.extra-headers 'Authorization: env:CGW_REBUILD_CONNECTOR_AUTHORIZATION' \
   --mcp.discovery-extra-headers 'Authorization: env:CGW_REBUILD_CONNECTOR_AUTHORIZATION'

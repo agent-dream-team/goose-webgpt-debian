@@ -52,7 +52,6 @@ export interface SetupOptions {
   refreshAccountCapabilities?: boolean;
   forceLogin?: boolean;
   autoApproveToolCalls?: boolean;
-  experimentalBiggerContext?: boolean;
   zeroRiskProEnabled?: boolean;
   replaceCodexRoute?: boolean;
   restartService?: boolean;
@@ -143,7 +142,6 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     headed: before.headed,
     solAvailable: before.solAvailable,
     proAvailable: before.proAvailable,
-    experimentalBiggerContext: before.experimentalBiggerContext,
     zeroRiskProEnabled: before.zeroRiskProEnabled,
     autoApproveToolCalls: before.autoApproveToolCalls,
     controlToken: before.controlToken,
@@ -172,7 +170,6 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     headed: after.headed,
     solAvailable: after.solAvailable,
     proAvailable: after.proAvailable,
-    experimentalBiggerContext: after.experimentalBiggerContext,
     zeroRiskProEnabled: after.zeroRiskProEnabled,
     autoApproveToolCalls: after.autoApproveToolCalls,
     controlToken: after.controlToken,
@@ -268,9 +265,6 @@ function baseConfig(
     delete config.browserHostDescriptorPath;
   }
   if (options.autoApproveToolCalls !== undefined) config.autoApproveToolCalls = options.autoApproveToolCalls;
-  if (options.experimentalBiggerContext !== undefined) {
-    config.experimentalBiggerContext = options.experimentalBiggerContext;
-  }
   if (options.zeroRiskProEnabled !== undefined) {
     if (config.browserInteractionMode !== "manual") {
       throw new Error("Zero Risk Pro can be configured only with --zero-risk-browser-interaction");
@@ -284,16 +278,12 @@ function baseConfig(
     if (options.forceLogin) {
       throw new Error("Zero Risk uses the launcher's existing ChatGPT session; --login is unavailable");
     }
-    if (options.experimentalBiggerContext === true) {
-      throw new Error("Zero Risk does not support Bigger Context");
-    }
     if (config.mode !== "full") {
       throw new Error("Zero Risk requires --full so Codex Zero Risk can signal start, tools, and completion");
     }
     if (config.browserHost !== "launcher") {
       throw new Error("Zero Risk requires the Launcher; pass --browser-host-descriptor from the running Launcher");
     }
-    config.experimentalBiggerContext = false;
   }
   if (options.acknowledgedUnofficial) config.acknowledgedUnofficialAt = new Date().toISOString();
   if (!config.acknowledgedUnofficialAt) {

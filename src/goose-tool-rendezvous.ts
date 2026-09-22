@@ -72,6 +72,7 @@ interface AwaitingContinuation {
   toolNames: ReadonlySet<string>;
   result: Deferred<GooseToolContinuationCandidate>;
   candidateCreated: boolean;
+  pendingStage?: StageState;
 }
 
 export function advertisedGooseToolNames(body: unknown): ReadonlySet<string> {
@@ -188,6 +189,33 @@ export class GooseToolRendezvous {
     return result.promise;
   }
 
+  /** Retire process-local stage authority after the broker has durably made the tool result uncertain. */
+  quarantineTurn(turnRef: string, reason: string): boolean {
+    if (!reason) throw new GooseToolRendezvousError("TURN_UNCERTAIN", "Tool quarantine requires a reason");
+    const alreadyQuarantined = this.quarantinedTurns.has(turnRef);
+    this.quarantinedTurns.add(turnRef);
+    const error = new GooseToolRendezvousError("TURN_UNCERTAIN", reason);
+    const current = this.currentStages.get(turnRef);
+    if (current) {
+      this.currentStages.delete(turnRef);
+      current.lifecycle = "released";
+      current.directive.reject(error);
+      void current.directive.promise.catch(() => {});
+    }
+    const awaiting = this.awaitingContinuations.get(turnRef);
+    if (awaiting) {
+      this.awaitingContinuations.delete(turnRef);
+      awaiting.result.reject(error);
+      void awaiting.result.promise.catch(() => {});
+      if (awaiting.pendingStage?.lifecycle === "pending") {
+        awaiting.pendingStage.lifecycle = "released";
+        awaiting.pendingStage.directive.reject(error);
+        void awaiting.pendingStage.directive.promise.catch(() => {});
+      }
+    }
+    return !alreadyQuarantined;
+  }
+
   private acceptContinuation(
     turnRef: string,
     body: unknown,
@@ -216,6 +244,7 @@ export class GooseToolRendezvous {
 
     awaiting.candidateCreated = true;
     const pending = this.makeStage(turnRef, decision.checkpoint, advertisedGooseToolNames(body), "pending");
+    awaiting.pendingStage = pending;
     const checkpointJson = encodeGooseResponsesProjectionCheckpoint(decision.checkpoint);
     const candidate: GooseToolContinuationCandidate = {
       output: decision.output,

@@ -142,13 +142,38 @@ function projection(text: string): RebuildAnswerProjection {
 
 function makeInput(options: {
   existingConversationId?: string | null;
+  resumeAccepted?: RebuildPersistentBrowserTurnInput["resumeAccepted"];
+  resumePendingAcceptance?: RebuildPersistentBrowserTurnInput["resumePendingAcceptance"];
   prompt?: string;
   toolInFlight?: () => boolean;
+  gooseWork?: RebuildPersistentBrowserTurnInput["gooseWork"];
   onSendActivated?: () => void;
   onAccepted?: (conversationId: string, userTurnId: string) => void;
+  onRebound?: (conversationId: string, userTurnId: string) => void;
   abortController?: AbortController;
 } = {}): RebuildPersistentBrowserTurnInput {
   const controller = options.abortController ?? new AbortController();
+  let priorToolState = false;
+  let progressRevision = 0;
+  let lastToolBatchRevision = 0;
+  let lastProgressAt: number | undefined;
+  const gooseWork = options.gooseWork ?? {
+    snapshot: () => {
+      const active = options.toolInFlight?.() ?? false;
+      if (active !== priorToolState) {
+        progressRevision += 1;
+        if (active) lastToolBatchRevision = progressRevision;
+        lastProgressAt = Date.now();
+        priorToolState = active;
+      }
+      return {
+        revision: progressRevision,
+        lastToolBatchRevision,
+        activeToolCalls: active ? 1 : 0,
+        ...(lastProgressAt === undefined ? {} : { lastProgressAt }),
+      };
+    },
+  };
   return {
     turnRef: "turn_browser_driver_test",
     gooseSessionId: "goose-browser-driver",
@@ -157,11 +182,14 @@ function makeInput(options: {
     submitNonce: "submit_browser_driver_1",
     prompt: options.prompt ?? "submit_browser_driver_1:op_browser_driver_1",
     existingConversationId: options.existingConversationId ?? null,
+    ...(options.resumeAccepted ? { resumeAccepted: options.resumeAccepted } : {}),
+    ...(options.resumePendingAcceptance ? { resumePendingAcceptance: options.resumePendingAcceptance } : {}),
     preSendAbortSignal: controller.signal,
-    gooseWork: { isToolWorkInFlight: options.toolInFlight ?? (() => false) },
+    gooseWork,
     lifecycle: {
       onSendActivated: options.onSendActivated ?? (() => {}),
       onAccepted: evidence => options.onAccepted?.(evidence.canonicalConversationId, evidence.acceptedUserTurnId),
+      onRebound: evidence => options.onRebound?.(evidence.canonicalConversationId, evidence.acceptedUserTurnId),
     },
   };
 }
@@ -169,6 +197,7 @@ function makeInput(options: {
 function createHarness(options: {
   surface: FakeSurface;
   captureSnapshot: (page?: Page) => Promise<PersistentChatTurnSnapshot>;
+  correlatedUserTurn?: (page: Page, turnRef: string, submitNonce: string) => Promise<string | undefined>;
   captureAnswer?: (page?: Page) => Promise<RebuildAnswerProjection>;
   prepareFresh?: (page: Page, input: RebuildPersistentBrowserTurnInput) => Promise<void>;
   clearConnectorComposer?: (...args: any[]) => Promise<void>;
@@ -180,6 +209,7 @@ function createHarness(options: {
   timeoutMs?: number;
   staleObservationFirstRefreshMs?: number;
   staleObservationSubsequentRefreshMs?: number;
+  semanticObservationRefreshMs?: number;
   startLease?: {
     surfaceId: string;
     reused: boolean;
@@ -211,6 +241,7 @@ function createHarness(options: {
     postToolAnswerGraceMs: 50,
     staleObservationFirstRefreshMs: options.staleObservationFirstRefreshMs,
     staleObservationSubsequentRefreshMs: options.staleObservationSubsequentRefreshMs,
+    semanticObservationRefreshMs: options.semanticObservationRefreshMs,
     prepareFreshProjectChat: options.prepareFresh ?? (async () => {}),
     dependencies: {
       notifyTurn: (async (_path: string, activity: any) => {
@@ -229,6 +260,7 @@ function createHarness(options: {
       }) as any,
       connectSurface: options.connectSurface ?? (async () => connection) as any,
       captureSnapshot: async page => await options.captureSnapshot(page),
+      correlatedUserTurn: options.correlatedUserTurn,
       captureAnswer: async page => options.captureAnswer ? await options.captureAnswer(page) : projection("final answer"),
       verifyAuthenticated: async () => {},
       clearConnectorComposer: options.clearConnectorComposer ?? (async () => {}),
@@ -688,7 +720,7 @@ test("repeated hard refresh preserves the post-tool answer boundary until fresh 
   let connects = 0;
   const harness = createHarness({
     surface: first,
-    staleObservationFirstRefreshMs: 0,
+    staleObservationFirstRefreshMs: 5,
     staleObservationSubsequentRefreshMs: 0,
     connectSurface: async () => connections[connects++]!,
     captureSnapshot: async () => snapshotsAfterSend(() => sent),
@@ -832,7 +864,53 @@ test("pre-acceptance terminal UI does not retire an uncertain accepted send", as
   expect(harness.activities.filter(activity => activity.phase === "end")).toEqual([]);
 });
 
-test("send-activated identity acquisition fails promptly when its browser surface closes", async () => {
+test("retained turn refreshes a lost browser before acceptance binding without resending", async () => {
+  let sends = 0;
+  let sent = false;
+  let firstPostSendObservations = 0;
+  const before: PersistentChatTurnSnapshot = {
+    turnIdentities: ["user-old", "assistant-old"],
+    userIdentities: ["user-old"],
+    assistantIdentities: ["assistant-old"],
+  };
+  const after: PersistentChatTurnSnapshot = {
+    turnIdentities: ["user-old", "assistant-old", "user-1", "assistant-1"],
+    userIdentities: ["user-old", "user-1"],
+    assistantIdentities: ["assistant-old", "assistant-1"],
+  };
+  const first = fakeSurface(() => { sends += 1; sent = true; }, `https://chatgpt.com/c/${CONVERSATION}`);
+  const recovered = fakeSurface(() => { throw new Error("recovered observer must never resend"); });
+  const connections = [browserConnection(first), browserConnection(recovered)];
+  let connects = 0;
+  const harness = createHarness({
+    surface: first,
+    recoveryStartLease: {
+      surfaceId: "r".repeat(32), reused: false, connectorBound: false, surfaceRecreated: true,
+    },
+    connectSurface: async () => connections[connects++]!,
+    captureSnapshot: async page => {
+      if (!sent) return before;
+      if (page === first.page) {
+        firstPostSendObservations += 1;
+        if (firstPostSendObservations === 1) first.setClosed(true);
+        return before;
+      }
+      return after;
+    },
+    captureAnswer: async () => ({ ...projection("recovered before local acceptance"), assistantTurnId: "assistant-1" }),
+  });
+  const execution = harness.driver.createTurn(makeInput({ existingConversationId: CONVERSATION }));
+
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("recovered before local acceptance");
+  expect(candidate.acceptedUserTurnId).toBe("user-1");
+  expect(sends).toBe(1);
+  expect(harness.activities.filter(activity => activity.phase === "start")).toHaveLength(2);
+  expect(recovered.gotos).toEqual([`https://chatgpt.com/c/${CONVERSATION}`]);
+  await execution.confirmFinal(candidate);
+});
+
+test("fresh send without a durable conversation still fails closed if its pre-acceptance browser surface closes", async () => {
   let sent = false;
   let postSendSnapshots = 0;
   let surface!: FakeSurface;
@@ -985,7 +1063,7 @@ test("persistent stale observation may hard-refresh repeatedly and never resend 
   expect(sends).toBe(1);
 });
 
-test("running turn ignores the short refresh threshold and refreshes only at the long watchdog", async () => {
+test("running turn ignores the short settle threshold and refreshes only at the observation watchdog", async () => {
   let sent = false;
   let sends = 0;
   let reopenCalls = 0;
@@ -1019,7 +1097,7 @@ test("running turn ignores the short refresh threshold and refreshes only at the
     reopenBinding: async binding => {
       reopenCalls += 1;
       // With the short threshold incorrectly applied to running turns, refresh happens on the
-      // second stable observation. The long watchdog must leave several observations untouched.
+      // second stable observation. The observation watchdog must leave several observations untouched.
       expect(runningObservations).toBeGreaterThanOrEqual(3);
       return { binding, assistantTurnId: "assistant-1", snapshot: snapshotsAfterSend(() => true) };
     },
@@ -1114,6 +1192,373 @@ test("tool activity clears a stale episode so later staleness starts with refres
   expect(connects).toBe(3);
   expect(reopenCalls).toBe(2);
   await execution.confirmFinal(candidate);
+});
+
+test("pending-acceptance rebind holds answer-boundary capture until remote identity is rebound", async () => {
+  const correlation = deferred<string | undefined>();
+  let reboundCalls = 0;
+  let boundaryResolved = false;
+  const surface = fakeSurface(() => { throw new Error("pending-acceptance rebind must never send"); }, `https://chatgpt.com/c/${CONVERSATION}`);
+  surface.setRunning(false);
+  const snapshot: PersistentChatTurnSnapshot = {
+    turnIdentities: ["user-recovered", "assistant-1"],
+    userIdentities: ["user-recovered"],
+    assistantIdentities: ["assistant-1"],
+  };
+  const harness = createHarness({
+    surface,
+    captureSnapshot: async () => snapshot,
+    correlatedUserTurn: async () => await correlation.promise,
+    captureAnswer: async () => projection("recovered pending acceptance"),
+  });
+  const input = makeInput({
+    existingConversationId: CONVERSATION,
+    resumePendingAcceptance: { canonicalConversationId: CONVERSATION },
+    prompt: "",
+    onSendActivated: () => { throw new Error("pending-acceptance rebind must not arm another send"); },
+    onAccepted: () => { throw new Error("pending-acceptance rebind must not create a replacement accepted turn"); },
+    onRebound: (conversationId, userTurnId) => {
+      expect(conversationId).toBe(CONVERSATION);
+      expect(userTurnId).toBe("user-recovered");
+      reboundCalls += 1;
+    },
+  });
+  const execution = harness.driver.createTurn(input);
+  const runPromise = execution.run();
+  await Bun.sleep(5);
+  const boundaryPromise = execution.captureAnswerBoundary(input.initialOpRef).then(value => {
+    boundaryResolved = true;
+    return value;
+  });
+  await Bun.sleep(5);
+  expect(boundaryResolved).toBeFalse();
+
+  correlation.resolve("user-recovered");
+  const boundary = await boundaryPromise;
+  expect(boundary).toContain("user-recovered");
+  expect(boundary).toContain(input.initialOpRef);
+  expect(reboundCalls).toBe(1);
+
+  await execution.detachExecution?.("pending-acceptance boundary hold test complete");
+  await expect(runPromise).rejects.toThrow("detached");
+});
+
+test("reattach mode proves the same accepted pair and observes final without sending another Goose prompt", async () => {
+  let sends = 0;
+  let acceptedCalls = 0;
+  let reboundCalls = 0;
+  const surface = fakeSurface(() => { sends += 1; }, `https://chatgpt.com/c/${CONVERSATION}`);
+  surface.setRunning(false);
+  const harness = createHarness({
+    surface,
+    captureSnapshot: async () => snapshotsAfterSend(() => true),
+    captureAnswer: async () => projection("reattached final"),
+  });
+  const execution = harness.driver.createTurn(makeInput({
+    existingConversationId: CONVERSATION,
+    resumeAccepted: {
+      canonicalConversationId: CONVERSATION,
+      acceptedUserTurnId: "user-1",
+    },
+    prompt: "",
+    onSendActivated: () => { throw new Error("reattach must not arm another send"); },
+    onAccepted: () => { acceptedCalls += 1; },
+    onRebound: (conversationId, userTurnId) => {
+      expect(conversationId).toBe(CONVERSATION);
+      expect(userTurnId).toBe("user-1");
+      reboundCalls += 1;
+    },
+  }));
+
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("reattached final");
+  expect(sends).toBe(0);
+  expect(acceptedCalls).toBe(0);
+  expect(reboundCalls).toBe(1);
+  expect(surface.reloads).toBe(1);
+  await execution.confirmFinal(candidate);
+});
+
+test("accepted-final reattach refreshes stale stopped views without sending a recovery continuation", async () => {
+  let recoverySends = 0;
+  const first = fakeSurface(
+    () => { recoverySends += 1; },
+    `https://chatgpt.com/c/${CONVERSATION}`,
+  );
+  first.setRunning(false);
+  const refreshedOnce = fakeSurface(
+    () => { recoverySends += 1; },
+    `https://chatgpt.com/c/${CONVERSATION}`,
+  );
+  refreshedOnce.setRunning(false);
+  const refreshedTwice = fakeSurface(
+    () => { recoverySends += 1; },
+    `https://chatgpt.com/c/${CONVERSATION}`,
+  );
+  refreshedTwice.setRunning(false);
+  const connections = [
+    browserConnection(first), browserConnection(refreshedOnce), browserConnection(refreshedTwice),
+  ];
+  let connects = 0;
+  const harness = createHarness({
+    surface: first,
+    staleObservationFirstRefreshMs: 0,
+    staleObservationSubsequentRefreshMs: 0,
+    connectSurface: async () => connections[connects++]!,
+    captureSnapshot: async () => snapshotsAfterSend(() => true),
+    captureAnswer: async page => page === refreshedTwice.page
+      ? projection("existing accepted final")
+      : projection(""),
+    reopenBinding: async binding => ({
+      binding,
+      assistantTurnId: "assistant-1",
+      snapshot: snapshotsAfterSend(() => true),
+    }),
+  });
+  const execution = harness.driver.createTurn(makeInput({
+    existingConversationId: CONVERSATION,
+    resumeAccepted: {
+      canonicalConversationId: CONVERSATION,
+      acceptedUserTurnId: "user-1",
+      finalRecoveryOnly: true,
+    },
+    prompt: "",
+  }));
+
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("existing accepted final");
+  expect(recoverySends).toBe(0);
+  expect(connects).toBe(3);
+});
+
+test("reattached stopped turn refreshes the view then continues privately in the same ChatGPT conversation", async () => {
+  let continuationSends = 0;
+  let continuationAccepted = false;
+  const first = fakeSurface(
+    () => { throw new Error("reattach must never resend the original Goose prompt"); },
+    `https://chatgpt.com/c/${CONVERSATION}`,
+  );
+  first.setRunning(false);
+  const refreshed = fakeSurface(() => {
+    continuationSends += 1;
+    continuationAccepted = true;
+  }, `https://chatgpt.com/c/${CONVERSATION}`);
+  const connections = [browserConnection(first), browserConnection(refreshed)];
+  let connects = 0;
+  const continuedSnapshot: PersistentChatTurnSnapshot = {
+    turnIdentities: ["user-1", "assistant-1", "user-2", "assistant-2"],
+    userIdentities: ["user-1", "user-2"],
+    assistantIdentities: ["assistant-1", "assistant-2"],
+  };
+  const harness = createHarness({
+    surface: first,
+    staleObservationFirstRefreshMs: 0,
+    staleObservationSubsequentRefreshMs: 0,
+    connectSurface: async () => connections[connects++]!,
+    captureSnapshot: async () => continuationAccepted
+      ? continuedSnapshot
+      : snapshotsAfterSend(() => true),
+    captureAnswer: async () => continuationAccepted
+      ? { ...projection("continued after rebind"), assistantTurnId: "assistant-2" }
+      : projection(""),
+    reopenBinding: async binding => ({
+      binding,
+      assistantTurnId: "assistant-1",
+      snapshot: snapshotsAfterSend(() => true),
+    }),
+  });
+  const execution = harness.driver.createTurn(makeInput({
+    existingConversationId: CONVERSATION,
+    resumeAccepted: {
+      canonicalConversationId: CONVERSATION,
+      acceptedUserTurnId: "user-1",
+    },
+    prompt: "",
+  }));
+
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("continued after rebind");
+  expect(continuationSends).toBe(1);
+  expect(connects).toBe(2);
+  expect(refreshed.composerText()).toContain("continue from there");
+});
+
+test("stale-tool observation uses the observation watchdog before refreshing and preserves tool authority", async () => {
+  let sent = false;
+  let originalSends = 0;
+  let progress = { revision: 1, lastToolBatchRevision: 1, activeToolCalls: 1, lastProgressAt: 0 };
+  let staleToolObservations = 0;
+  let refreshedObservations = 0;
+  const first = fakeSurface(() => {
+    sent = true;
+    originalSends += 1;
+    first.setUrl(`https://chatgpt.com/c/${CONVERSATION}`);
+  });
+  const refreshed = fakeSurface(
+    () => { throw new Error("view recovery must not resend or continue while Goose tool work is active"); },
+    `https://chatgpt.com/c/${CONVERSATION}`,
+  );
+  const connections = [browserConnection(first), browserConnection(refreshed)];
+  let connects = 0;
+  const harness = createHarness({
+    surface: first,
+    semanticObservationRefreshMs: 1,
+    staleObservationFirstRefreshMs: 0,
+    staleObservationSubsequentRefreshMs: 20,
+    connectSurface: async () => connections[connects++]!,
+    captureSnapshot: async () => snapshotsAfterSend(() => sent),
+    captureAnswer: async page => {
+      if (page === first.page) {
+        staleToolObservations += 1;
+        await Bun.sleep(5);
+        return projection("tool still pending");
+      }
+      refreshedObservations += 1;
+      if (refreshedObservations < 3) return projection("tool still pending");
+      progress = { ...progress, revision: 2, activeToolCalls: 0, lastProgressAt: Date.now() };
+      return projection("recovered final");
+    },
+    reopenBinding: async binding => {
+      // The zero short threshold must not make stale-tool recovery aggressive.
+      expect(staleToolObservations).toBeGreaterThanOrEqual(3);
+      return { binding, assistantTurnId: "assistant-1", snapshot: snapshotsAfterSend(() => true) };
+    },
+  });
+  const execution = harness.driver.createTurn(makeInput({
+    existingConversationId: CONVERSATION,
+    gooseWork: { snapshot: () => ({ ...progress }) },
+  }));
+
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("recovered final");
+  expect(progress.activeToolCalls).toBe(0);
+  expect(connects).toBe(2);
+  expect(staleToolObservations).toBeGreaterThanOrEqual(3);
+  expect(originalSends).toBe(1);
+  await execution.confirmFinal(candidate);
+});
+
+test("fresh semantic tool progress continues to suppress recovery without treating lease heartbeats as progress", async () => {
+  let sent = false;
+  let observations = 0;
+  let active = true;
+  const semanticProgressAt = Date.now();
+  let surface!: FakeSurface;
+  surface = fakeSurface(() => {
+    sent = true;
+    surface.setUrl(`https://chatgpt.com/c/${CONVERSATION}`);
+  });
+  surface.setRunning(true);
+  const harness = createHarness({
+    surface,
+    semanticObservationRefreshMs: 10_000,
+    staleObservationFirstRefreshMs: 0,
+    staleObservationSubsequentRefreshMs: 0,
+    captureSnapshot: async () => snapshotsAfterSend(() => sent),
+    captureAnswer: async () => {
+      observations += 1;
+      if (observations >= 4) {
+        active = false;
+        surface.setRunning(false);
+        return projection("long tool completed");
+      }
+      return { ...projection("waiting for tool"), completionActionVisible: false };
+    },
+  });
+  const execution = harness.driver.createTurn(makeInput({
+    existingConversationId: CONVERSATION,
+    gooseWork: {
+      snapshot: () => active
+        ? { revision: 1, lastToolBatchRevision: 1, activeToolCalls: 1, lastProgressAt: semanticProgressAt }
+        : { revision: 2, lastToolBatchRevision: 1, activeToolCalls: 0, lastProgressAt: semanticProgressAt },
+    },
+  }));
+
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("long tool completed");
+  expect(observations).toBeGreaterThanOrEqual(4);
+  expect(harness.activities.filter(activity => activity.phase === "start")).toHaveLength(1);
+  await execution.confirmFinal(candidate);
+});
+
+test("empty stopped assistant projection refreshes once then continues on the short settle cadence", async () => {
+  let sent = false;
+  let originalSends = 0;
+  let continuationSends = 0;
+  let continuationAccepted = false;
+  let reopenCalls = 0;
+  const first = fakeSurface(() => {
+    sent = true;
+    originalSends += 1;
+    first.setUrl(`https://chatgpt.com/c/${CONVERSATION}`);
+  });
+  const refreshed = fakeSurface(() => {
+    continuationSends += 1;
+    continuationAccepted = true;
+  }, `https://chatgpt.com/c/${CONVERSATION}`);
+  const connections = [browserConnection(first), browserConnection(refreshed)];
+  let connects = 0;
+  const continuedSnapshot: PersistentChatTurnSnapshot = {
+    turnIdentities: ["user-1", "assistant-1", "user-2", "assistant-2"],
+    userIdentities: ["user-1", "user-2"],
+    assistantIdentities: ["assistant-1", "assistant-2"],
+  };
+  const harness = createHarness({
+    surface: first,
+    staleObservationFirstRefreshMs: 5,
+    staleObservationSubsequentRefreshMs: 60_000,
+    connectSurface: async () => connections[connects++]!,
+    captureSnapshot: async () => continuationAccepted
+      ? continuedSnapshot
+      : snapshotsAfterSend(() => sent),
+    captureAnswer: async () => continuationAccepted
+      ? { ...projection("continued after empty stop"), assistantTurnId: "assistant-2" }
+      : projection(""),
+    reopenBinding: async binding => {
+      reopenCalls += 1;
+      return { binding, assistantTurnId: "assistant-1", snapshot: snapshotsAfterSend(() => true) };
+    },
+  });
+  const execution = harness.driver.createTurn(makeInput({ existingConversationId: CONVERSATION }));
+
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("continued after empty stop");
+  expect(originalSends).toBe(1);
+  expect(continuationSends).toBe(1);
+  expect(reopenCalls).toBe(1);
+  expect(connects).toBe(2);
+  expect(refreshed.composerText()).toContain("continue from there");
+});
+
+test("process-local execution detach ends launcher heartbeat ownership without mutating either persistent chat", async () => {
+  let sent = false;
+  const accepted = deferred<void>();
+  let surface!: FakeSurface;
+  surface = fakeSurface(() => {
+    sent = true;
+    surface.setUrl(`https://chatgpt.com/c/${CONVERSATION}`);
+  });
+  surface.setRunning(true);
+  const harness = createHarness({
+    surface,
+    captureSnapshot: async () => snapshotsAfterSend(() => sent),
+    captureAnswer: async () => ({ ...projection("still running"), completionActionVisible: false }),
+  });
+  const execution = harness.driver.createTurn(makeInput({
+    existingConversationId: CONVERSATION,
+    onAccepted: () => accepted.resolve(),
+  }));
+  const running = execution.run();
+  await accepted.promise;
+  const rejection = running.then(
+    () => new Error("browser execution unexpectedly completed"),
+    error => error as Error,
+  );
+
+  await execution.detachExecution?.("transport_lost");
+  expect((await rejection).message).toContain("execution attachment detached");
+  expect(harness.activities.at(-1)).toMatchObject({ phase: "end", status: "failed" });
+  expect(harness.activities.filter(activity => activity.phase === "start")).toHaveLength(1);
 });
 
 test("visible approval fence blocks stale-observation recovery before refresh", async () => {

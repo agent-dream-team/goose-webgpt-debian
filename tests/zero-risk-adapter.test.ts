@@ -83,8 +83,7 @@ function provider(name: string): CodexProviderConfig {
       localToolsEnabled: true,
       solAvailable: false,
       proAvailable: false,
-      experimentalBiggerContext: false,
-    },
+      },
   };
 }
 

@@ -89,6 +89,134 @@ out({ type: "ready", version: 1 });
   return path;
 }
 
+function recoveryControlWorkerFixture(): string {
+  const root = mkdtempSync(join(tmpdir(), "cgw-node-browser-driver-recovery-test-"));
+  ROOTS.push(root);
+  const path = join(root, "worker.mjs");
+  writeFileSync(path, `
+import { createInterface } from "node:readline";
+const out = value => process.stdout.write(JSON.stringify(value) + "\\n");
+const accepted = { canonicalConversationId: ${JSON.stringify(CONVERSATION)}, acceptedUserTurnId: "user-fixture" };
+const final = { ...accepted, text: "recovered fixture final", remoteNonRunning: true };
+let latestProgress;
+createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", line => {
+  const message = JSON.parse(line);
+  if (message.type === "start") return out({ type: "lifecycle", event: "send_activated" });
+  if (message.type === "tool_progress") { latestProgress = message.snapshot; return; }
+  if (message.type === "lifecycle_ack" && message.event === "send_activated") {
+    return out({ type: "lifecycle", event: "accepted", evidence: accepted });
+  }
+  if (message.type === "lifecycle_ack" && message.event === "accepted") {
+    if (!latestProgress || latestProgress.activeToolCalls !== 1 || latestProgress.revision !== 1) {
+      return out({ type: "error", message: "semantic progress snapshot missing" });
+    }
+    return out({ type: "candidate", evidence: final });
+  }
+  if (message.type === "detach_execution") {
+    out({ type: "execution_detached" });
+    return out({ type: "error", message: "process-local execution detached" });
+  }
+  if (message.type === "confirm") {
+    out({ type: "confirmed", evidence: final });
+    return setImmediate(() => process.exit(0));
+  }
+});
+out({ type: "ready", version: 1 });
+`, { mode: 0o600 });
+  return path;
+}
+
+function rebindWorkerFixture(finalRecoveryOnly = false): string {
+  const root = mkdtempSync(join(tmpdir(), "cgw-node-browser-driver-rebind-test-"));
+  ROOTS.push(root);
+  const path = join(root, "worker.mjs");
+  writeFileSync(path, `
+import { createInterface } from "node:readline";
+const out = value => process.stdout.write(JSON.stringify(value) + "\\n");
+const accepted = { canonicalConversationId: ${JSON.stringify(CONVERSATION)}, acceptedUserTurnId: "user-fixture" };
+const final = { ...accepted, text: "rebound fixture final", remoteNonRunning: true };
+createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", line => {
+  const message = JSON.parse(line);
+  if (message.type === "start") {
+    if (message.input.prompt !== "" || message.input.existingConversationId !== accepted.canonicalConversationId
+      || message.input.resumeAccepted?.canonicalConversationId !== accepted.canonicalConversationId
+      || message.input.resumeAccepted?.acceptedUserTurnId !== accepted.acceptedUserTurnId
+      || (message.input.resumeAccepted?.finalRecoveryOnly === true) !== ${JSON.stringify(finalRecoveryOnly)}) {
+      return out({ type: "error", message: "rebind start contract missing" });
+    }
+    return out({ type: "lifecycle", event: "rebound", evidence: accepted });
+  }
+  if (message.type === "lifecycle_ack" && message.event === "rebound") {
+    if (!message.ok) return out({ type: "error", message: message.message || "rebind rejected" });
+    return out({ type: "candidate", evidence: final });
+  }
+  if (message.type === "confirm") {
+    out({ type: "confirmed", evidence: final });
+    return setImmediate(() => process.exit(0));
+  }
+});
+out({ type: "ready", version: 1 });
+`, { mode: 0o600 });
+  return path;
+}
+
+function pendingAcceptanceWorkerFixture(): string {
+  const root = mkdtempSync(join(tmpdir(), "cgw-node-browser-driver-pending-rebind-test-"));
+  ROOTS.push(root);
+  const path = join(root, "worker.mjs");
+  writeFileSync(path, `
+import { createInterface } from "node:readline";
+const out = value => process.stdout.write(JSON.stringify(value) + "\\n");
+const accepted = { canonicalConversationId: ${JSON.stringify(CONVERSATION)}, acceptedUserTurnId: "user-recovered-pending" };
+const final = { ...accepted, text: "pending rebound fixture final", remoteNonRunning: true };
+createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", line => {
+  const message = JSON.parse(line);
+  if (message.type === "start") {
+    if (message.input.prompt !== "" || message.input.existingConversationId !== accepted.canonicalConversationId
+      || message.input.resumeAccepted !== undefined
+      || message.input.resumePendingAcceptance?.canonicalConversationId !== accepted.canonicalConversationId) {
+      return out({ type: "error", message: "pending rebind start contract missing" });
+    }
+    return out({ type: "lifecycle", event: "rebound", evidence: accepted });
+  }
+  if (message.type === "lifecycle_ack" && message.event === "rebound") {
+    if (!message.ok) return out({ type: "error", message: message.message || "pending rebind rejected" });
+    return out({ type: "candidate", evidence: final });
+  }
+  if (message.type === "confirm") {
+    out({ type: "confirmed", evidence: final });
+    return setImmediate(() => process.exit(0));
+  }
+});
+out({ type: "ready", version: 1 });
+`, { mode: 0o600 });
+  return path;
+}
+
+function executionDetachWorkerFixture(): string {
+  const root = mkdtempSync(join(tmpdir(), "cgw-node-browser-driver-detach-test-"));
+  ROOTS.push(root);
+  const path = join(root, "worker.mjs");
+  writeFileSync(path, `
+import { createInterface } from "node:readline";
+const out = value => process.stdout.write(JSON.stringify(value) + "\\n");
+const accepted = { canonicalConversationId: ${JSON.stringify(CONVERSATION)}, acceptedUserTurnId: "user-fixture" };
+createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", line => {
+  const message = JSON.parse(line);
+  if (message.type === "start") return out({ type: "lifecycle", event: "send_activated" });
+  if (message.type === "lifecycle_ack" && message.event === "send_activated") {
+    return out({ type: "lifecycle", event: "accepted", evidence: accepted });
+  }
+  if (message.type === "detach_execution") {
+    out({ type: "execution_detached" });
+    return out({ type: "error", message: "process-local execution detached" });
+  }
+});
+out({ type: "ready", version: 1 });
+`, { mode: 0o600 });
+  return path;
+}
+
 function turnInput(overrides: Partial<RebuildPersistentBrowserTurnInput> = {}): RebuildPersistentBrowserTurnInput {
   return {
     turnRef: "turn-fixture",
@@ -99,7 +227,9 @@ function turnInput(overrides: Partial<RebuildPersistentBrowserTurnInput> = {}): 
     prompt: "private prompt sentinel",
     existingConversationId: null,
     preSendAbortSignal: new AbortController().signal,
-    gooseWork: { isToolWorkInFlight: () => false },
+    gooseWork: {
+      snapshot: () => ({ revision: 0, lastToolBatchRevision: 0, activeToolCalls: 0 }),
+    },
     lifecycle: {
       onSendActivated: () => {},
       onAccepted: () => {},
@@ -177,4 +307,93 @@ test("boundary refusal rejects only that request while the browser turn remains 
   const candidate = await running;
   expect(candidate.text).toBe("fixture final");
   expect(await execution.confirmFinal(candidate)).toEqual(candidate);
+});
+
+test("worker receives semantic progress snapshots without acquiring tool-retirement authority", async () => {
+  const progress = { revision: 1, lastToolBatchRevision: 1, activeToolCalls: 1, lastProgressAt: 1 };
+  const execution = driver(recoveryControlWorkerFixture()).createTurn(turnInput({
+    gooseWork: { snapshot: () => ({ ...progress }) },
+  }));
+
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("recovered fixture final");
+  expect(await execution.confirmFinal(candidate)).toEqual(candidate);
+});
+
+test("node worker rebind passes the persisted pair and acknowledges rebound without send or acceptance", async () => {
+  const events: string[] = [];
+  const execution = driver(rebindWorkerFixture()).createTurn(turnInput({
+    prompt: "",
+    existingConversationId: CONVERSATION,
+    resumeAccepted: {
+      canonicalConversationId: CONVERSATION,
+      acceptedUserTurnId: "user-fixture",
+    },
+    lifecycle: {
+      onSendActivated: () => { throw new Error("rebind must not send"); },
+      onAccepted: () => { throw new Error("rebind must not create a replacement accepted turn"); },
+      onRebound: evidence => { events.push(`rebound:${evidence.acceptedUserTurnId}`); },
+    },
+  }));
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("rebound fixture final");
+  expect(events).toEqual(["rebound:user-fixture"]);
+  expect(await execution.confirmFinal(candidate)).toEqual(candidate);
+});
+
+test("node worker preserves final-recovery-only rebind authority across the process boundary", async () => {
+  const events: string[] = [];
+  const execution = driver(rebindWorkerFixture(true)).createTurn(turnInput({
+    prompt: "",
+    existingConversationId: CONVERSATION,
+    resumeAccepted: {
+      canonicalConversationId: CONVERSATION,
+      acceptedUserTurnId: "user-fixture",
+      finalRecoveryOnly: true,
+    },
+    lifecycle: {
+      onSendActivated: () => { throw new Error("final recovery must not send"); },
+      onAccepted: () => { throw new Error("final recovery must not replace the accepted turn"); },
+      onRebound: evidence => { events.push(`rebound:${evidence.acceptedUserTurnId}`); },
+    },
+  }));
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("rebound fixture final");
+  expect(events).toEqual(["rebound:user-fixture"]);
+  expect(await execution.confirmFinal(candidate)).toEqual(candidate);
+});
+
+test("node worker preserves pending-acceptance rebind authority across the process boundary", async () => {
+  const events: string[] = [];
+  const execution = driver(pendingAcceptanceWorkerFixture()).createTurn(turnInput({
+    prompt: "",
+    existingConversationId: CONVERSATION,
+    resumePendingAcceptance: { canonicalConversationId: CONVERSATION },
+    lifecycle: {
+      onSendActivated: () => { throw new Error("pending rebind must not send"); },
+      onAccepted: () => { throw new Error("pending rebind must not create a replacement accepted turn"); },
+      onRebound: evidence => { events.push(`rebound:${evidence.acceptedUserTurnId}`); },
+    },
+  }));
+  const candidate = await execution.run();
+  expect(candidate.text).toBe("pending rebound fixture final");
+  expect(events).toEqual(["rebound:user-recovered-pending"]);
+  expect(await execution.confirmFinal(candidate)).toEqual(candidate);
+});
+
+test("process-local execution detach is acknowledged before worker cleanup", async () => {
+  let resolveAccepted!: () => void;
+  const accepted = new Promise<void>(resolve => { resolveAccepted = resolve; });
+  const execution = driver(executionDetachWorkerFixture()).createTurn(turnInput({
+    lifecycle: { onSendActivated: () => {}, onAccepted: () => resolveAccepted() },
+  }));
+  const running = execution.run();
+  await accepted;
+  const rejection = running.then(
+    () => new Error("browser execution unexpectedly completed"),
+    error => error as Error,
+  );
+
+  await execution.detachExecution?.("transport_lost");
+  expect((await rejection).message).toContain("process-local browser execution detached");
 });

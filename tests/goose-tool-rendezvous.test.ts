@@ -154,6 +154,48 @@ describe("GooseToolRendezvous", () => {
     expect(() => rendezvous.openStage({ turnRef: "turn-a", body: next })).toThrow(GooseToolRendezvousError);
   });
 
+  test("stalled claimed work quarantines once and rejects a late continuation without redispatch", async () => {
+    const initial = initialBody();
+    const { rendezvous } = fixture(initial);
+    const stage = rendezvous.openStage({ turnRef: "turn-a", body: initial });
+    const result = rendezvous.dispatchTool({
+      turnRef: "turn-a", opRef: "op-1", toolName: "tree", arguments: { path: "." },
+    });
+    await stage.waitForDirective();
+
+    expect(rendezvous.quarantineTurn("turn-a", "semantic progress stalled")).toBeTrue();
+    expect(rendezvous.quarantineTurn("turn-a", "semantic progress stalled")).toBeFalse();
+    await expect(result).rejects.toMatchObject({ code: "TURN_UNCERTAIN" });
+
+    const late = continuationBody(initial, "op-1", "tree", { path: "." }, "late-result");
+    expect(() => rendezvous.openStage({ turnRef: "turn-a", body: late }))
+      .toThrow(expect.objectContaining({ code: "TURN_UNCERTAIN" }));
+    await expect(rendezvous.dispatchTool({
+      turnRef: "turn-a", opRef: "op-1", toolName: "tree", arguments: { path: "." },
+    })).rejects.toMatchObject({ code: "TURN_UNCERTAIN" });
+  });
+
+  test("quarantine wins a continuation race before commit and retires the pending next stage", async () => {
+    const initial = initialBody();
+    const { rendezvous } = fixture(initial);
+    const stage = rendezvous.openStage({ turnRef: "turn-a", body: initial });
+    const result = rendezvous.dispatchTool({
+      turnRef: "turn-a", opRef: "op-1", toolName: "tree", arguments: { path: "." },
+    });
+    await stage.waitForDirective();
+    const pending = rendezvous.openStage({
+      turnRef: "turn-a",
+      body: continuationBody(initial, "op-1", "tree", { path: "." }, "late-result"),
+    });
+    const candidate = await result;
+
+    expect(rendezvous.quarantineTurn("turn-a", "owner terminated")).toBeTrue();
+    candidate.commit();
+    await expect(pending.waitForDirective()).rejects.toMatchObject({ code: "TURN_UNCERTAIN" });
+    expect(() => rendezvous.openStage({ turnRef: "turn-a", body: initial }))
+      .toThrow(expect.objectContaining({ code: "TURN_UNCERTAIN" }));
+  });
+
   test("released current stage cannot be replaced by stale history after durable progress advances", async () => {
     const { rendezvous, commit } = fixture();
     const initial = initialBody();

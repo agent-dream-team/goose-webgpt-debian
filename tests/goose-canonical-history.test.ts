@@ -114,7 +114,8 @@ test("seed prompt resolves tool output from durable sanitized authority and neve
   expect(prompt).toContain('"op_ref":"op_current"');
   expect(prompt).toContain('"connector_identity":"Goose Native 2nd Shift"');
   expect(prompt).toContain('"available_tool_names":["tree","shell"]');
-  expect(prompt).toContain("use a tool_name exactly as listed in available_tool_names");
+  expect(prompt).toContain("a tool_name from available_tool_names");
+  expect(prompt).toContain("wait about 50–55 seconds before checking once; never tight-poll");
 });
 
 test("append prompt contains only the classified new suffix and active correlation", () => {

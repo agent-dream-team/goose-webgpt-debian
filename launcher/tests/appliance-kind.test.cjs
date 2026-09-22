@@ -45,7 +45,6 @@ test("inherited Codex mutations are behaviorally rejected for the persistent reb
     "Browser smoke setup",
     "Codex core setup",
     "Codex MCP setup",
-    "Codex Bigger Context setup",
     "Zero Risk setup",
     "Codex integration removal",
   ]) {

@@ -26,10 +26,11 @@ export interface RebuildNodeBrowserDriverOptions {
 type WorkerMessage =
   | { type: "ready"; version: 1 }
   | { type: "lifecycle"; event: "send_activated" }
-  | { type: "lifecycle"; event: "accepted"; evidence: RebuildBrowserAcceptedEvidence }
+  | { type: "lifecycle"; event: "accepted" | "rebound"; evidence: RebuildBrowserAcceptedEvidence }
   | { type: "candidate"; evidence: RebuildBrowserFinalEvidence }
   | { type: "confirmed"; evidence: RebuildBrowserFinalEvidence }
   | { type: "boundary"; requestId: number; boundaryJson?: string; error?: string }
+  | { type: "execution_detached" }
   | { type: "error"; message: string };
 
 interface Deferred<T> {
@@ -75,12 +76,13 @@ export function createRebuildNodeBrowserDriver(
       let runStarted = false;
       let candidate: RebuildBrowserFinalEvidence | undefined;
       let terminal = false;
-      let latestToolState: boolean | undefined;
+      let latestToolProgressRevision = -1;
       let toolTimer: ReturnType<typeof setInterval> | undefined;
       let boundaryRequestId = 0;
       const ready = deferred<void>();
       const runResult = deferred<RebuildBrowserFinalEvidence>();
       const confirmResult = deferred<RebuildBrowserFinalEvidence>();
+      const executionDetachResult = deferred<void>();
       const boundaries = new Map<number, Deferred<string>>();
       let messageChain = Promise.resolve();
       let stderrTail = "";
@@ -91,6 +93,7 @@ export function createRebuildNodeBrowserDriver(
         ready.reject(error);
         runResult.reject(error);
         confirmResult.reject(error);
+        executionDetachResult.reject(error);
         for (const pending of boundaries.values()) pending.reject(error);
         boundaries.clear();
         if (toolTimer) clearInterval(toolTimer);
@@ -127,7 +130,11 @@ export function createRebuildNodeBrowserDriver(
       const handleLifecycle = async (message: Extract<WorkerMessage, { type: "lifecycle" }>) => {
         try {
           if (message.event === "send_activated") await input.lifecycle.onSendActivated();
-          else await input.lifecycle.onAccepted(message.evidence);
+          else if (message.event === "accepted") await input.lifecycle.onAccepted(message.evidence);
+          else {
+            if (!input.lifecycle.onRebound) throw new Error("Node browser rebind has no parent lifecycle handler");
+            await input.lifecycle.onRebound(message.evidence);
+          }
           await send({ type: "lifecycle_ack", event: message.event, ok: true });
         } catch (error) {
           // A parent durability refusal is already authoritative for this turn. Do not send a
@@ -172,6 +179,22 @@ export function createRebuildNodeBrowserDriver(
             throw new Error("Node browser worker returned an invalid boundary response");
           }
           pending.resolve(message.boundaryJson);
+          return;
+        }
+        if (message.type === "execution_detached") {
+          executionDetachResult.resolve();
+          if (!terminal) {
+            // The acknowledgement is the terminal fence. Settle parent promises here because
+            // stopping the disposable child may race with its later diagnostic error frame.
+            terminal = true;
+            const error = new Error("process-local browser execution detached");
+            runResult.reject(error);
+            confirmResult.reject(error);
+            for (const pending of boundaries.values()) pending.reject(error);
+            boundaries.clear();
+            if (toolTimer) clearInterval(toolTimer);
+            toolTimer = undefined;
+          }
           return;
         }
         if (message.type === "error") throw new Error(message.message);
@@ -221,16 +244,18 @@ export function createRebuildNodeBrowserDriver(
             submitNonce: input.submitNonce,
             prompt: input.prompt,
             existingConversationId: input.existingConversationId,
+            ...(input.resumeAccepted ? { resumeAccepted: input.resumeAccepted } : {}),
+            ...(input.resumePendingAcceptance ? { resumePendingAcceptance: input.resumePendingAcceptance } : {}),
           },
         });
         const abort = () => { void send({ type: "abort" }).catch(() => {}); };
         input.preSendAbortSignal.addEventListener("abort", abort, { once: true });
         if (input.preSendAbortSignal.aborted) abort();
         const publishToolState = () => {
-          const next = input.gooseWork.isToolWorkInFlight();
-          if (next === latestToolState) return;
-          latestToolState = next;
-          void send({ type: "tool_state", inFlight: next }).catch(fail);
+          const next = input.gooseWork.snapshot();
+          if (next.revision === latestToolProgressRevision) return;
+          latestToolProgressRevision = next.revision;
+          void send({ type: "tool_progress", snapshot: next }).catch(fail);
         };
         publishToolState();
         toolTimer = setInterval(publishToolState, toolStatePollMs);
@@ -238,6 +263,12 @@ export function createRebuildNodeBrowserDriver(
       };
 
       return {
+        detachExecution: async reason => {
+          if (!runStarted) throw new Error("Node browser execution detach requires an active run");
+          await send({ type: "detach_execution", reason });
+          try { await executionDetachResult.promise; }
+          finally { stopWorker(); }
+        },
         run: async () => {
           if (runStarted) throw new Error("Node browser turn run() may be called only once");
           runStarted = true;

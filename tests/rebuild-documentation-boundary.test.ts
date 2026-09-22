@@ -21,20 +21,29 @@ test("persistent-chat lifecycle authority preserves recovery and paired-handoff 
   const followUp = read("docs/persistent-chat-follow-up.md");
 
   expect(agents).toContain("Read `docs/persistent-chat-lifecycle.md`");
+  expect(agents).toContain("Mandatory browser troubleshooting rule");
+  expect(agents).toContain("view failure, not chat failure");
   for (const invariant of [
-    "Persistent provider chats are recovered, not abandoned.",
-    "Refresh is an observation/recovery tool, not a retry loop.",
+    "The server-side ChatGPT conversation is durable.",
+    "The local Goose session is durable too.",
+    "One Goose session and one ChatGPT conversation form a persistent context pair.",
     "GCW continuation prompts are provider-internal recovery artifacts.",
-    "One Goose chat and one ChatGPT provider chat remain context partners until handoff.",
+    "Timers, heartbeats, and semantic-silence watchers may escalate observation only.",
+    "Deliberate handoff is the only normal way to replace the pair.",
     "Provider-chat instructions must promote graceful context rollover.",
-    "Timers, heartbeats, and watchers may trigger observation or escalation only.",
   ]) expect(lifecycle).toContain(invariant);
   expect(lifecycle).toContain("do not click ChatGPT Retry");
-  expect(lifecycle).toContain("fresh ChatGPT conversation and a fresh Goose session");
+  expect(lifecycle).toContain("### Operational recovery classifier");
+  expect(lifecycle).toContain("`RUNNING`");
+  expect(lifecycle).toContain("`STALLED_OR_ERROR`");
+  expect(lifecycle).toContain("`FINAL`");
+  expect(lifecycle).toContain("A partially loaded or stale browser view is not classifiable evidence.");
+  expect(lifecycle).toContain("fresh Goose session and a fresh ChatGPT conversation");
   expect(followUp).toContain("### 1. Paired context handoff");
+  expect(followUp).toContain("`paired_handoff_required`");
   expect(followUp).toContain("### 2. Persistent-chat recovery fault matrix");
-  expect(followUp).toContain("### 6. Reboot reconstruction");
-  expect(followUp).toContain("Do not reboot DreamBook for GCW qualification without explicit operator approval.");
+  expect(followUp).toContain("### 6. Fixed-package full-reboot confirmation");
+  expect(followUp).toContain("Do not reboot DreamBook solely for this confirmation without explicit operator approval.");
 });
 
 test("obsolete inherited Codex operator documents are removed from the DreamBook product surface", () => {

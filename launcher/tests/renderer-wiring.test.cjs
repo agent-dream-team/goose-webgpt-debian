@@ -112,10 +112,9 @@ test("DEV launcher exposes its profile and supervises only its Full-mode MCP run
   assert.match(electronMain, /onboardingComplete:\s*true,[\s\S]*?autoStart:\s*false/);
   assert.match(appSource, /snapshot\.profile === "development"/);
   assert.match(appSource, /data-profile=\{snapshot\.profile\}/);
-  assert.match(appSource, /manualBiggerContextUnavailable[\s\S]*?copy\.biggerContextBody/);
-  assert.match(appSource, /api!\.setBiggerContext\(enabled\)/);
-  assert.match(electronMain, /runtimeHost\.setBiggerContext\(enabled === true\)/);
-  assert.doesNotMatch(electronMain, /IS_DEV_PROFILE && key === "experimentalBiggerContext"/);
+  assert.doesNotMatch(appSource, /BiggerContext|biggerContext|setBiggerContext/);
+  assert.doesNotMatch(electronMain, /bigger-context|setBiggerContext|experimentalBiggerContext/);
+  assert.doesNotMatch(preloadSource, /setBiggerContext|bigger-context/);
 });
 
 test("persistent rebuild identifies itself and suppresses inherited Codex setup workflow", () => {
@@ -124,7 +123,6 @@ test("persistent rebuild identifies itself and suppresses inherited Codex setup 
   assert.match(electronMain, /requireLegacyCodexAction\("Browser smoke setup"\)/);
   assert.match(electronMain, /requireLegacyCodexAction\("Codex core setup"\)/);
   assert.match(electronMain, /requireLegacyCodexAction\("Codex MCP setup"\)/);
-  assert.match(electronMain, /requireLegacyCodexAction\("Codex Bigger Context setup"\)/);
   assert.match(electronMain, /requireLegacyCodexAction\("Zero Risk setup"\)/);
   assert.match(electronMain, /Persistent Goose rebuild uses Automatic browser interaction/);
   assert.match(appSource, /const rebuildAppliance = snapshot\.applianceKind === "persistent-rebuild"/);
@@ -147,22 +145,6 @@ test("macOS passkey sign-in is additive to the unchanged embedded login action",
   assert.match(electronMain, /launcher:browser-passkey-login[\s\S]*?browserHost\.openPasskeyLogin\(\)/);
   assert.match(electronMain, /loginWithPasskey: \(\) => runtimeHost\.capturePasskeyLogin\(\)/);
   assert.match(browserHostSource, /await this\.waitForAuthenticated\(60_000\)[\s\S]*?runSessionInspection\(false\)/);
-});
-
-test("Bigger Context startup recommendation reuses the persisted setting and setup transaction", () => {
-  assert.match(
-    appSource,
-    /const \[biggerContextRecommendationOpen, setBiggerContextRecommendationOpen\] = useState\([\s\S]*?!rebuildAppliance[\s\S]*?snapshot\.state\.browserInteractionMode === "automatic"[\s\S]*?snapshot\.state\.coreSetupComplete === true[\s\S]*?!snapshot\.state\.experimentalBiggerContext,/,
-  );
-  assert.match(appSource, /&& !biggerContextRecommendationOpen;/);
-  assert.match(appSource, /updateState\(await api!\.setBiggerContext\(enabled\)\)/);
-  assert.match(
-    appSource,
-    /<BiggerContextRecommendation[\s\S]*?checked=\{snapshot\.state\.experimentalBiggerContext\}[\s\S]*?onClose=\{\(\) => setBiggerContextRecommendationOpen\(false\)\}/,
-  );
-  assert.match(appSource, /<Switch checked=\{checked\} disabled=\{busy\} onChange=\{onChange\} \/>/);
-  assert.match(stylesSource, /\.bigger-context-recommendation-backdrop\s*\{[^}]*position:\s*fixed;/s);
-  assert.doesNotMatch(stylesSource, /\.bigger-context-recommendation-backdrop\s*\{[^}]*backdrop-filter:/s);
 });
 
 test("Zero Risk setup commits state after the runtime transaction and preserves manual inspection boundaries", () => {

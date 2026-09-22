@@ -1060,52 +1060,6 @@ class RuntimeHost {
     return { ...result, mode };
   }
 
-  async setBiggerContext(enabled) {
-    const current = this.runtimeConfigSnapshot();
-    if (!current.configured) {
-      throw new Error("Initialize the runtime before changing Bigger Context");
-    }
-    const mode = current.mode;
-    const contextFlag = enabled === true ? "--bigger-context" : "--standard-context";
-    if (this.launcherProfile === "development") {
-      const args = [
-        "dev",
-        "setup",
-        mode === "full" ? "--full" : "--browser-only",
-        "--browser-host-descriptor",
-        this.browserDescriptorPath,
-        ...this.browserInteractionArgs(),
-        "--acknowledge-unofficial",
-        contextFlag,
-      ];
-      if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
-      const result = await this.runDevSetup("bigger-context", args, {
-        message: enabled ? "Enabling Bigger Context" : "Disabling Bigger Context",
-        successMessage: enabled ? "Bigger Context enabled" : "Standard context restored",
-        timeoutMs: CORE_SETUP_TIMEOUT_MS,
-      });
-      return { ...result, mode, enabled: enabled === true };
-    }
-    const args = [
-      "setup",
-      mode === "full" ? "--full" : "--browser-only",
-      "--browser-host-descriptor",
-      this.browserDescriptorPath,
-      ...this.browserInteractionArgs(),
-      "--replace-codex-route",
-      "--acknowledge-unofficial",
-      "--restart-service",
-      contextFlag,
-    ];
-    if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
-    const result = await this.runSetup("bigger-context", args, {
-      message: enabled ? "Enabling Bigger Context" : "Disabling Bigger Context",
-      successMessage: enabled ? "Bigger Context enabled; restart Codex" : "Standard context restored; restart Codex",
-      timeoutMs: CORE_SETUP_TIMEOUT_MS,
-    });
-    return { ...result, mode, enabled: enabled === true };
-  }
-
   async setZeroRiskPro(enabled) {
     const current = this.runtimeConfigSnapshot();
     if (!current.configured) {
@@ -1122,7 +1076,6 @@ class RuntimeHost {
       this.browserDescriptorPath,
       ...this.browserInteractionArgs({ mode: "manual" }),
       "--acknowledge-unofficial",
-      "--standard-context",
       profileFlag,
       ...(this.launcherProfile === "production" ? ["--replace-codex-route", "--restart-service"] : []),
     ];
@@ -1313,9 +1266,6 @@ class RuntimeHost {
       ...this.browserInteractionArgs({ mode, refreshCapabilities: true }),
       "--acknowledge-unofficial",
       ...(this.launcherProfile === "production" ? ["--replace-codex-route", "--restart-service"] : []),
-      mode === "automatic" && current.config?.experimentalBiggerContext === true
-        ? "--bigger-context"
-        : "--standard-context",
     ];
     if (current.config?.autoApproveToolCalls === true) args.push("--auto-approve-tool-calls");
     const options = {

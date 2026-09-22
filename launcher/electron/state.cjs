@@ -14,7 +14,6 @@ const DEFAULT_STATE = Object.freeze({
   keepRunningOnClose: true,
   showBrowserDuringTurns: true,
   browserInteractionMode: "automatic",
-  experimentalBiggerContext: false,
   zeroRiskProEnabled: false,
   browserSmokePassed: false,
   browserSmokeVersion: null,
@@ -35,6 +34,7 @@ function readState(filePath) {
     if (!parsed || parsed.version !== 1) return { ...DEFAULT_STATE };
     const state = { ...DEFAULT_STATE, ...parsed };
     delete state.bridgeEnabled;
+    delete state.experimentalBiggerContext;
     if (state.language !== null && state.language !== "en" && state.language !== "zh-CN" && state.language !== "ja") {
       state.language = DEFAULT_STATE.language;
     }
@@ -45,7 +45,6 @@ function readState(filePath) {
       "autoStart",
       "keepRunningOnClose",
       "showBrowserDuringTurns",
-      "experimentalBiggerContext",
       "zeroRiskProEnabled",
       "browserSmokePassed",
       "sidebarOpen",

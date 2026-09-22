@@ -273,11 +273,6 @@ async function run(message: RunMessage): Promise<void> {
         throw new Error("Browser helper could not persist ChatGPT submission evidence");
       }
     },
-    onMultipartStageAcknowledged: stageIndex => {
-      if (!writeProtocol({ type: "event", id: message.id, event: "multipart_stage_acknowledged", stageIndex })) {
-        throw new Error("Browser helper could not persist multipart acknowledgement evidence");
-      }
-    },
     onReasoningSummary: (text, continuation) => writeProtocol({
       type: "event",
       id: message.id,
@@ -399,17 +394,6 @@ input.on("line", line => {
       abortControllers.get(message.id)?.abort();
       return;
     }
-    if (prepared.multipart !== undefined) {
-      const multipart = prepared.multipart;
-      if (!multipart || !Array.isArray(multipart.parts)
-        || (multipart.parts.length !== 2 && multipart.parts.length !== 3)
-        || multipart.parts.some(part => typeof part !== "string")
-        || typeof multipart.commit !== "string") {
-        writeProtocol({ type: "error", id: message.id, message: "Browser helper multipart prompt is invalid" });
-        abortControllers.get(message.id)?.abort();
-        return;
-      }
-    }
     const selection = preparedSelections.get(message.id);
     if (!selection) {
       writeProtocol({ type: "error", id: message.id, message: "Browser helper has no pending prompt selection" });
@@ -517,4 +501,4 @@ process.once("SIGTERM", () => {
 });
 
 // Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
-writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "multipart-stage-ack"] });
+writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence"] });

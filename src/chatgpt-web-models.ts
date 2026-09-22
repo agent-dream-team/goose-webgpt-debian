@@ -28,8 +28,8 @@ export const CHATGPT_WEB_INSTANT_CONTEXT_WINDOW = 41_000;
 export const CHATGPT_WEB_INSTANT_AUTO_COMPACT_TOKEN_LIMIT = 32_000;
 /**
  * Zero Risk keeps one visible ChatGPT conversation across sequential Codex turns. Its fixed route
- * therefore uses the requested three-turn compaction interval without enabling Bigger Context's
- * automatic multipart transport; the user still pastes exactly one incremental prompt per turn.
+ * therefore uses the requested three-turn compaction interval while the user still pastes exactly
+ * one incremental prompt per turn.
  */
 export const CHATGPT_WEB_ZERO_RISK_CONTEXT_WINDOW = CHATGPT_WEB_INSTANT_CONTEXT_WINDOW * 3;
 export const CHATGPT_WEB_ZERO_RISK_AUTO_COMPACT_TOKEN_LIMIT = CHATGPT_WEB_INSTANT_AUTO_COMPACT_TOKEN_LIMIT * 3;
@@ -71,7 +71,6 @@ export const CHATGPT_WEB_PRO_MODEL_COMPOSER_CHAR_LIMIT = 1_635_000;
  * history out of later browser requests without asking Codex to compact its canonical history.
  */
 export const CHATGPT_WEB_LUNA_CONTEXT_WINDOW = 1_050_000;
-export const CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER = 3;
 
 export interface ChatGptWebContextLimits {
   contextWindow: number;
@@ -111,9 +110,6 @@ export function resolveChatGptWebContextLimits(
   capabilities: ChatGptWebAccountCapabilities,
 ): ChatGptWebContextLimits {
   if (isChatGptWebZeroRiskBackendModel(backendModel)) {
-    if (capabilities.experimentalBiggerContext) {
-      throw new Error("Zero Risk does not support Bigger Context");
-    }
     if (backendModel === CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL) {
       return contextLimits(
         CHATGPT_WEB_ZERO_RISK_PRO_CONTEXT_WINDOW,
@@ -132,32 +128,26 @@ export function resolveChatGptWebContextLimits(
     return contextLimits(CHATGPT_WEB_LUNA_CONTEXT_WINDOW, CHATGPT_WEB_LUNA_CONTEXT_WINDOW);
   }
 
-  let limits: ChatGptWebContextLimits;
   if (capabilities.proAvailable) {
     const contextWindow = effort === "low"
       ? CHATGPT_WEB_PRO_STANDARD_CONTEXT_WINDOW
       : effort === "max"
         ? CHATGPT_WEB_PRO_MODEL_CONTEXT_WINDOW
         : CHATGPT_WEB_PRO_STANDARD_CONTEXT_WINDOW;
-    limits = contextLimits(contextWindow, CHATGPT_WEB_PRO_AUTO_COMPACT_TOKEN_LIMIT);
+    return contextLimits(contextWindow, CHATGPT_WEB_PRO_AUTO_COMPACT_TOKEN_LIMIT);
   } else if (effort === "low") {
-    limits = contextLimits(
+    return contextLimits(
       CHATGPT_WEB_INSTANT_CONTEXT_WINDOW,
       CHATGPT_WEB_INSTANT_AUTO_COMPACT_TOKEN_LIMIT,
     );
   } else if (effort === "medium" || effort === "high") {
-    limits = contextLimits(
+    return contextLimits(
       CHATGPT_WEB_MEDIUM_HIGH_CONTEXT_WINDOW,
       CHATGPT_WEB_MEDIUM_HIGH_AUTO_COMPACT_TOKEN_LIMIT,
     );
   } else {
     throw new Error(`ChatGPT Plus context limit is not defined for unavailable effort: ${effort}`);
   }
-  if (!capabilities.experimentalBiggerContext) return limits;
-  return contextLimits(
-    limits.contextWindow * CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER,
-    limits.autoCompactTokenLimit * CHATGPT_WEB_BIGGER_CONTEXT_MULTIPLIER,
-  );
 }
 
 /** Resolve limits of one visible ChatGPT composer message, independently of model context. */
@@ -198,7 +188,7 @@ export function resolveChatGptWebTransportLimits(
 /**
  * Visible text that fits one ordinary input after its hidden reserve and images. This is derived
  * from the existing context contract, not a new measured browser limit or a compaction trigger.
- * Bigger Context expands the transaction, never this per-message budget.
+ * This remains a per-message budget independent of the total model context window.
  */
 export function resolveChatGptWebMessageTokenBudget(
   backendModel: typeof CHATGPT_WEB_BACKEND_MODEL,
@@ -207,7 +197,7 @@ export function resolveChatGptWebMessageTokenBudget(
   imageTokens = 0,
 ): number {
   const { contextWindow } = resolveChatGptWebContextLimits(
-    backendModel, effort, { ...capabilities, experimentalBiggerContext: false },
+    backendModel, effort, capabilities,
   );
   const { browserMessageTokenLimit } = resolveChatGptWebTransportLimits(backendModel, effort, capabilities);
   return Math.max(0, Math.min(
@@ -242,7 +232,6 @@ export type ChatGptWebModelRoute = ChatGptWebAutomaticModelRoute | ChatGptWebZer
 export interface ChatGptWebAccountCapabilities {
   solAvailable: boolean;
   proAvailable: boolean;
-  experimentalBiggerContext?: boolean;
   browserInteractionMode?: "automatic" | "manual";
   zeroRiskProEnabled?: boolean;
 }
@@ -375,9 +364,6 @@ export function availableChatGptWebModelRoutes(
   capabilities: ChatGptWebAccountCapabilities,
 ): readonly ChatGptWebModelRoute[] {
   if (capabilities.browserInteractionMode === "manual") {
-    if (capabilities.experimentalBiggerContext) {
-      throw new Error("Zero Risk does not support Bigger Context");
-    }
     return capabilities.zeroRiskProEnabled
       ? [CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE, CHATGPT_WEB_ZERO_RISK_PRO_MODEL_ROUTE]
       : [CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE];
@@ -392,9 +378,6 @@ export function requireChatGptWebModelRoute(
   modelId: string,
   capabilities: ChatGptWebAccountCapabilities,
 ): ChatGptWebModelRoute {
-  if (capabilities.browserInteractionMode === "manual" && capabilities.experimentalBiggerContext) {
-    throw new Error("Zero Risk does not support Bigger Context");
-  }
   const route = routesBySlug.get(modelId);
   if (!route) throw new Error(`ChatGPT web model is not enabled: ${modelId}`);
   if (capabilities.browserInteractionMode === "manual") {
