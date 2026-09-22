@@ -882,7 +882,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
     };
   };
 
-  const acceptedFinalRuntimeCheckpoint = (
+  const generatedProjectionRuntimeCheckpoint = (
     body: unknown,
     previous: GooseResponsesProjectionCheckpoint,
     current: GooseResponsesProjectionCheckpoint,
@@ -938,14 +938,33 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         return jsonError(409, "rebind_request_conflict", "Persistent pair rebind requires a valid latest durable Goose Responses checkpoint");
       }
       const recoveredReplay = recoveredTerminalReplayForBody(turn.turnRef, body);
-      const acceptedFinalCheckpoint = turn.finalDigest
-        ? acceptedFinalRuntimeCheckpoint(body, durableCheckpoint, checkpoint)
+      const generatedProjectionCheckpoint = generatedProjectionRuntimeCheckpoint(
+        body,
+        durableCheckpoint,
+        checkpoint,
+      );
+      const acceptedFinalCheckpoint = turn.finalDigest ? generatedProjectionCheckpoint : null;
+      const initialOperation = broker.getInitialOperationForTurn(turn.turnRef);
+      const pendingAcceptanceProjectionCheckpoint = !turn.acceptedUserTurnId
+        && !turn.finalDigest
+        && initialOperation.state === "MINTED"
+        && initialOperation.inputHash === null
+        && initialOperation.resultJson === null
+        && initialOperation.ownerId === null
+        && initialOperation.answerBoundaryJson === null
+        && initialOperation.terminalAt === null
+        && broker.getNextOperationForTurn(turn.turnRef, initialOperation.seq) === null
+        ? generatedProjectionCheckpoint
         : null;
       let recoveredDecision = null;
       if (durableCheckpoint.requestHash !== checkpoint.requestHash) {
         if (acceptedFinalCheckpoint) {
           // The durable provider final already closes execution. Only Goose-generated system/tool
           // projection may migrate here; canonical conversation items remain byte-identical.
+        } else if (pendingAcceptanceProjectionCheckpoint) {
+          // A retained pre-acceptance turn has no dispatched Goose tool work yet. Allow only the
+          // generated Goose system/tool projection to migrate while every canonical history item
+          // remains byte-identical; the browser still rebinds the same durable conversation.
         } else if (recoveredReplay) {
           recoveredDecision = classifyGooseResponsesContinuation({
             body,
@@ -963,7 +982,8 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
             }
           }
         }
-        if (!acceptedFinalCheckpoint && (!recoveredReplay || recoveredDecision?.kind !== "TOOL_RESULT")) {
+        if (!acceptedFinalCheckpoint && !pendingAcceptanceProjectionCheckpoint
+          && (!recoveredReplay || recoveredDecision?.kind !== "TOOL_RESULT")) {
           return jsonError(
             409,
             "rebind_request_conflict",
@@ -972,7 +992,8 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         }
         // Recovered +2 continuations are admitted only after the separate recovery cadence has
         // proven the remote UI non-running, no unresolved Goose work, and no contradictory activity.
-        if (!acceptedFinalCheckpoint && !broker.hasRecordedPositiveTerminalSlotRelease(turn.turnRef)) {
+        if (!acceptedFinalCheckpoint && !pendingAcceptanceProjectionCheckpoint
+          && !broker.hasRecordedPositiveTerminalSlotRelease(turn.turnRef)) {
           return jsonError(
             409,
             "rebind_recovery_precondition",
@@ -984,7 +1005,7 @@ export function startRebuildProviderRuntime(options: RebuildProviderRuntimeOptio
         return jsonError(409, "rebind_blocked", "Persistent pair rebind requires unresolved Goose tool/result state to be reconciled first");
       }
       if (durableCheckpoint.requestHash !== checkpoint.requestHash) {
-        let upgradedCheckpoint = acceptedFinalCheckpoint;
+        let upgradedCheckpoint = acceptedFinalCheckpoint ?? pendingAcceptanceProjectionCheckpoint;
         if (!upgradedCheckpoint) {
           if (recoveredDecision?.kind !== "TOOL_RESULT") {
             throw new Error("Recovered rebind checkpoint disappeared after request validation");

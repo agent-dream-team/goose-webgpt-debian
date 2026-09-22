@@ -2900,6 +2900,114 @@ test("exact replay recovers a sent retained turn whose browser died before local
   });
 });
 
+test("pre-acceptance rebind bridges only generated Goose system and tool projection drift", async () => {
+  let starts = 0;
+  const conversationId = "aaaaaaaa-bbbb-4ccc-8ddd-000000000779";
+  const driver: RebuildPersistentBrowserDriver = {
+    createTurn(input) {
+      starts += 1;
+      const ordinal = starts;
+      return {
+        captureAnswerBoundary: async () => { throw new Error("no tool expected"); },
+        confirmFinal: async evidence => evidence,
+        run: async () => {
+          if (ordinal === 1) {
+            input.lifecycle.onSendActivated();
+            input.lifecycle.onAccepted({ canonicalConversationId: conversationId, acceptedUserTurnId: "user-projection-seed" });
+            return {
+              canonicalConversationId: conversationId,
+              acceptedUserTurnId: "user-projection-seed",
+              text: "projection-seed-final",
+              remoteNonRunning: true,
+            };
+          }
+          if (ordinal === 2) {
+            input.lifecycle.onSendActivated();
+            throw new Error("synthetic browser loss before projected acceptance binding");
+          }
+          expect(input.prompt).toBe("");
+          expect(input.resumeAccepted).toBeUndefined();
+          expect(input.resumePendingAcceptance).toEqual({ canonicalConversationId: conversationId });
+          await input.lifecycle.onRebound?.({
+            canonicalConversationId: conversationId,
+            acceptedUserTurnId: "user-projection-recovered",
+          });
+          return {
+            canonicalConversationId: conversationId,
+            acceptedUserTurnId: "user-projection-recovered",
+            text: "projection-recovered-ok",
+            remoteNonRunning: true,
+          };
+        },
+      };
+    },
+  };
+  const { runtime } = setup(driver);
+  const firstRequest = requestBody("seed generated projection recovery");
+  const first = await post(runtime, firstRequest, "goose-pending-projection-recovery");
+  expect(first.status).toBe(200);
+
+  const secondRequest = laterTurnBody(firstRequest, "projection-seed-final", "recover across generated projection drift");
+  const failed = await post(runtime, secondRequest, "goose-pending-projection-recovery");
+  expect(failed.status).toBe(502);
+  const retained = runtime.broker.getOpenTurnForSession("goose-pending-projection-recovery");
+  expect(retained).toMatchObject({ state: "UNRECONCILED", acceptedUserTurnId: null });
+  const initial = runtime.broker.getInitialOperationForTurn(retained!.turnRef);
+  expect(initial).toMatchObject({
+    state: "MINTED",
+    inputHash: null,
+    resultJson: null,
+    ownerId: null,
+    answerBoundaryJson: null,
+    terminalAt: null,
+  });
+  expect(runtime.broker.getNextOperationForTurn(retained!.turnRef, initial.seq)).toBeNull();
+
+  const projectionDrift = structuredClone(secondRequest) as any;
+  projectionDrift.input[0].content[0].text =
+    "You are a general-purpose AI agent called goose. Updated generated system projection.";
+  projectionDrift.tools = projectionDrift.tools.map((tool: any) => ({
+    ...tool,
+    description: "Updated generated tool projection.",
+  }));
+
+  const historyDrift = structuredClone(projectionDrift) as any;
+  historyDrift.input[1].content[0].text = "tampered durable history";
+  const rejectedHistory = await post(runtime, historyDrift, "goose-pending-projection-recovery");
+  expect(rejectedHistory.status).toBe(409);
+  expect(await rejectedHistory.text()).toContain("rebind_request_conflict");
+  expect(starts).toBe(2);
+
+  const stableDrift = { ...projectionDrift, max_output_tokens: 2048 };
+  const rejectedStable = await post(runtime, stableDrift, "goose-pending-projection-recovery");
+  expect(rejectedStable.status).toBe(409);
+  expect(await rejectedStable.text()).toContain("rebind_request_conflict");
+  expect(starts).toBe(2);
+
+  const invalidSystem = structuredClone(projectionDrift) as any;
+  invalidSystem.input[0].content[0].text = "not a Goose-generated system projection";
+  const rejectedSystem = await post(runtime, invalidSystem, "goose-pending-projection-recovery");
+  expect(rejectedSystem.status).toBe(409);
+  expect(await rejectedSystem.text()).toContain("rebind_request_conflict");
+  expect(starts).toBe(2);
+
+  const recovered = await post(runtime, projectionDrift, "goose-pending-projection-recovery");
+  expect(recovered.status).toBe(200);
+  expect(await recovered.text()).toContain("projection-recovered-ok");
+  expect(starts).toBe(3);
+  expect(runtime.broker.getAccountSlotHolder()).toBeNull();
+  const completed = runtime.broker.getTurn(retained!.turnRef);
+  expect(completed?.state).toBe("COMPLETE");
+  expect(decodeGooseResponsesProjectionCheckpoint(completed!.checkpointJson).requestHash)
+    .toBe(gooseResponsesProjectionCheckpoint(projectionDrift).requestHash);
+  expect(runtime.broker.getCurrentEpoch("goose-pending-projection-recovery")).toMatchObject({
+    epoch: 1,
+    conversationId,
+    leaseState: "IDLE",
+    historyWatermark: watermark(projectionDrift, "projection-recovered-ok"),
+  });
+});
+
 test("invalid browser acceptance identity cannot partially bind durable remote identity", async () => {
   const driver: RebuildPersistentBrowserDriver = {
     createTurn(input) {
