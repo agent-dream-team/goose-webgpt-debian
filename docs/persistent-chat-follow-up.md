@@ -41,7 +41,7 @@ The dedicated `CGW Provider Sessions` Project with project-only memory is an acc
 
 The current lifecycle decision supersedes older independent provider-epoch rollover behavior. Context pressure or non-append-compatible Goose history must lead to a deliberate handoff and then a **fresh Goose session plus fresh ChatGPT conversation together**.
 
-Qualify this for ordinary context pressure and for non-append-compatible history such as compaction/truncation/fork-style divergence. Richer and multimodal history must not be silently repaired by rolling only the provider chat.
+Qualify this for ordinary context pressure, for a normal completed-slice rollover under the shared Day Shift orchestrator-slicing policy, and for non-append-compatible history such as compaction/truncation/fork-style divergence. Richer and multimodal history must not be silently repaired by rolling only the provider chat.
 
 Any remaining source path that automatically creates a replacement provider epoch under the same Goose session because of history rewrite or local context estimates is implementation debt until narrowed to initial pair creation or deliberate paired handoff.
 
